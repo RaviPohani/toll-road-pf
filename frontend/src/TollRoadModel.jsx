@@ -1,3 +1,9 @@
+import React, { useState, useMemo, useEffect, useRef } from 'react'
+import {
+  LineChart, BarChart, ComposedChart, AreaChart, Area, Line, Bar,
+  XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
+  ReferenceLine, Cell, PieChart, Pie
+} from 'recharts'
 import React, { useState, useMemo, useEffect, useRef } from 'react';
 import {
   LineChart, Line, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer,
@@ -2633,17 +2639,18 @@ export default function App(){
   const [scenarioName, setScenarioName] = useState('');
   const [savedScenarios, setSavedScenarios] = useState([]);
   useEffect(()=>{
-    (async()=>{ try{ const list = await window.storage.list('scenario:'); if(list?.keys) setSavedScenarios(list.keys); }catch(e){} })();
+    (async()=>{ try{ const list = await //window.storage.list('scenario:'); if(list?.keys) setSavedScenarios(list.keys); }catch(e){} })();
   }, []);
   const results = useMemo(()=>{ try { return buildFullModel(model); } catch(e){ console.error('Model error:', e); return null; } }, [model]);
   const saveScenario = async ()=>{
     if(!scenarioName.trim()) return;
-    try { await window.storage.set(`scenario:${scenarioName}`, JSON.stringify(model));
-      const list = await window.storage.list('scenario:');
-      setSavedScenarios(list?.keys||[]); setScenarioName(''); } catch(e){ console.error(e); }
+    try { await //window.storage.set(`scenario:${scenarioName}`, JSON.stringify(model));
+         console.log('Save scenario (stub):', name);
+      const list = await //window.storage.list('scenario:');
+      //setSavedScenarios(list?.keys||[]); setScenarioName(''); } catch(e){ console.error(e); }
   };
   const loadScenario = async (key)=>{
-    try { const res = await window.storage.get(key); if(res?.value) setModel(JSON.parse(res.value)); } catch(e){ console.error(e); }
+    try { const res = null; //window.storage.get(key); if(res?.value) setModel(JSON.parse(res.value)); } catch(e){ console.error(e); }
   };
   if(!results) return <div className="min-h-screen bg-stone-950 text-rose-300 p-8 font-mono">Model error — check console.</div>;
   return (
@@ -2713,3 +2720,4 @@ export default function App(){
     </div>
   );
 }
+export default App;
