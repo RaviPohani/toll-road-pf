@@ -37,8 +37,10 @@ from calendar import monthrange
 # ============================================================
 REPAYMENT_STYLES = [
     'Sculpted (target DSCR)', 'Level debt service', 'Equal principal',
-    'Bullet', 'IO then amortize', 'Deferred P&I then sculpted', 'Custom schedule',
+    'Bullet', 'IO then amortize', 'Deferred P&I then sculpted',
+    'Phased (multi-regime)', 'Custom schedule',
 ]
+PHASE_REGIMES = ['defer', 'io', 'sculpt', 'level', 'equal-principal']
 CURVE_TYPES = ['Linear', 'S-curve', 'Front-loaded', 'Back-loaded', 'Custom']
 DAY_COUNT = ['Actual/Actual', 'Actual/360', '30/360']
 WATERFALL_MODES = ['Opex-first (CFADS \u2192 DS)', 'Debt-first (Revenue \u2192 DS \u2192 Opex)']
@@ -187,7 +189,13 @@ def default_model() -> Dict[str, Any]:
                 {'id': 'tifia1', 'type': 'TIFIA Loan',         'amount': 200_000_000, 'rate': 0.0410, 'tenorYears': 35,
                  'closeDate': '2026-07-01', 'seniority': 'Subordinate', 'repaymentStyle': 'Deferred P&I then sculpted',
                  'drawdownPriority': 4, 'targetDSCR': 1.10, 'ioYears': 0, 'deferralYears': 5,
-                 'dayCount': 'Actual/Actual', 'covenants': 'TIFIA springing lien'},
+                 'dayCount': 'Actual/Actual', 'covenants': 'TIFIA springing lien',
+                 'phases': [
+                     {'regime': 'defer',  'endPeriod': 10, 'targetDSCR': None},
+                     {'regime': 'io',     'endPeriod': 20, 'targetDSCR': None},
+                     {'regime': 'sculpt', 'endPeriod': 60, 'targetDSCR': 1.10},
+                     {'regime': 'level',  'endPeriod': 70, 'targetDSCR': None},
+                 ]},
                 {'id': 'ran1',   'type': 'RAN',                'amount':  50_000_000, 'rate': 0.0350, 'tenorYears': 2,
                  'closeDate': '2026-07-01', 'seniority': 'Short-term',  'repaymentStyle': 'Bullet',
                  'drawdownPriority': 2, 'targetDSCR': 0, 'ioYears': 0, 'deferralYears': 0,
@@ -573,6 +581,100 @@ def bullet(principal: float, rate_per: float, periods: List[Dict[str, Any]]) -> 
     return {'interest': interest, 'principal': principal_arr, 'balance': balance}
 
 
+def phased_schedule(principal: float, rate_per: float, periods: List[Dict[str, Any]],
+                    cfads: List[float], phases: List[Dict[str, Any]],
+                    original_principal: float) -> Dict[str, List[float]]:
+    """Phased multi-regime repayment.
+
+    Each phase: {'regime': defer|io|sculpt|level|equal-principal,
+                 'endPeriod': int (exclusive),
+                 'targetDSCR': float (only for sculpt)}
+
+    Walks periods sequentially through phases. Last phase's endPeriod should equal
+    tenor period count; any residual balance past the last phase bullets at maturity.
+    """
+    n = len(periods)
+    interest, principal_arr, balance = _zeros(n), _zeros(n), _zeros(n)
+    bal = principal
+    if not phases:
+        return bullet(principal, rate_per, periods)
+
+    phase_idx = 0
+    level_pmt = None              # cached on entry to a level phase
+    equal_pri_per_period = None   # cached on entry to an equal-principal phase
+
+    for i in range(n):
+        # Advance through completed phases
+        while phase_idx < len(phases) and i >= (phases[phase_idx].get('endPeriod') or n):
+            phase_idx += 1
+            level_pmt = None
+            equal_pri_per_period = None
+
+        if phase_idx >= len(phases):
+            # Past last phase — accrue interest, bullet remaining at maturity
+            interest[i] = bal * rate_per
+            if i == n - 1:
+                principal_arr[i] = bal
+                bal = 0
+            balance[i] = bal
+            continue
+
+        phase = phases[phase_idx]
+        int_p = bal * rate_per
+        phase_end = phase.get('endPeriod') or n
+        periods_remaining_in_phase = phase_end - i
+        regime = phase.get('regime')
+
+        if regime == 'defer':
+            # Interest capitalizes — no payment
+            bal += int_p
+            balance[i] = bal
+        elif regime == 'io':
+            interest[i] = int_p
+            balance[i] = bal
+        elif regime == 'sculpt':
+            tgt = phase.get('targetDSCR') or 1.20
+            max_ds = (cfads[i] if i < len(cfads) else 0) / max(tgt, 0.0001)
+            pri = max(0, min(bal, max_ds - int_p))
+            interest[i] = int_p
+            principal_arr[i] = pri
+            bal -= pri
+            balance[i] = bal
+        elif regime == 'level':
+            if level_pmt is None:
+                # Compute level pmt ONCE at phase entry
+                if rate_per > 0:
+                    level_pmt = (bal * rate_per) / (1 - (1 + rate_per) ** -periods_remaining_in_phase)
+                else:
+                    level_pmt = bal / max(1, periods_remaining_in_phase)
+            pri = max(0, min(bal, level_pmt - int_p))
+            interest[i] = int_p
+            principal_arr[i] = pri
+            bal -= pri
+            balance[i] = bal
+        elif regime == 'equal-principal':
+            if equal_pri_per_period is None:
+                equal_pri_per_period = bal / max(1, periods_remaining_in_phase)
+            pri = min(bal, equal_pri_per_period)
+            interest[i] = int_p
+            principal_arr[i] = pri
+            bal -= pri
+            balance[i] = bal
+        else:
+            # Unknown regime — fallback to IO
+            interest[i] = int_p
+            balance[i] = bal
+
+    # Safety: ensure any residual balance bullets at maturity (matches level/bullet behavior).
+    # Triggers if user-defined phases don't fully amortize within the actual slice (e.g. tenor capped by ops period).
+    if n > 0 and balance[n - 1] > 0:
+        extra = balance[n - 1]
+        principal_arr[n - 1] += extra
+        balance[n - 1] = 0
+
+    return {'interest': interest, 'principal': principal_arr, 'balance': balance}
+
+
 # ============================================================
 # 50% TEST — JOINT SOLVER + POST-HOC
 # ============================================================
@@ -668,6 +770,11 @@ def apply_fifty_pct_test(sched: Dict[str, List[float]], periods: List[Dict[str, 
         ns['principal'][i] = min(prev_bal, max(0, ns['principal'][i]))
         ns['balance'][i] = prev_bal - ns['principal'][i]
         bal = ns['balance'][i]
+    # Safety: bullet any residual at maturity (redistribution can leave residual when implied interest shifts)
+    if n > 0 and ns['balance'][n - 1] > 0:
+        extra = ns['balance'][n - 1]
+        ns['principal'][n - 1] += extra
+        ns['balance'][n - 1] = 0
     return {'schedule': ns, 'applied': True, 'testIdx': test_idx,
             'beforeBal': sched['balance'][test_idx], 'maxAllowed': max_allowed,
             'movedTotal': moved}
@@ -754,6 +861,9 @@ def build_instrument_schedule(inst: Dict[str, Any], periods: List[Dict[str, Any]
         elif inst['repaymentStyle'] == 'Sculpted (target DSCR)':
             s = sculpt_to_target(principal, rate_per, slice_periods, cfads,
                                   inst.get('targetDSCR', 1.30), io_p, def_p)
+        elif inst['repaymentStyle'] == 'Phased (multi-regime)':
+            s = phased_schedule(principal, rate_per, slice_periods, cfads,
+                                inst.get('phases', []), principal)
         else:
             s = level_debt(principal, rate_per, slice_periods, io_p, def_p)
         if is_tifia_with_50:
