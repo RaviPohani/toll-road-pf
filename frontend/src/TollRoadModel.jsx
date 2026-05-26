@@ -85,7 +85,7 @@ const defaultModel = () => ({
       {id:'eq1',type:'Sponsor Equity',amount:120_000_000,rate:0,tenorYears:30,closeDate:'2026-07-01',seniority:'Equity',repaymentStyle:'Sculpted (target DSCR)',drawdownPriority:5,targetDSCR:1.30,ioYears:0,deferralYears:0,dayCount:'30/360',covenants:'Distribution lockup if TIFIA lockup triggered', issuanceCost:0, issuanceCostEscalation:0},
       {id:'fg1',type:'Federal Grant',amount:60_000_000,rate:0,tenorYears:0,closeDate:'2026-07-01',seniority:'Grant',repaymentStyle:'Bullet',drawdownPriority:1,targetDSCR:0,ioYears:0,deferralYears:0,dayCount:'30/360',covenants:'Federal cost-share requirements', issuanceCost:250_000, issuanceCostEscalation:0.03},
       {id:'sg1',type:'State Grant',amount:40_000_000,rate:0,tenorYears:0,closeDate:'2026-07-01',seniority:'Grant',repaymentStyle:'Bullet',drawdownPriority:1,targetDSCR:0,ioYears:0,deferralYears:0,dayCount:'30/360',covenants:'State match requirements', issuanceCost:150_000, issuanceCostEscalation:0.03},
-      {id:'pab1',type:'PABs (Private Activity Bonds)',amount:280_000_000,rate:0.0525,tenorYears:30,closeDate:'2026-07-01',seniority:'Senior',repaymentStyle:'Sculpted (target DSCR)',drawdownPriority:3,targetDSCR:1.35,ioYears:0,deferralYears:3,dayCount:'30/360',covenants:'Senior DSCR ≥1.20x; reserve fund equal to MADS', issuanceCost:4_500_000, issuanceCostEscalation:0.03},
+      {id:'pab1',type:'PABs (Private Activity Bonds)',amount:280_000_000,rate:0.0525,tenorYears:30,closeDate:'2026-07-01',seniority:'Senior',repaymentStyle:'Level debt service',drawdownPriority:3,targetDSCR:1.35,ioYears:0,deferralYears:3,dayCount:'30/360',covenants:'Senior DSCR ≥1.20x; reserve fund equal to MADS', issuanceCost:4_500_000, issuanceCostEscalation:0.03},
       {id:'tifia1',type:'TIFIA Loan',amount:200_000_000,rate:0.0410,tenorYears:35,closeDate:'2026-07-01',seniority:'Subordinate',repaymentStyle:'Deferred P&I then sculpted',drawdownPriority:4,targetDSCR:1.10,ioYears:0,deferralYears:5,dayCount:'Actual/Actual',covenants:'TIFIA springing lien; sub DSCR ≥1.10x after deferral', issuanceCost:1_750_000, issuanceCostEscalation:0.03,
         phases:[
           {regime:'defer',           endPeriod:10, targetDSCR:null},
@@ -2164,54 +2164,24 @@ function ControlAccountsTab({model, setModel, results}){
   </div>;
 }
 
+
 function OptimizerTab({model, setModel, results}){
   const o = model.optimizer;
   const setO = patch => setModel({...model, optimizer:{...o, ...patch}});
-  const setCons = (k,v) => setO({constraints:{...o.constraints,[k]:v}});
   const setCascade = patch => setO({cascade:{...(o.cascade||{}), ...patch}});
+  const c = o.cascade || {};
+  const ap = c.autoTifiaParams || {};
+  const setAuto = patch => setCascade({autoTifiaParams: {...ap, ...patch}});
   const [running, setRunning] = useState(false);
-  const [output, setOutput] = useState(o.lastRun);
-  const [jointOutput, setJointOutput] = useState(o.lastJointRun);
-  const [cascadeOutput, setCascadeOutput] = useState(o.lastCascadeRun);
-  const [autoCascadeOutput, setAutoCascadeOutput] = useState(o.lastAutoCascadeRun);
-  const mode = o.mode || 'single';
-  const updateJointTarget = (i, patch) => setO({jointTargets: o.jointTargets.map((t,idx)=>idx===i?{...t,...patch}:t)});
-  const addJointTarget = () => setO({jointTargets:[...o.jointTargets, {instrumentId:model.financing.instruments[0]?.id||'', minDSCR:1.20, minLLCR:1.20}]});
-  const removeJointTarget = (i) => setO({jointTargets:o.jointTargets.filter((_,idx)=>idx!==i)});
+  const [output, setOutput] = useState(o.lastAutoCascadeRun);
+  const ppy = model.general.periodsPerYear || 2;
+  const tifiaInst = model.financing.instruments.find(i => i.id === c.tifiaInstrumentId) || model.financing.instruments.find(i => i.type === 'TIFIA Loan');
+  const tifiaTenor = tifiaInst ? tifiaInst.tenorYears : 35;
+  const sculptYears = Math.max(0, tifiaTenor - (ap.deferYears || 0) - (ap.ioYears || 0) - (ap.testYearsBeforeMaturity || 10));
 
-  const runSingle = () => {
+  const runOpt = () => {
     setRunning(true);
     setTimeout(()=>{
-      const r = optimizeInstrument(model, o.targetInstrumentId, o.constraints);
-      setOutput(r);
-      setO({lastRun:{best:r.best, iterations:r.iterations}});
-      setRunning(false);
-    },50);
-  };
-  const runJoint = () => {
-    setRunning(true);
-    setTimeout(()=>{
-      const r = optimizeJointTranches(model, o.jointTargets, o.constraints, o.plugInstrumentId);
-      setJointOutput(r);
-      setO({lastJointRun:{traces:r.traces, preGap:r.preGap, plugAdjustment:r.plugAdjustment, finalGap:r.finalGap, sizes: r.workingModel.financing.instruments.map(i=>({id:i.id,amount:i.amount}))}});
-      setRunning(false);
-    },50);
-  };
-  const runCascade = () => {
-    setRunning(true);
-    setTimeout(()=>{
-      const r = runCascadeWaterfall(model, o.cascade || {});
-      setCascadeOutput(r);
-      setO({lastCascadeRun:{trace:r.trace, converged:r.converged, finalGap:r.finalGap,
-        sizes: r.workingModel?.financing?.instruments?.map(i=>({id:i.id,amount:i.amount}))||[]}});
-      setRunning(false);
-    },50);
-  };
-  const runAutoCascade = () => {
-    setRunning(true);
-    setTimeout(()=>{
-      const c = o.cascade || {};
-      const ap = c.autoTifiaParams || {};
       const params = {
         tifiaInstrumentId: c.tifiaInstrumentId,
         tifiaEligibleCapexIds: c.tifiaEligibleCapexIds || [],
@@ -2228,804 +2198,175 @@ function OptimizerTab({model, setModel, results}){
         minTifiaDSCR: ap.minTifiaDSCR,
       };
       const r = autoCascadeTifia(model, params);
-      setAutoCascadeOutput(r);
-      setO({lastAutoCascadeRun:{
-        bestPct: r.best?.pct, bestTifia: r.best?.tifiaAmount, bestPab: r.best?.pabAmount,
-        diagnosis: r.best?.phaseInfo?.diagnosis, converged: r.converged,
-      }});
+      setOutput(r);
+      setO({lastAutoCascadeRun:{bestPct: r.best?.pct, bestTifia: r.best?.tifiaAmount, bestPab: r.best?.pabAmount, diagnosis: r.best?.phaseInfo?.diagnosis, converged: r.converged}});
       setRunning(false);
-    },50);
+    }, 50);
   };
-  const applyAutoCascade = () => {
-    if(!autoCascadeOutput || !autoCascadeOutput.best || !autoCascadeOutput.best.workingModel) return;
-    setModel(autoCascadeOutput.best.workingModel);
+  const applyOpt = () => {
+    if(!output || !output.best || !output.best.workingModel) return;
+    setModel(output.best.workingModel);
   };
-  const applySingle = () => {
-    if(!output || !output.best) return;
-    const m = JSON.parse(JSON.stringify(model));
-    const inst = m.financing.instruments.find(i=>i.id===o.targetInstrumentId);
-    inst.amount = Math.round(output.best);
-    setModel(m);
+
+  const eligibleIds = c.tifiaEligibleCapexIds || [];
+  const toggleEligible = (id) => {
+    const newIds = eligibleIds.includes(id) ? eligibleIds.filter(x=>x!==id) : [...eligibleIds, id];
+    setCascade({tifiaEligibleCapexIds: newIds});
   };
-  const applyJoint = () => {
-    if(!jointOutput || !jointOutput.workingModel) return;
-    setModel(jointOutput.workingModel);
-  };
-  const applyCascade = () => {
-    if(!cascadeOutput || !cascadeOutput.workingModel) return;
-    setModel(cascadeOutput.workingModel);
-  };
+  let eligiblePreview = 0;
+  if(results && results.capexSched){
+    for(const id of eligibleIds){ eligiblePreview += sum(results.capexSched.byItem[id] || []); }
+  }
 
   return <div>
-    <Section title="Optimizer Mode">
-      <div className="flex gap-2 flex-wrap">
-        <button onClick={()=>setO({mode:'single'})} className={`px-4 py-2 rounded text-xs uppercase tracking-wider border ${mode==='single'?'bg-amber-500/10 border-amber-500/50 text-amber-300':'bg-stone-900 border-stone-700 text-stone-400'}`}>Single Instrument</button>
-        <button onClick={()=>setO({mode:'joint'})} className={`px-4 py-2 rounded text-xs uppercase tracking-wider border ${mode==='joint'?'bg-amber-500/10 border-amber-500/50 text-amber-300':'bg-stone-900 border-stone-700 text-stone-400'}`}>Joint Multi-Tranche</button>
-        <button onClick={()=>setO({mode:'cascade'})} className={`px-4 py-2 rounded text-xs uppercase tracking-wider border ${mode==='cascade'?'bg-amber-500/10 border-amber-500/50 text-amber-300':'bg-stone-900 border-stone-700 text-stone-400'}`}>Cascade Waterfall</button>
+    <Section title="TIFIA Cascade Optimizer"
+      subtitle="Sizes TIFIA first to its statutory or DSCR ceiling (whichever binds), then PAB only if TIFIA at 49% and gap remains. TIFIA amortization is auto-structured: CapI → IO → Sculpt → Level-to-Maturity. The 50% balance test passes by construction.">
+      <div className="bg-amber-500/5 border border-amber-500/30 rounded p-3 mb-4 text-xs text-amber-200">
+        <span className="font-medium">Logic:</span> 1) TIFIA = min(49% × eligible, max where Total DSCR ≥ floor + 50% test passes) · 2) PAB = min(gap, max at Sr DSCR floor) only if TIFIA hit 49% · 3) Equity = plug.
       </div>
-      <p className="text-xs text-stone-500 mt-3">
-        {mode==='single' && 'Size one instrument against your binding constraints (binary search).'}
-        {mode==='joint' && 'Size senior, then sub, sequentially against residual CFADS. Equity (or chosen plug) absorbs the funding gap.'}
-        {mode==='cascade' && 'Cascade: TIFIA = % of eligible capex → PAB = max @ target DSCR → Equity = NPV(residual CF @ target IRR) → Plug absorbs gap. Iterates to convergence.'}
-      </p>
     </Section>
 
-    <Section title="Shared Constraints" subtitle="Apply across single and joint modes.">
+    <Section title="Step 1 · TIFIA Amortization Profile"
+      subtitle={`Tenor: ${tifiaTenor}y (${tifiaTenor*ppy} periods at ${ppy}/yr). Auto-builds 4 phases that pass the 50% test by construction.`}>
+      <div className="grid grid-cols-4 gap-4">
+        <Field label="Phase 1 — CapI (years)" hint="Interest capitalizes into balance"><NumInput value={ap.deferYears} onChange={v=>setAuto({deferYears:v})} step={1} suffix="y"/></Field>
+        <Field label="Phase 2 — IO (years)" hint="Pay interest only"><NumInput value={ap.ioYears} onChange={v=>setAuto({ioYears:v})} step={1} suffix="y"/></Field>
+        <Field label="Phase 3 — Sculpt span" hint="Auto-derived"><div className="text-sm text-stone-300 font-mono py-2">{sculptYears.toFixed(1)} y</div></Field>
+        <Field label="Phase 4 — Level (years to maturity)" hint="Last X years; balance must = 50% at start of this phase (10y is TIFIA statute)"><NumInput value={ap.testYearsBeforeMaturity} onChange={v=>setAuto({testYearsBeforeMaturity:v})} step={1} suffix="y"/></Field>
+      </div>
+      <div className="grid grid-cols-2 gap-4 mt-3">
+        <Field label="Phase 3 — Sculpt Mode"
+          hint="Annuity = deterministic level pmt to 50% balance. Sculpt = DSCR-driven (falls back to annuity if CFADS infeasible)">
+          <Select value={ap.phase3Mode} onChange={v=>setAuto({phase3Mode:v})} options={['annuity','sculpt']}/>
+        </Field>
+        <Field label="TIFIA Instrument"><Select value={c.tifiaInstrumentId} onChange={v=>setCascade({tifiaInstrumentId:v})} options={model.financing.instruments.filter(i=>i.type==='TIFIA Loan').map(i=>i.id)}/></Field>
+      </div>
+      <div className="mt-4 flex h-6 rounded overflow-hidden border border-stone-700/60">
+        {(()=>{
+          const segs = [
+            {label:`CapI ${ap.deferYears}y`, w: (ap.deferYears||0)/tifiaTenor, c:'#475569'},
+            {label:`IO ${ap.ioYears}y`, w: (ap.ioYears||0)/tifiaTenor, c:'#fbbf24'},
+            {label:`Sculpt ${sculptYears.toFixed(0)}y`, w: sculptYears/tifiaTenor, c:'#a78bfa'},
+            {label:`Level ${ap.testYearsBeforeMaturity}y`, w: (ap.testYearsBeforeMaturity||0)/tifiaTenor, c:'#10b981'},
+          ];
+          return segs.map((s,i)=>(
+            <div key={i} style={{width:`${s.w*100}%`, background:s.c}} className="flex items-center justify-center text-[9px] font-medium text-stone-950 px-1">
+              {s.w > 0.06 ? s.label : ''}
+            </div>
+          ));
+        })()}
+      </div>
+    </Section>
+
+    <Section title="Step 2 · TIFIA-Eligible Capex Items"
+      subtitle={`Items checked here count toward the TIFIA % cap. Eligible total: ${fmt$(eligiblePreview)} of ${fmt$(sum(results?.capexSched?.monthly || []))}.`}>
+      <div className="grid grid-cols-3 gap-x-3 gap-y-1 max-h-64 overflow-y-auto p-2 bg-stone-900/40 border border-stone-700/60 rounded">
+        {model.capex.items.map(it => {
+          const itemTotal = results && results.capexSched ? sum(results.capexSched.byItem[it.id] || []) : 0;
+          return <label key={it.id} className="flex items-center gap-2 px-2 py-1 hover:bg-stone-800/60 rounded cursor-pointer">
+            <input type="checkbox" checked={eligibleIds.includes(it.id)} onChange={()=>toggleEligible(it.id)} className="accent-amber-500"/>
+            <span className="text-xs text-stone-300 flex-1 truncate">{it.name}</span>
+            <span className="text-[10px] text-stone-500 font-mono">{fmt$(itemTotal)}</span>
+          </label>;
+        })}
+      </div>
+    </Section>
+
+    <Section title="Step 3 · Constraint Floors"
+      subtitle="TIFIA is binary-searched between min and max % to find the largest size that satisfies ALL three DSCR floors AND the 50% test.">
+      <div className="grid grid-cols-2 gap-3 mb-3">
+        <Field label="Min TIFIA % (search floor)"><NumInput value={ap.minTifiaPct} onChange={v=>setAuto({minTifiaPct:v})} step={0.01} suffix="%"/></Field>
+        <Field label="Max TIFIA % (statute cap)" hint="49% is the federal statutory cap"><NumInput value={ap.maxTifiaPct} onChange={v=>setAuto({maxTifiaPct:v})} step={0.01} suffix="%"/></Field>
+      </div>
       <div className="grid grid-cols-3 gap-3">
-        <Field label="Min Senior DSCR"><NumInput value={o.constraints.minSeniorDSCR} onChange={v=>setCons('minSeniorDSCR',v)} step={0.05}/></Field>
-        <Field label="Min Total DSCR"><NumInput value={o.constraints.minTotalDSCR} onChange={v=>setCons('minTotalDSCR',v)} step={0.05}/></Field>
-        <Field label="Min LLCR"><NumInput value={o.constraints.minLLCR} onChange={v=>setCons('minLLCR',v)} step={0.05}/></Field>
-        <Field label="Min PLCR"><NumInput value={o.constraints.minPLCR} onChange={v=>setCons('minPLCR',v)} step={0.05}/></Field>
-        <Field label="Enforce 1.0x overall obligation"><Toggle value={o.constraints.enforceOverallObligation} onChange={v=>setCons('enforceOverallObligation',v)} label={o.constraints.enforceOverallObligation?'ON':'OFF'}/></Field>
+        <Field label="Min Total DSCR (Sr + TIFIA)" hint="Primary TIFIA-sizing constraint"><NumInput value={ap.minTotalDSCR} onChange={v=>setAuto({minTotalDSCR:v})} step={0.05}/></Field>
+        <Field label="Min Senior DSCR" hint="Binds PAB sizing when TIFIA at 49%"><NumInput value={ap.minSrDSCR} onChange={v=>setAuto({minSrDSCR:v})} step={0.05}/></Field>
+        <Field label="Min TIFIA Eff DSCR" hint="(CFADS − Sr DS) / TIFIA DS"><NumInput value={ap.minTifiaDSCR} onChange={v=>setAuto({minTifiaDSCR:v})} step={0.05}/></Field>
       </div>
     </Section>
 
-    {mode==='single' && <>
-      <Section title="Single-Instrument Sizing">
-        <div className="grid grid-cols-2 gap-4 mb-4">
-          <Field label="Target Instrument"><Select value={o.targetInstrumentId} onChange={v=>setO({targetInstrumentId:v})} options={model.financing.instruments.map(i=>i.id)}/></Field>
-          <div className="text-xs text-stone-400 pt-6">{(()=>{
-            const inst = model.financing.instruments.find(i=>i.id===o.targetInstrumentId);
-            return inst ? `${inst.type} — current size ${fmt$(inst.amount)}` : '';
-          })()}</div>
-        </div>
-        <div className="flex items-center gap-3">
-          <button onClick={runSingle} disabled={running} className="px-4 py-2 bg-amber-500 text-stone-900 rounded text-sm font-medium hover:bg-amber-400 disabled:opacity-50">{running?'Optimizing…':'Run Optimizer'}</button>
-          {output && output.best && <button onClick={applySingle} className="px-4 py-2 bg-emerald-500/20 text-emerald-300 border border-emerald-600 rounded text-sm hover:bg-emerald-500/30">Apply ({fmt$(output.best)})</button>}
-        </div>
-      </Section>
-      {output && output.iterations && (
-        <Section title="Optimization Trace">
-          <div className="grid grid-cols-3 gap-3 mb-4">
-            <Metric label="Optimal principal" value={fmt$(output.best)} accent="amber"/>
-            <Metric label="Iterations" value={output.iterations.length} accent="stone"/>
-            <Metric label="Final min DSCR" value={fmtRatio(output.bestResults?.minSeniorDSCR)} accent="green"/>
-          </div>
-          <div className="overflow-x-auto border border-stone-700/60 rounded max-h-72">
-            <table className="w-full text-xs"><thead className="bg-stone-900 sticky top-0"><tr><TH>Iter</TH><TH className="text-right">Test Principal</TH><TH className="text-center">Feasible?</TH><TH className="text-right">Min DSCR</TH><TH className="text-right">Min LLCR</TH></tr></thead>
-            <tbody>{output.iterations.map((it,i)=>(<tr key={i}>
-              <TD>{it.iter+1}</TD><TD className="text-right">{fmt$(it.amount)}</TD>
-              <TD className="text-center">{it.ok?<span className="text-emerald-400">✓</span>:<span className="text-rose-400">✗</span>}</TD>
-              <TD className="text-right">{fmtRatio(it.minDSCR)}</TD><TD className="text-right">{fmtRatio(it.minLLCR)}</TD></tr>))}</tbody></table>
-          </div>
-        </Section>
-      )}
-    </>}
+    <Section title="Step 4 · Run">
+      <div className="flex items-center gap-3">
+        <button onClick={runOpt} disabled={running}
+          className="px-6 py-3 bg-amber-500 text-stone-900 rounded text-sm font-medium hover:bg-amber-400 disabled:opacity-50">
+          {running ? 'Running…' : '▶ Run Cascade Optimizer'}
+        </button>
+        {output && output.best && <button onClick={applyOpt}
+          className="px-6 py-3 bg-emerald-500/10 border border-emerald-500/50 text-emerald-300 rounded text-sm hover:bg-emerald-500/20">
+          ✓ Apply Optimized Stack
+        </button>}
+      </div>
+    </Section>
 
-    {mode==='joint' && <>
-      <Section title="Joint Multi-Tranche Targets" subtitle="Listed in seniority order (Senior → Sub). Each gets sized against residual CFADS at its target."
-        action={<button onClick={addJointTarget} className="text-xs px-3 py-1.5 bg-amber-500/10 border border-amber-500/50 text-amber-300 rounded hover:bg-amber-500/20">+ Add Tranche</button>}>
-        <table className="w-full">
-          <thead><tr><TH>Instrument</TH><TH className="text-right">Min DSCR (own)</TH><TH className="text-right">Min LLCR (own)</TH><TH></TH></tr></thead>
-          <tbody>{o.jointTargets.map((t,i)=>{
-            const inst = model.financing.instruments.find(x=>x.id===t.instrumentId);
-            return <tr key={i} className="hover:bg-stone-900/40">
-              <TD><Select value={t.instrumentId} onChange={v=>updateJointTarget(i,{instrumentId:v})} options={model.financing.instruments.filter(x=>!['Grant','Paygo'].includes(x.seniority)).map(x=>x.id)}/>
-                <div className="text-[10px] text-stone-500 mt-1">{inst?`${inst.type} (${inst.seniority}) · current ${fmt$(inst.amount)}`:'—'}</div>
-              </TD>
-              <TD className="text-right"><NumInput value={t.minDSCR} onChange={v=>updateJointTarget(i,{minDSCR:v})} step={0.05}/></TD>
-              <TD className="text-right"><NumInput value={t.minLLCR} onChange={v=>updateJointTarget(i,{minLLCR:v})} step={0.05}/></TD>
-              <TD><button onClick={()=>removeJointTarget(i)} className="text-xs text-rose-400 hover:text-rose-300">remove</button></TD>
-            </tr>;
-          })}</tbody>
-        </table>
-        <div className="grid grid-cols-2 gap-4 mt-4">
-          <Field label="Funding-Gap Plug Instrument"><Select value={o.plugInstrumentId} onChange={v=>setO({plugInstrumentId:v})} options={model.financing.instruments.map(i=>i.id)}/></Field>
-          <div className="text-xs text-stone-400 pt-6">After sizing tranches, this instrument is adjusted up or down so Sources = Uses.</div>
-        </div>
-        <div className="mt-4 flex items-center gap-3">
-          <button onClick={runJoint} disabled={running} className="px-4 py-2 bg-amber-500 text-stone-900 rounded text-sm font-medium hover:bg-amber-400 disabled:opacity-50">{running?'Optimizing…':'Run Joint Optimizer'}</button>
-          {jointOutput && jointOutput.workingModel && <button onClick={applyJoint} className="px-4 py-2 bg-emerald-500/20 text-emerald-300 border border-emerald-600 rounded text-sm hover:bg-emerald-500/30">Apply Joint Sizing</button>}
-        </div>
-      </Section>
-      {jointOutput && jointOutput.outerHistory && (
-        <Section title="Joint Sizing Result" subtitle={jointOutput.converged ? `Converged in ${jointOutput.outerIterations} iteration(s)` : `Stopped at ${jointOutput.outerIterations} iterations (did not fully converge)`}>
-          <div className="grid grid-cols-4 gap-3 mb-4">
-            <Metric label="Outer iterations" value={jointOutput.outerIterations} accent={jointOutput.converged?'green':'amber'} sub={jointOutput.converged?'Converged':'Tolerance not met'}/>
-            <Metric label="Total plug adjustment" value={fmt$(jointOutput.totalPlugAdjustment)} accent="violet" sub={`Δ ${model.financing.instruments.find(i=>i.id===o.plugInstrumentId)?.type||''}`}/>
-            <Metric label="Final gap" value={fmt$(jointOutput.finalGap)} accent={Math.abs(jointOutput.finalGap)<1e6?'green':'red'} sub="Post-plug"/>
-            <Metric label="Final min Sr DSCR" value={fmtRatio(jointOutput.finalResults?.minSeniorDSCR)} accent="green"/>
-          </div>
-          <div className="text-[11px] uppercase tracking-wider text-stone-400 mb-2">Iteration Convergence Trace</div>
-          <div className="overflow-x-auto border border-stone-700/60 rounded mb-4">
-            <table className="w-full text-xs">
-              <thead className="bg-stone-900"><tr>
-                <TH>Iter</TH>
-                <TH className="text-right">Pre-plug Gap</TH>
-                <TH className="text-right">Plug Δ</TH>
-                <TH className="text-right">Post-plug Gap</TH>
-                <TH className="text-right">Min Sr DSCR</TH>
-                <TH className="text-right">Min LLCR</TH>
-              </tr></thead>
-              <tbody>{jointOutput.outerHistory.map((h,i)=>(
-                <tr key={i} className="hover:bg-stone-900/40">
-                  <TD>{h.outerIter}</TD>
-                  <TD className="text-right text-amber-300">{fmt$(h.preGap)}</TD>
-                  <TD className="text-right text-violet-300">{fmt$(h.plugAdjustment)}</TD>
-                  <TD className={`text-right ${Math.abs(h.postGap)<1e6?'text-emerald-300':'text-rose-300'}`}>{fmt$(h.postGap)}</TD>
-                  <TD className="text-right text-stone-300">{fmtRatio(h.minSeniorDSCR)}</TD>
-                  <TD className="text-right text-stone-300">{fmtRatio(h.minLLCR)}</TD>
-                </tr>
-              ))}</tbody>
-            </table>
-          </div>
-          <div className="text-[11px] uppercase tracking-wider text-stone-400 mb-2">Final Tranche Sizes</div>
-          <table className="w-full">
-            <thead><tr><TH>Instrument</TH><TH>Seniority</TH><TH className="text-right">Sized to</TH><TH className="text-right">Bisection Iters</TH></tr></thead>
-            <tbody>{jointOutput.traces.map((t,i)=>{
-              const inst = jointOutput.workingModel.financing.instruments.find(x=>x.id===t.instrumentId);
-              return <tr key={i} className="hover:bg-stone-900/40">
-                <TD mono={false} className="text-stone-200">{inst?inst.type:t.instrumentId}</TD>
-                <TD mono={false} className="text-stone-400">{t.seniority||'—'}</TD>
-                <TD className="text-right text-amber-300">{t.best?fmt$(t.best):(t.error||'—')}</TD>
-                <TD className="text-right text-stone-400">{t.iterations||0}</TD>
-              </tr>;
-            })}</tbody>
-          </table>
-        </Section>
-      )}
-    </>}
-
-    {mode==='cascade' && (()=>{
-      const c = o.cascade || {};
-      const ap = c.autoTifiaParams || {};
-      const setAuto = patch => setCascade({autoTifiaParams: {...ap, ...patch}});
-      const eligibleIds = c.tifiaEligibleCapexIds || [];
-      const toggleEligible = (id) => {
-        const newIds = eligibleIds.includes(id) ? eligibleIds.filter(x=>x!==id) : [...eligibleIds, id];
-        setCascade({tifiaEligibleCapexIds: newIds});
-      };
-      // Eligible cost preview from current model
-      let eligiblePreview = 0;
-      if(results && results.capexSched){
-        for(const id of eligibleIds){
-          eligiblePreview += sum(results.capexSched.byItem[id] || []);
-        }
-      }
-      const tifiaPreview = eligiblePreview * (c.tifiaPercentage || 0);
-      return <>
-        <Section title="Auto-Optimize TIFIA %"
-          subtitle="When ON: binary-search the maximum TIFIA % such that (a) the 50% balance test passes by construction (phases built deterministically), (b) Sr DSCR ≥ floor, and (c) TIFIA effective DSCR ≥ floor. Auto-cascade overrides the manual TIFIA % in Step 1 below."
-          action={<Toggle value={c.autoOptimizeTifia} onChange={v=>setCascade({autoOptimizeTifia:v})} label={c.autoOptimizeTifia?'AUTO ON':'AUTO OFF'}/>}>
-          {c.autoOptimizeTifia && <div className="space-y-4">
-            <div className="grid grid-cols-4 gap-3">
-              <Field label="Defer Years (CapI)"><NumInput value={ap.deferYears} onChange={v=>setAuto({deferYears:v})} step={1} suffix="y"/></Field>
-              <Field label="IO Years"><NumInput value={ap.ioYears} onChange={v=>setAuto({ioYears:v})} step={1} suffix="y"/></Field>
-              <Field label="Test Point (yrs before maturity)"><NumInput value={ap.testYearsBeforeMaturity} onChange={v=>setAuto({testYearsBeforeMaturity:v})} step={1} suffix="y"/></Field>
-              <Field label="Phase 3 Mode"><Select value={ap.phase3Mode} onChange={v=>setAuto({phase3Mode:v})} options={['sculpt','annuity']}/></Field>
+    {output && (
+      <Section title="Result" subtitle={output.converged ? `Converged in ${output.trace.length} iterations` : 'Did not converge'}>
+        {output.error && <div className="p-3 bg-rose-900/20 border border-rose-700/50 rounded text-rose-300 text-sm mb-3">Error: {output.error}</div>}
+        {output.best && (()=>{
+          const b = output.best;
+          const atCeiling = b.pct >= (ap.maxTifiaPct - 0.005);
+          return <>
+            <div className="grid grid-cols-4 gap-3 mb-4">
+              <Metric label="TIFIA %" value={fmtPct(b.pct, 2)} accent="amber" sub={atCeiling ? '49% statutory ceiling' : 'Constraint-bound below 49%'}/>
+              <Metric label="TIFIA Principal" value={fmt$(b.tifiaAmount)} accent="amber" sub={`of ${fmt$(b.eligibleCost)} eligible`}/>
+              <Metric label="PAB Sized to" value={fmt$(b.pabAmount)} accent={b.pabAmount > 0 ? 'amber' : 'stone'} sub={b.pabAmount > 0 ? 'fills funding gap' : 'no PAB needed'}/>
+              <Metric label="Funding Gap" value={fmt$(b.finalGap)} accent={Math.abs(b.finalGap) < 1e6 ? 'green' : 'amber'} sub="post plug-equity"/>
             </div>
-            <div className="grid grid-cols-2 gap-3">
-              <Field label="Min TIFIA % (search floor)"><NumInput value={ap.minTifiaPct} onChange={v=>setAuto({minTifiaPct:v})} step={0.01} suffix="%"/></Field>
-              <Field label="Max TIFIA % (statute cap)"><NumInput value={ap.maxTifiaPct} onChange={v=>setAuto({maxTifiaPct:v})} step={0.01} suffix="%"/></Field>
+            <div className="grid grid-cols-4 gap-3 mb-4">
+              <Metric label="Min Total DSCR" value={fmtRatio(b.minTotalDSCR)} accent={!b.minTotalDSCR || b.minTotalDSCR >= (ap.minTotalDSCR||1.10) ? 'green' : 'red'} sub={`floor ${(ap.minTotalDSCR||1.10).toFixed(2)}x`}/>
+              <Metric label="Min Senior DSCR" value={(b.minSrDSCR && b.minSrDSCR >= 998) ? '—' : fmtRatio(b.minSrDSCR)} accent={!b.minSrDSCR || b.minSrDSCR >= (ap.minSrDSCR||1.30) ? 'green' : 'red'} sub={(b.minSrDSCR && b.minSrDSCR >= 998) ? 'no senior debt (PAB=0)' : `floor ${(ap.minSrDSCR||1.30).toFixed(2)}x`}/>
+              <Metric label="Min TIFIA Eff DSCR" value={fmtRatio(b.minTifiaEffDSCR)} accent={!b.minTifiaEffDSCR || b.minTifiaEffDSCR >= (ap.minTifiaDSCR||1.10) ? 'green' : 'red'} sub={`floor ${(ap.minTifiaDSCR||1.10).toFixed(2)}x`}/>
+              <Metric label="Test Point Balance" value={fmt$(b.testBalAtPoint)} accent={b.testPassed ? 'green' : 'red'} sub={`target 50% = ${fmt$(0.5*b.tifiaAmount)} · ${b.testPassed ? 'PASS' : 'FAIL'}`}/>
             </div>
-            <div className="grid grid-cols-3 gap-3">
-              <Field label="Min Total DSCR (Sr + TIFIA)" hint="Binds TIFIA sizing"><NumInput value={ap.minTotalDSCR} onChange={v=>setAuto({minTotalDSCR:v})} step={0.05}/></Field>
-              <Field label="Min Senior DSCR" hint="Binds PAB sizing"><NumInput value={ap.minSrDSCR} onChange={v=>setAuto({minSrDSCR:v})} step={0.05}/></Field>
-              <Field label="Min TIFIA Eff DSCR" hint="(CFADS−SrDS)/TIFIA DS"><NumInput value={ap.minTifiaDSCR} onChange={v=>setAuto({minTifiaDSCR:v})} step={0.05}/></Field>
+            <div className="bg-stone-900/40 border border-amber-500/30 rounded p-3 mb-3">
+              <div className="text-[11px] uppercase tracking-wider text-amber-300 mb-1">Phase Structure</div>
+              <div className="text-xs text-stone-300">{b.phaseInfo?.diagnosis}</div>
+              {b.phaseInfo?.fallbackUsed && <div className="text-xs text-amber-400 mt-1">⚠ Sculpt CFADS-infeasible — fell back to annuity</div>}
+              <div className="mt-2 flex h-6 rounded overflow-hidden border border-stone-700/60">
+                {(b.phaseInfo?.phases || []).map((p, idx) => {
+                  const startP = idx === 0 ? 0 : (b.phaseInfo.phases[idx-1].endPeriod || 0);
+                  const lastEnd = b.phaseInfo.phases[b.phaseInfo.phases.length-1].endPeriod;
+                  const widthPct = ((p.endPeriod - startP) / Math.max(1, lastEnd)) * 100;
+                  const colors = {defer:'#475569', io:'#fbbf24', sculpt:'#a78bfa', level:'#10b981', 'equal-principal':'#fb7185'};
+                  return <div key={idx} style={{width:`${widthPct}%`, background:colors[p.regime]||'#666'}}
+                    className="flex items-center justify-center text-[9px] font-medium text-stone-950 px-1"
+                    title={`${p.regime} (${startP}→${p.endPeriod})${p.targetDSCR?` @ ${p.targetDSCR.toFixed(2)}x`:''}`}>
+                    {widthPct > 8 ? p.regime : ''}
+                  </div>;
+                })}
+              </div>
             </div>
-            <div className="bg-stone-900/40 border border-stone-700/60 rounded p-3 text-xs text-stone-400 space-y-1">
-              <div><span className="text-amber-300">Phase 1 — Defer (CapI):</span> {ap.deferYears}y · interest capitalizes into balance</div>
-              <div><span className="text-amber-300">Phase 2 — IO:</span> {ap.ioYears}y · pay interest only</div>
-              <div><span className="text-amber-300">Phase 3 — {ap.phase3Mode === 'annuity' ? 'Annuity (level pmt)' : 'Sculpt (binary-searched DSCR)'}:</span> from period {(ap.deferYears+ap.ioYears)*(model.general.periodsPerYear||2)} to test point · targets balance = 50% of original P at test point</div>
-              <div><span className="text-amber-300">Phase 4 — Level:</span> {ap.testYearsBeforeMaturity}y · amortize remaining 50% to zero by maturity</div>
-              {ap.phase3Mode === 'sculpt' && <div className="text-stone-500">If sculpt is infeasible (TIFIA too large for CFADS), phase 3 falls back to annuity automatically.</div>}
-            </div>
-            <div className="flex items-center gap-3">
-              <button onClick={runAutoCascade} disabled={running}
-                className="px-4 py-2 bg-amber-500 text-stone-900 rounded text-sm font-medium hover:bg-amber-400 disabled:opacity-50">
-                {running ? 'Running auto-cascade…' : 'Run Auto-Cascade TIFIA Optimizer'}
-              </button>
-              {autoCascadeOutput && autoCascadeOutput.best && <button onClick={applyAutoCascade} className="px-4 py-2 bg-emerald-500/10 border border-emerald-500/50 text-emerald-300 rounded text-sm hover:bg-emerald-500/20">Apply Optimized Stack</button>}
-            </div>
-          </div>}
-        </Section>
-
-        {c.autoOptimizeTifia && autoCascadeOutput && (
-          <Section title="Auto-Cascade Result" subtitle={autoCascadeOutput.converged?'Converged':'Did not converge'}>
-            {autoCascadeOutput.error && <div className="p-3 bg-rose-900/20 border border-rose-700/50 rounded text-rose-300 text-sm mb-3">Error: {autoCascadeOutput.error}</div>}
-            {autoCascadeOutput.best && (()=>{
-              const b = autoCascadeOutput.best;
-              return <>
-                <div className="grid grid-cols-4 gap-3 mb-4">
-                  <Metric label="Optimized TIFIA %" value={fmtPct(b.pct,2)} accent="amber" sub={b.pct >= (ap.maxTifiaPct-0.005) ? 'Ceiling reached' : 'Max feasible'}/>
-                  <Metric label="TIFIA Principal" value={fmt$(b.tifiaAmount)} accent="amber" sub={`of ${fmt$(b.eligibleCost)} eligible`}/>
-                  <Metric label="Balance @ Test Point" value={fmt$(b.testBalAtPoint)} accent={b.testPassed?'green':'red'} sub={`50% target = ${fmt$(0.5*b.tifiaAmount)} · ${b.testPassed?'PASS':'FAIL'}`}/>
-                  <Metric label="Funding Gap" value={fmt$(b.finalGap)} accent={Math.abs(b.finalGap)<1e6?'green':'amber'} sub="Post-plug"/>
-                </div>
-                <div className="grid grid-cols-4 gap-3 mb-4">
-                  <Metric label="Min Total DSCR (Sr+TIFIA)" value={fmtRatio(b.minTotalDSCR)} accent={!b.minTotalDSCR || b.minTotalDSCR >= (ap.minTotalDSCR||1.10) ? 'green':'red'} sub={`floor ${(ap.minTotalDSCR||1.10).toFixed(2)}x · binds TIFIA`}/>
-                  <Metric label="Min Senior DSCR" value={fmtRatio(b.minSrDSCR)} accent={b.minSrDSCR >= (ap.minSrDSCR||1.30) ? 'green':'red'} sub={`floor ${(ap.minSrDSCR||1.30).toFixed(2)}x`}/>
-                  <Metric label="Min TIFIA Eff DSCR" value={fmtRatio(b.minTifiaEffDSCR)} accent={!b.minTifiaEffDSCR || b.minTifiaEffDSCR >= (ap.minTifiaDSCR||1.10) ? 'green':'red'} sub={`floor ${(ap.minTifiaDSCR||1.10).toFixed(2)}x`}/>
-                  <Metric label="PAB Sized to" value={fmt$(b.pabAmount)} accent="amber" sub={`fills senior capacity`}/>
-                </div>
-                <div className="bg-stone-900/40 border border-amber-500/30 rounded p-3 mb-3">
-                  <div className="text-[11px] uppercase tracking-wider text-amber-300 mb-1">Phase Structure (auto-generated)</div>
-                  <div className="text-xs text-stone-300">{b.phaseInfo?.diagnosis}</div>
-                  {b.phaseInfo?.fallbackUsed && <div className="text-xs text-amber-400 mt-1">⚠ Sculpt failed — fell back to annuity for phase 3</div>}
-                  <div className="mt-2 flex h-6 rounded overflow-hidden border border-stone-700/60">
-                    {(b.phaseInfo?.phases || []).map((p, idx) => {
-                      const startP = idx === 0 ? 0 : (b.phaseInfo.phases[idx-1].endPeriod || 0);
-                      const widthPct = ((p.endPeriod - startP) / Math.max(1, b.phaseInfo.phases[b.phaseInfo.phases.length-1].endPeriod)) * 100;
-                      const colors = {defer:'#475569', io:'#fbbf24', sculpt:'#a78bfa', level:'#10b981', 'equal-principal':'#fb7185'};
-                      return <div key={idx} style={{width:`${widthPct}%`, background:colors[p.regime]||'#666'}} className="flex items-center justify-center text-[9px] font-medium text-stone-950" title={`${p.regime} (${startP}→${p.endPeriod})`}>
-                        {widthPct > 8 ? p.regime : ''}
-                      </div>;
-                    })}
-                  </div>
-                </div>
-                <div className="text-[11px] uppercase tracking-wider text-stone-400 mb-2">Binary Search Trace</div>
-                <div className="overflow-x-auto border border-stone-700/60 rounded">
-                  <table className="w-full text-xs">
-                    <thead className="bg-stone-900"><tr>
-                      <TH>Iter</TH><TH className="text-right">TIFIA %</TH><TH className="text-right">TIFIA $</TH><TH className="text-right">PAB $</TH>
-                      <TH className="text-right">Min Total</TH><TH className="text-right">Min Sr</TH><TH className="text-right">TIFIA Eff</TH>
-                      <TH className="text-right">Test Bal</TH><TH>Feasible</TH>
-                    </tr></thead>
-                    <tbody>{autoCascadeOutput.trace.map((t,i)=>(
-                      <tr key={i} className={`hover:bg-stone-900/40 ${t.feasible?'':'opacity-60'}`}>
-                        <TD>{t.iter}</TD>
-                        <TD className="text-right text-amber-300">{fmtPct(t.pct,2)}</TD>
-                        <TD className="text-right text-stone-300">{fmt$(t.tifiaAmount)}</TD>
-                        <TD className="text-right text-stone-300">{fmt$(t.pabAmount)}</TD>
-                        <TD className="text-right text-stone-300">{fmtRatio(t.minTotalDSCR)}</TD>
-                        <TD className="text-right text-stone-300">{fmtRatio(t.minSrDSCR)}</TD>
-                        <TD className="text-right text-stone-300">{fmtRatio(t.minTifiaEffDSCR)}</TD>
-                        <TD className="text-right text-stone-400">{fmt$(t.testBalAtPoint)}</TD>
-                        <TD className={t.feasible?'text-emerald-300':'text-rose-300'}>{t.feasible?'✓':'✗'}</TD>
-                      </tr>
-                    ))}</tbody>
-                  </table>
-                </div>
-              </>;
-            })()}
-          </Section>
-        )}
-
-        {!c.autoOptimizeTifia && (<>
-        <Section title="Step 1 — TIFIA Sizing (% of Eligible Capex)" subtitle="Select which capex line items are TIFIA-eligible. TIFIA sized as % of summed nominal capex. (TIFIA statute caps at 33% normally, 49% in some cases.)">
-          <div className="grid grid-cols-2 gap-4 mb-4">
-            <Field label="TIFIA Instrument"><Select value={c.tifiaInstrumentId} onChange={v=>setCascade({tifiaInstrumentId:v})} options={model.financing.instruments.filter(i=>i.type==='TIFIA Loan').map(i=>i.id)}/></Field>
-            <Field label="Eligible Cost %"><NumInput value={c.tifiaPercentage} onChange={v=>setCascade({tifiaPercentage:v})} step={0.01} suffix="%"/></Field>
-          </div>
-          <div className="text-[11px] uppercase tracking-wider text-stone-400 mb-2">Capex Items — Toggle TIFIA-Eligible</div>
-          <div className="grid grid-cols-3 gap-2 mb-4 max-h-64 overflow-y-auto border border-stone-700/60 rounded p-3 bg-stone-950">
-            {model.capex.items.map(item => {
-              const sel = eligibleIds.includes(item.id);
-              const itemTotal = results?.capexSched?.byItem?.[item.id] ? sum(results.capexSched.byItem[item.id]) : item.base;
-              return <label key={item.id} className={`flex items-center justify-between gap-2 p-2 rounded cursor-pointer border ${sel?'bg-amber-500/10 border-amber-500/40':'bg-stone-900/40 border-stone-800 hover:border-stone-700'}`}>
-                <div className="flex items-center gap-2 min-w-0">
-                  <input type="checkbox" checked={sel} onChange={()=>toggleEligible(item.id)} className="accent-amber-500 flex-shrink-0"/>
-                  <span className="text-xs text-stone-200 truncate">{item.label}</span>
-                </div>
-                <span className="text-[10px] text-stone-500 font-mono flex-shrink-0">{fmt$(itemTotal)}</span>
-              </label>;
-            })}
-          </div>
-          <div className="grid grid-cols-2 gap-3">
-            <Metric label="Eligible Cost (preview)" value={fmt$(eligiblePreview)} accent="stone" sub={`${eligibleIds.length} of ${model.capex.items.length} items`}/>
-            <Metric label="TIFIA Sized to (preview)" value={fmt$(tifiaPreview)} accent="amber" sub={`${(c.tifiaPercentage*100).toFixed(1)}% × eligible`}/>
-          </div>
-        </Section>
-
-        <Section title="Step 2 — PAB Sizing (Target Senior DSCR)" subtitle="After TIFIA is sized, PAB is sized via binary search to the maximum that meets the target Senior DSCR.">
-          <div className="grid grid-cols-2 gap-4">
-            <Field label="PAB Instrument"><Select value={c.pabInstrumentId} onChange={v=>setCascade({pabInstrumentId:v})} options={model.financing.instruments.filter(i=>i.seniority==='Senior').map(i=>i.id)}/></Field>
-            <Field label="Target Senior DSCR"><NumInput value={c.pabTargetDSCR} onChange={v=>setCascade({pabTargetDSCR:v})} step={0.05}/></Field>
-          </div>
-        </Section>
-
-        <Section title="Step 3 — Equity Sizing (Target IRR from Residual CF)" subtitle="Equity sized as NPV of residual equity cashflow stream (CFADS − DS − reserves) discounted at target IRR. Sized to exactly earn that IRR from project cashflows.">
-          <div className="grid grid-cols-2 gap-4">
-            <Field label="Equity Instrument"><Select value={c.equityInstrumentId} onChange={v=>setCascade({equityInstrumentId:v})} options={model.financing.instruments.filter(i=>i.seniority==='Equity').map(i=>i.id)}/></Field>
-            <Field label="Target Equity IRR"><NumInput value={c.targetEquityIRR} onChange={v=>setCascade({targetEquityIRR:v})} step={0.005} suffix="%"/></Field>
-          </div>
-        </Section>
-
-        <Section title="Step 4 — Plug Instrument (Funding Gap)" subtitle="Whatever gap remains between uses and sources flows into the plug. If plug is the same as the equity instrument, any plug above the IRR-sized equity will dilute the actual achieved IRR below target.">
-          <div className="grid grid-cols-1 gap-4">
-            <Field label="Plug Instrument"><Select value={c.plugInstrumentId} onChange={v=>setCascade({plugInstrumentId:v})} options={model.financing.instruments.map(i=>i.id)}/></Field>
-          </div>
-        </Section>
-
-        <div className="flex items-center gap-3 mb-6">
-          <button onClick={runCascade} disabled={running} className="px-4 py-2 bg-amber-500 text-stone-900 rounded text-sm font-medium hover:bg-amber-400 disabled:opacity-50">
-            {running?'Running cascade…':'Run Cascade Waterfall'}
-          </button>
-          {cascadeOutput && cascadeOutput.workingModel && <button onClick={applyCascade} className="px-4 py-2 bg-emerald-500/10 border border-emerald-500/50 text-emerald-300 rounded text-sm hover:bg-emerald-500/20">Apply Sized Capital Stack</button>}
-        </div>
-
-        {cascadeOutput && cascadeOutput.trace && (
-          <Section title="Cascade Result" subtitle={cascadeOutput.converged ? `Converged in ${cascadeOutput.outerIterations} iteration(s)` : `Stopped at ${cascadeOutput.outerIterations} (did not fully converge)`}>
-            {cascadeOutput.error && <div className="p-3 bg-rose-900/20 border border-rose-700/50 rounded text-rose-300 text-sm mb-3">Error: {cascadeOutput.error}</div>}
-            {cascadeOutput.trace.length > 0 && (()=>{
-              const last = cascadeOutput.trace[cascadeOutput.trace.length-1];
-              const irrDilution = last.actualEquityIRR != null && c.targetEquityIRR != null ? c.targetEquityIRR - last.actualEquityIRR : 0;
-              return <>
-                <div className="grid grid-cols-4 gap-3 mb-4">
-                  <Metric label="TIFIA" value={fmt$(last.tifiaAmount)} accent="amber" sub={`${(c.tifiaPercentage*100).toFixed(1)}% of ${fmt$(last.eligibleCost)}`}/>
-                  <Metric label="PAB" value={fmt$(last.pabAmount)} accent="amber" sub={`Min Sr DSCR ${fmtRatio(last.minSrDSCR)}`}/>
-                  <Metric label="Equity (Total incl. Plug)" value={fmt$(last.totalEquity)} accent="violet" sub={`Of which IRR-sized: ${fmt$(last.equityFromIRR)}`}/>
-                  <Metric label="Funding Gap (final)" value={fmt$(last.postGap)} accent={Math.abs(last.postGap)<1e6?'green':'red'} sub="Post-plug"/>
-                </div>
-                <div className="grid grid-cols-3 gap-3 mb-4">
-                  <Metric label="Target Equity IRR" value={fmtPct(c.targetEquityIRR,2)} accent="stone"/>
-                  <Metric label="Actual Achieved IRR" value={fmtPct(last.actualEquityIRR,2)} accent={Math.abs(irrDilution)<0.005?'green':'amber'} sub={Math.abs(irrDilution)<0.005?'On target':`${irrDilution>0?'Diluted by':'Above target by'} ${fmtPct(Math.abs(irrDilution),2)}`}/>
-                  <Metric label="Min LLCR" value={fmtRatio(last.minLLCR)} accent="stone"/>
-                </div>
-              </>;
-            })()}
-            <div className="text-[11px] uppercase tracking-wider text-stone-400 mb-2">Iteration Convergence Trace</div>
+            <div className="text-[11px] uppercase tracking-wider text-stone-400 mb-2">Binary Search Trace</div>
             <div className="overflow-x-auto border border-stone-700/60 rounded">
               <table className="w-full text-xs">
                 <thead className="bg-stone-900"><tr>
-                  <TH>Iter</TH>
-                  <TH className="text-right">Eligible Cost</TH>
-                  <TH className="text-right">TIFIA</TH>
-                  <TH className="text-right">PAB</TH>
-                  <TH className="text-right">Equity (IRR)</TH>
-                  <TH className="text-right">Plug Δ</TH>
-                  <TH className="text-right">Post Gap</TH>
-                  <TH className="text-right">Actual IRR</TH>
-                  <TH className="text-right">Min DSCR</TH>
+                  <TH>Iter</TH><TH className="text-right">TIFIA %</TH><TH className="text-right">TIFIA $</TH><TH className="text-right">PAB $</TH>
+                  <TH className="text-right">Min Total</TH><TH className="text-right">Min Sr</TH><TH className="text-right">TIFIA Eff</TH>
+                  <TH className="text-right">Test Bal</TH><TH>Feasible</TH>
                 </tr></thead>
-                <tbody>{cascadeOutput.trace.map((t,i)=>(
-                  <tr key={i} className="hover:bg-stone-900/40">
-                    <TD>{t.outer}</TD>
-                    <TD className="text-right text-stone-300">{fmt$(t.eligibleCost)}</TD>
-                    <TD className="text-right text-amber-300">{fmt$(t.tifiaAmount)}</TD>
-                    <TD className="text-right text-amber-300">{fmt$(t.pabAmount)}</TD>
-                    <TD className="text-right text-violet-300">{fmt$(t.equityFromIRR)}</TD>
-                    <TD className="text-right text-stone-300">{fmt$(t.plugAmount)}</TD>
-                    <TD className={`text-right ${Math.abs(t.postGap)<1e6?'text-emerald-300':'text-rose-300'}`}>{fmt$(t.postGap)}</TD>
-                    <TD className="text-right text-stone-300">{fmtPct(t.actualEquityIRR,2)}</TD>
-                    <TD className="text-right text-stone-300">{fmtRatio(t.minSrDSCR)}</TD>
+                <tbody>{output.trace.map((t,i)=>(
+                  <tr key={i} className={`hover:bg-stone-900/40 ${t.feasible?'':'opacity-60'}`}>
+                    <TD>{t.iter}</TD>
+                    <TD className="text-right text-amber-300">{fmtPct(t.pct,2)}</TD>
+                    <TD className="text-right text-stone-300">{fmt$(t.tifiaAmount)}</TD>
+                    <TD className="text-right text-stone-300">{fmt$(t.pabAmount)}</TD>
+                    <TD className="text-right text-stone-300">{fmtRatio(t.minTotalDSCR)}</TD>
+                    <TD className="text-right text-stone-300">{(t.minSrDSCR && t.minSrDSCR >= 998) ? '—' : fmtRatio(t.minSrDSCR)}</TD>
+                    <TD className="text-right text-stone-300">{fmtRatio(t.minTifiaEffDSCR)}</TD>
+                    <TD className="text-right text-stone-400">{fmt$(t.testBalAtPoint)}</TD>
+                    <TD className={t.feasible?'text-emerald-300':'text-rose-300'}>{t.feasible?'✓':'✗'}</TD>
                   </tr>
                 ))}</tbody>
               </table>
             </div>
-          </Section>
-        )}
-        </>)}
-      </>;
-    })()}
-  </div>;
-}
-
-function CFRow({label, data, positive, negative, bold, ratio, raw}){
-  return <tr className={`hover:bg-stone-900/40 ${bold?'bg-stone-900/40':''}`}>
-    <TD mono={false} className={`sticky left-0 bg-stone-950 ${bold?'text-stone-100 font-medium':'text-stone-300'}`}>{label}</TD>
-    {data.map((v,i)=>(
-      <TD key={i} className={`text-right ${positive?'text-emerald-300':''} ${negative?'text-rose-300':''} ${bold?'font-medium':''}`}>
-        {ratio?(v==null||!isFinite(v)?'—':`${v.toFixed(2)}x`):raw?(v!=null?v.toLocaleString():'—'):fmt$(v)}
-      </TD>))}
-  </tr>;
-}
-
-function CashflowTab({model, results}){
-  const periods = results.periods;
-  return <div>
-    <Section title={`Operating Cashflow — ${model.general.periodsPerYear===2?'Semi-Annual':'Annual'} (${model.general.useFiscalYear?`FY M${model.general.fyStartMonth}`:'CY'})`} subtitle={`${periods.length} periods · partial: ${periods.filter(p=>p.isPartial).length}`}>
-      <div className="overflow-x-auto border border-stone-700/60 rounded">
-        <table className="w-full text-xs">
-          <thead className="bg-stone-900/80 sticky top-0"><tr>
-            <TH className="sticky left-0 bg-stone-900 z-10 min-w-[240px]">Line Item ($ nominal)</TH>
-            {periods.map((p,i)=><TH key={i} className="text-right">{p.label}{p.isPartial?'*':''}</TH>)}
-          </tr></thead>
-          <tbody>
-            <CFRow label="Days in period" data={periods.map(p=>p.days)} raw/>
-            <CFRow label="Toll Revenue" data={results.revSched.byPeriod} positive/>
-            <CFRow label="Operating Expense" data={results.opexSched.byPeriod.map(v=>-v)} negative/>
-            <CFRow label="CFADS" data={results.cfadsByPeriod} bold/>
-            <CFRow label="Senior Interest" data={results.seniorInt.map(v=>-v)} negative/>
-            <CFRow label="Senior Principal" data={results.seniorPri.map(v=>-v)} negative/>
-            <CFRow label="Sub Interest" data={results.subInt.map(v=>-v)} negative/>
-            <CFRow label="Sub Principal" data={results.subPri.map(v=>-v)} negative/>
-            <CFRow label="Short-term DS" data={results.shortDS.map(v=>-v)} negative/>
-            <CFRow label="Total Debt Service" data={results.totalDS.map(v=>-v)} bold negative/>
-            <CFRow label="Equity CF (post-lockup)" data={results.equityCF} bold positive/>
-            <CFRow label="Senior DSCR" data={results.seniorDSCR} ratio/>
-            <CFRow label="Total DSCR" data={results.totalDSCR} ratio/>
-            <CFRow label="Senior LLCR" data={results.llcrSenior} ratio/>
-            <CFRow label="Overall Obligation Ratio" data={results.overallObligation} ratio/>
-            <CFRow label="Lockup (1=triggered)" data={results.lockup} raw/>
-            <CFRow label="Lockup Account — Deposits" data={results.lockupAcct.deposits.map(v=>-v)} negative/>
-            <CFRow label="Lockup Account — Releases" data={results.lockupAcct.releases} positive/>
-            <CFRow label="Lockup Account — Balance" data={results.lockupAcct.balance}/>
-          </tbody>
-        </table>
-      </div>
-      <p className="text-xs text-stone-500 mt-2">* partial period (days less than full period).</p>
-    </Section>
-    <Section title="Capex Monthly Schedule (Construction)">
-      <div className="overflow-x-auto border border-stone-700/60 rounded max-h-96">
-        <table className="w-full text-xs">
-          <thead className="bg-stone-900/80 sticky top-0"><tr>
-            <TH className="sticky left-0 bg-stone-900 min-w-[220px]">Line Item</TH>
-            {results.capexSched.monthly.map((_,i)=><TH key={i} className="text-right">M{i+1}</TH>)}
-            <TH className="text-right">Total</TH>
-          </tr></thead>
-          <tbody>
-            {model.capex.items.map(it=>{
-              const arr = results.capexSched.byItem[it.id]; if(!arr) return null;
-              return <tr key={it.id} className="hover:bg-stone-900/40">
-                <TD mono={false} className="sticky left-0 bg-stone-950 text-stone-200">{it.label}</TD>
-                {arr.map((v,i)=><TD key={i} className="text-right text-stone-300">{v>0?fmt$(v):'—'}</TD>)}
-                <TD className="text-right text-amber-300 font-medium">{fmt$(sum(arr))}</TD>
-              </tr>;
-            })}
-            <tr className="bg-stone-900/60">
-              <TD mono={false} className="sticky left-0 bg-stone-900 font-medium text-stone-100">TOTAL CAPEX</TD>
-              {results.capexSched.monthly.map((v,i)=><TD key={i} className="text-right text-amber-300 font-medium">{fmt$(v)}</TD>)}
-              <TD className="text-right text-amber-300 font-bold">{fmt$(results.capexSched.totalNominal)}</TD>
-            </tr>
-            <tr className="bg-stone-900/40">
-              <TD mono={false} className="sticky left-0 bg-stone-900 font-medium text-violet-200">TIFIA cap. interest</TD>
-              {results.tifiaConstr.monthlyInterest.map((v,i)=><TD key={i} className="text-right text-violet-300">{v>0?fmt$(v):'—'}</TD>)}
-              <TD className="text-right text-violet-300 font-bold">{fmt$(results.capitalizedTIFIAInterest)}</TD>
-            </tr>
-            <tr className="bg-stone-900/40">
-              <TD mono={false} className="sticky left-0 bg-stone-900 font-medium text-stone-200">Non-TIFIA IDC</TD>
-              {results.nonTIFIAIDCMonthly.map((v,i)=><TD key={i} className="text-right text-stone-300">{v>0?fmt$(v):'—'}</TD>)}
-              <TD className="text-right text-stone-200 font-bold">{fmt$(results.nonTIFIAIDC)}</TD>
-            </tr>
-            <tr className="bg-stone-900/40">
-              <TD mono={false} className="sticky left-0 bg-stone-900 font-medium text-emerald-200">Paygo contribution</TD>
-              {results.paygoSched.monthly.map((v,i)=><TD key={i} className="text-right text-emerald-300">{v>0?fmt$(v):'—'}</TD>)}
-              <TD className="text-right text-emerald-300 font-bold">{fmt$(results.paygoSched.total)}</TD>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-    </Section>
-  </div>;
-}
-
-function SourcesUsesTab({model, results}){
-  const uses = [];
-  model.capex.items.forEach(it=>{ uses.push({label:it.label, amount:sum(results.capexSched.byItem[it.id]||[])}); });
-  uses.push({label:'Capitalized TIFIA Interest', amount:results.capitalizedTIFIAInterest});
-  uses.push({label:'Non-TIFIA IDC', amount:results.nonTIFIAIDC});
-  uses.push({label:'Financing Fees', amount:results.financingFees});
-  const totalUses = sum(uses.map(u=>u.amount));
-  const sources = [];
-  model.financing.instruments.forEach(i=>sources.push({label:i.type, amount:i.amount, seniority:i.seniority}));
-  if(model.paygo.enabled) sources.push({label:'Paygo (Existing Net Revenues)', amount:results.paygoSched.total, seniority:'Paygo'});
-  const totalSources = sum(sources.map(s=>s.amount));
-  const gap = totalUses - totalSources;
-  return <div className="grid grid-cols-2 gap-6">
-    <Section title="Sources" subtitle={`Total: ${fmt$(totalSources)}`}>
-      <table className="w-full"><thead><tr><TH>Instrument</TH><TH>Seniority</TH><TH className="text-right">Amount</TH><TH className="text-right">%</TH></tr></thead>
-        <tbody>{sources.map((s,i)=>(<tr key={i} className="hover:bg-stone-900/40">
-          <TD mono={false} className="text-stone-200">{s.label}</TD>
-          <TD mono={false} className="text-stone-400">{s.seniority}</TD>
-          <TD className="text-right text-amber-300">{fmt$(s.amount)}</TD>
-          <TD className="text-right text-stone-400">{fmtPct(s.amount/totalSources)}</TD></tr>))}
-          <tr className="bg-stone-900/60"><TD mono={false} className="font-medium text-stone-100">TOTAL</TD><TD></TD>
-            <TD className="text-right text-amber-300 font-bold">{fmt$(totalSources)}</TD><TD className="text-right text-stone-400">100.0%</TD></tr>
-        </tbody></table>
-    </Section>
-    <Section title="Uses" subtitle={`Total: ${fmt$(totalUses)}`}>
-      <table className="w-full"><thead><tr><TH>Line Item</TH><TH className="text-right">Amount</TH><TH className="text-right">%</TH></tr></thead>
-        <tbody>{uses.map((u,i)=>(<tr key={i} className="hover:bg-stone-900/40">
-          <TD mono={false} className="text-stone-200">{u.label}</TD>
-          <TD className="text-right text-amber-300">{fmt$(u.amount)}</TD>
-          <TD className="text-right text-stone-400">{fmtPct(u.amount/totalUses)}</TD></tr>))}
-          <tr className="bg-stone-900/60"><TD mono={false} className="font-medium text-stone-100">TOTAL</TD>
-            <TD className="text-right text-amber-300 font-bold">{fmt$(totalUses)}</TD><TD className="text-right text-stone-400">100.0%</TD></tr>
-        </tbody></table>
-      <div className={`mt-4 p-3 rounded border ${Math.abs(gap)<1e6?'border-emerald-700/50 bg-emerald-900/10 text-emerald-300':'border-rose-700/50 bg-rose-900/10 text-rose-300'}`}>
-        <div className="text-[10px] uppercase tracking-wider">Funding Balance</div>
-        <div className="font-mono text-lg">{Math.abs(gap)<1e6?'Sources = Uses (balanced)':`Gap: ${fmt$(gap)} — ${gap>0?'shortfall':'excess'}`}</div>
-      </div>
-    </Section>
-  </div>;
-}
-
-function DashboardTab({model, results}){
-  const periods = results.periods;
-  const cashflowData = periods.map((p,i)=>({period:p.label,
-    Revenue:Math.round(results.revSched.byPeriod[i]/1e6),
-    Opex:-Math.round(results.opexSched.byPeriod[i]/1e6),
-    CFADS:Math.round(results.cfadsByPeriod[i]/1e6),
-    DS:-Math.round(results.totalDS[i]/1e6),
-    EquityCF:Math.round(results.equityCF[i]/1e6)}));
-  // Chart 1: Debt Service vs Revenue (positive-stacked areas + revenue line)
-  const debtServiceData = periods.map((p,i)=>({
-    period: p.label,
-    'Sr Interest':  +(results.seniorInt[i]/1e6).toFixed(2),
-    'Sr Principal': +(results.seniorPri[i]/1e6).toFixed(2),
-    'Sub Interest': +(results.subInt[i]/1e6).toFixed(2),
-    'Sub Principal':+(results.subPri[i]/1e6).toFixed(2),
-    'ST DS':        +(results.shortDS[i]/1e6).toFixed(2),
-    'Revenue':      +(results.revSched.byPeriod[i]/1e6).toFixed(2),
-  }));
-  // Chart 2: Full operating cashflow stack — opex items + debt service + reserve net deposits, all positive
-  const waterfallData = periods.map((p,i)=>{
-    const row = { period: p.label };
-    model.opex.items.forEach(it => {
-      row[it.label] = +((results.opexSched.byItem[it.id]?.[i] || 0)/1e6).toFixed(2);
-    });
-    row['Sr Interest']  = +(results.seniorInt[i]/1e6).toFixed(2);
-    row['Sr Principal'] = +(results.seniorPri[i]/1e6).toFixed(2);
-    row['Sub Interest'] = +(results.subInt[i]/1e6).toFixed(2);
-    row['Sub Principal']= +(results.subPri[i]/1e6).toFixed(2);
-    row['ST DS']        = +(results.shortDS[i]/1e6).toFixed(2);
-    const prev = (arr) => i > 0 ? arr[i-1] : 0;
-    row['DSRA Deposit']    = +(Math.max(0, results.controlAccts.dsraTarget[i] - prev(results.controlAccts.dsraTarget))/1e6).toFixed(2);
-    row['O&M Res Deposit'] = +(Math.max(0, results.controlAccts.omTarget[i]   - prev(results.controlAccts.omTarget))/1e6).toFixed(2);
-    row['MMR Deposit']     = +(Math.max(0, results.controlAccts.mmr[i]        - prev(results.controlAccts.mmr))/1e6).toFixed(2);
-    row['Lockup Deposit']  = +((results.lockupAcct.deposits[i] || 0)/1e6).toFixed(2);
-    row['Revenue']         = +(results.revSched.byPeriod[i]/1e6).toFixed(2);
-    return row;
-  });
-  const OPEX_COLORS  = ['#84cc16','#65a30d','#4ade80','#22c55e','#10b981','#059669','#047857','#065f46'];
-  const DEBT_COLORS  = { 'Sr Interest':'#fbbf24', 'Sr Principal':'#f59e0b', 'Sub Interest':'#a78bfa', 'Sub Principal':'#8b5cf6', 'ST DS':'#fb7185' };
-  const RES_COLORS   = { 'DSRA Deposit':'#94a3b8', 'O&M Res Deposit':'#64748b', 'MMR Deposit':'#475569', 'Lockup Deposit':'#7c3aed' };
-  const dscrData = periods.map((p,i)=>({period:p.label,
-    Senior:results.seniorDSCR[i] && isFinite(results.seniorDSCR[i])?results.seniorDSCR[i]:null,
-    Total:results.totalDSCR[i] && isFinite(results.totalDSCR[i])?results.totalDSCR[i]:null,
-    LLCR:results.llcrSenior[i] && isFinite(results.llcrSenior[i])?results.llcrSenior[i]:null,
-    Overall:results.overallObligation[i] && isFinite(results.overallObligation[i])?results.overallObligation[i]:null}));
-  const capexData = results.capexSched.monthly.map((v,i)=>({month:`M${i+1}`,Capex:Math.round(v/1e6)}));
-  const sourcesData = [...model.financing.instruments.map(i=>({name:i.type, value:i.amount})),
-    ...(model.paygo.enabled ? [{name:'Paygo', value:results.paygoSched.total}] : [])];
-  const COLORS = ['#fbbf24','#fb923c','#f87171','#a78bfa','#34d399','#60a5fa','#f472b6','#94a3b8'];
-  const tifiaInst = model.financing.instruments.find(i=>i.id===model.tifia.instrumentId);
-  const tifiaWAL = tifiaInst ? results.walByInstrument[tifiaInst.id] : null;
-  const lockupPeak = results.lockupAcct ? Math.max(...results.lockupAcct.balance) : 0;
-  const lockupReleaseTotal = results.lockupAcct ? sum(results.lockupAcct.releases) : 0;
-  return <div>
-    <div className="grid grid-cols-4 gap-3 mb-6">
-      <Metric label="Project IRR" value={fmtPct(results.projectIRR)} accent="amber" sub="Pre-financing"/>
-      <Metric label="Equity IRR" value={fmtPct(results.equityIRR)} accent="green" sub="Post-financing, post-lockup"/>
-      <Metric label="Min Senior DSCR" value={fmtRatio(results.minSeniorDSCR)} accent={results.minSeniorDSCR>=1.2?'green':'red'} sub={`Lockup ${model.tifia.lockupDSCR}x`}/>
-      <Metric label="Min Senior LLCR" value={fmtRatio(results.minLLCR)} accent={results.minLLCR>=model.tifia.minLLCR?'green':'red'} sub={`Floor ${model.tifia.minLLCR}x`}/>
-      <Metric label="TIFIA all-in rate" value={fmtPct(results.tifiaAllInRate,3)} accent="violet"/>
-      <Metric label="TIFIA WAL" value={tifiaWAL?`${tifiaWAL.toFixed(2)}y`:'—'} accent="violet" sub={`Max ${model.tifia.maxWAL}y`}/>
-      <Metric label="TIFIA effective DSCR" value={fmtRatio(results.tifiaEffectiveDSCR ?? results.tifiaTargetDSCR)} accent={results.tifiaEffectiveDSCR && results.tifiaTargetDSCR && results.tifiaEffectiveDSCR < results.tifiaTargetDSCR ? 'red' : 'violet'} sub={results.tifiaEffectiveDSCR && results.tifiaTargetDSCR && results.tifiaEffectiveDSCR < results.tifiaTargetDSCR ? `Target ${fmtRatio(results.tifiaTargetDSCR)} (50% test binding)` : `Target ${fmtRatio(results.tifiaTargetDSCR)}`}/>
-      <Metric label="Lockup Acct Peak" value={fmt$(lockupPeak)} accent={lockupPeak>0?'red':'green'} sub={`${sum(results.lockup)} period(s) trapped · ${fmt$(lockupReleaseTotal)} released`}/>
-      <Metric label="Total Capex (nominal)" value={fmt$(results.capexSched.totalNominal)} accent="amber"/>
-      <Metric label="Total Uses" value={fmt$(results.totalUses)} accent="amber" sub={`Cap. TIFIA: ${fmt$(results.capitalizedTIFIAInterest)}`}/>
-    </div>
-    <Section title="Debt Service vs Revenue (per period)" subtitle="All debt principal and interest stacked positively. Revenue line should sit above the stack — the gap is CFADS net of debt service.">
-      <div style={{height:340}}>
-        <ResponsiveContainer>
-          <ComposedChart data={debtServiceData}>
-            <CartesianGrid stroke="#44403c" strokeDasharray="2 4"/>
-            <XAxis dataKey="period" stroke="#a8a29e" tick={{fontSize:9}} interval={Math.max(0,Math.floor(periods.length/14))}/>
-            <YAxis stroke="#a8a29e" tick={{fontSize:11}} label={{value:'$M',angle:-90,position:'insideLeft',fill:'#a8a29e',fontSize:11}}/>
-            <Tooltip contentStyle={{background:'#1c1917',border:'1px solid #44403c',fontSize:12}} formatter={v=>`$${(v).toFixed(2)}M`}/>
-            <Legend wrapperStyle={{fontSize:11}}/>
-            <Area type="monotone" dataKey="Sr Interest"   stackId="ds" stroke={DEBT_COLORS['Sr Interest']}   fill={DEBT_COLORS['Sr Interest']}   fillOpacity={0.85}/>
-            <Area type="monotone" dataKey="Sr Principal"  stackId="ds" stroke={DEBT_COLORS['Sr Principal']}  fill={DEBT_COLORS['Sr Principal']}  fillOpacity={0.85}/>
-            <Area type="monotone" dataKey="Sub Interest"  stackId="ds" stroke={DEBT_COLORS['Sub Interest']}  fill={DEBT_COLORS['Sub Interest']}  fillOpacity={0.85}/>
-            <Area type="monotone" dataKey="Sub Principal" stackId="ds" stroke={DEBT_COLORS['Sub Principal']} fill={DEBT_COLORS['Sub Principal']} fillOpacity={0.85}/>
-            <Area type="monotone" dataKey="ST DS"         stackId="ds" stroke={DEBT_COLORS['ST DS']}         fill={DEBT_COLORS['ST DS']}         fillOpacity={0.85}/>
-            <Line type="monotone" dataKey="Revenue" stroke="#10b981" strokeWidth={2.5} dot={false}/>
-          </ComposedChart>
-        </ResponsiveContainer>
-      </div>
-    </Section>
-
-    <Section title="Operating Cashflow — Stacked Uses vs Revenue" subtitle="Every operating cost (line-item), every debt service component, and net reserve deposits stacked positively. Revenue line above stack = equity distribution available; revenue below stack = funding shortfall in that period.">
-      <div style={{height:420}}>
-        <ResponsiveContainer>
-          <ComposedChart data={waterfallData}>
-            <CartesianGrid stroke="#44403c" strokeDasharray="2 4"/>
-            <XAxis dataKey="period" stroke="#a8a29e" tick={{fontSize:9}} interval={Math.max(0,Math.floor(periods.length/14))}/>
-            <YAxis stroke="#a8a29e" tick={{fontSize:11}} label={{value:'$M',angle:-90,position:'insideLeft',fill:'#a8a29e',fontSize:11}}/>
-            <Tooltip contentStyle={{background:'#1c1917',border:'1px solid #44403c',fontSize:11, maxHeight:380, overflow:'auto'}} formatter={v=>`$${(v).toFixed(2)}M`} itemSorter={(it)=> -it.value}/>
-            <Legend wrapperStyle={{fontSize:10}} iconSize={8}/>
-            {/* Opex items first (greens) */}
-            {model.opex.items.map((it, idx) => (
-              <Area key={it.id} type="monotone" dataKey={it.label} stackId="cf"
-                stroke={OPEX_COLORS[idx % OPEX_COLORS.length]} fill={OPEX_COLORS[idx % OPEX_COLORS.length]} fillOpacity={0.85}/>
-            ))}
-            {/* Debt service (warm amber/violet/rose) */}
-            <Area type="monotone" dataKey="Sr Interest"   stackId="cf" stroke={DEBT_COLORS['Sr Interest']}   fill={DEBT_COLORS['Sr Interest']}   fillOpacity={0.85}/>
-            <Area type="monotone" dataKey="Sr Principal"  stackId="cf" stroke={DEBT_COLORS['Sr Principal']}  fill={DEBT_COLORS['Sr Principal']}  fillOpacity={0.85}/>
-            <Area type="monotone" dataKey="Sub Interest"  stackId="cf" stroke={DEBT_COLORS['Sub Interest']}  fill={DEBT_COLORS['Sub Interest']}  fillOpacity={0.85}/>
-            <Area type="monotone" dataKey="Sub Principal" stackId="cf" stroke={DEBT_COLORS['Sub Principal']} fill={DEBT_COLORS['Sub Principal']} fillOpacity={0.85}/>
-            <Area type="monotone" dataKey="ST DS"         stackId="cf" stroke={DEBT_COLORS['ST DS']}         fill={DEBT_COLORS['ST DS']}         fillOpacity={0.85}/>
-            {/* Reserve net deposits (slates + lockup violet) */}
-            <Area type="monotone" dataKey="DSRA Deposit"    stackId="cf" stroke={RES_COLORS['DSRA Deposit']}    fill={RES_COLORS['DSRA Deposit']}    fillOpacity={0.85}/>
-            <Area type="monotone" dataKey="O&M Res Deposit" stackId="cf" stroke={RES_COLORS['O&M Res Deposit']} fill={RES_COLORS['O&M Res Deposit']} fillOpacity={0.85}/>
-            <Area type="monotone" dataKey="MMR Deposit"     stackId="cf" stroke={RES_COLORS['MMR Deposit']}     fill={RES_COLORS['MMR Deposit']}     fillOpacity={0.85}/>
-            <Area type="monotone" dataKey="Lockup Deposit"  stackId="cf" stroke={RES_COLORS['Lockup Deposit']}  fill={RES_COLORS['Lockup Deposit']}  fillOpacity={0.85}/>
-            {/* Revenue line on top */}
-            <Line type="monotone" dataKey="Revenue" stroke="#10b981" strokeWidth={3} dot={false}/>
-          </ComposedChart>
-        </ResponsiveContainer>
-      </div>
-    </Section>
-    <Section title="Coverage Ratios — DSCR / LLCR / Overall Obligation">
-      <div style={{height:280}}>
-        <ResponsiveContainer>
-          <LineChart data={dscrData}>
-            <CartesianGrid stroke="#44403c" strokeDasharray="2 4"/>
-            <XAxis dataKey="period" stroke="#a8a29e" tick={{fontSize:9}} interval={Math.max(0,Math.floor(periods.length/14))}/>
-            <YAxis stroke="#a8a29e" tick={{fontSize:11}}/>
-            <Tooltip contentStyle={{background:'#1c1917',border:'1px solid #44403c',fontSize:12}} formatter={v=>v!=null?`${v.toFixed(2)}x`:'—'}/>
-            <Legend wrapperStyle={{fontSize:11}}/>
-            <ReferenceLine y={model.tifia.lockupDSCR} stroke="#f87171" strokeDasharray="4 4" label={{value:`Lockup ${model.tifia.lockupDSCR}x`,fill:'#f87171',fontSize:9}}/>
-            <ReferenceLine y={1.0} stroke="#fb923c" strokeDasharray="4 4" label={{value:'1.0x',fill:'#fb923c',fontSize:9}}/>
-            <Line type="monotone" dataKey="Senior" stroke="#fbbf24" strokeWidth={2} dot={false}/>
-            <Line type="monotone" dataKey="Total" stroke="#a78bfa" strokeWidth={2} dot={false}/>
-            <Line type="monotone" dataKey="LLCR" stroke="#34d399" strokeWidth={2} dot={false}/>
-            <Line type="monotone" dataKey="Overall" stroke="#60a5fa" strokeWidth={2} strokeDasharray="3 3" dot={false}/>
-          </LineChart>
-        </ResponsiveContainer>
-      </div>
-    </Section>
-    <div className="grid grid-cols-2 gap-6">
-      <Section title="Capex Curve (Monthly)">
-        <div style={{height:240}}>
-          <ResponsiveContainer><AreaChart data={capexData}>
-            <CartesianGrid stroke="#44403c" strokeDasharray="2 4"/>
-            <XAxis dataKey="month" stroke="#a8a29e" tick={{fontSize:10}} interval={Math.max(0,Math.floor(capexData.length/12))}/>
-            <YAxis stroke="#a8a29e" tick={{fontSize:11}}/>
-            <Tooltip contentStyle={{background:'#1c1917',border:'1px solid #44403c',fontSize:12}}/>
-            <Area type="monotone" dataKey="Capex" stroke="#fbbf24" fill="#fbbf24" fillOpacity={0.3}/>
-          </AreaChart></ResponsiveContainer>
-        </div>
+          </>;
+        })()}
       </Section>
-      <Section title="Sources of Capital">
-        <div style={{height:240}}>
-          <ResponsiveContainer><BarChart data={sourcesData} layout="vertical">
-            <CartesianGrid stroke="#44403c" strokeDasharray="2 4"/>
-            <XAxis type="number" stroke="#a8a29e" tick={{fontSize:11}} tickFormatter={v=>`$${(v/1e6).toFixed(0)}M`}/>
-            <YAxis type="category" dataKey="name" stroke="#a8a29e" tick={{fontSize:10}} width={140}/>
-            <Tooltip contentStyle={{background:'#1c1917',border:'1px solid #44403c',fontSize:12}} formatter={v=>fmt$(v)}/>
-            <Bar dataKey="value" fill="#fbbf24">{sourcesData.map((_,i)=><Cell key={i} fill={COLORS[i%COLORS.length]}/>)}</Bar>
-          </BarChart></ResponsiveContainer>
-        </div>
-      </Section>
-    </div>
+    )}
   </div>;
 }
 
-function SensCell({label, base, sens, isPct, isRatio}){
-  const fmt = v => { if(v==null||!isFinite(v)) return '—'; if(isPct) return fmtPct(v); if(isRatio) return `${v.toFixed(2)}x`; return fmt$(v); };
-  const delta = (sens||0)-(base||0);
-  const isGood = delta>0;
-  return <div className="bg-stone-950/60 p-2 rounded border border-stone-800">
-    <div className="text-[9px] uppercase tracking-wider text-stone-500">{label}</div>
-    <div className="font-mono text-sm text-stone-300">{fmt(base)} → <span className="text-amber-300">{fmt(sens)}</span></div>
-    <div className={`text-[10px] font-mono ${isGood?'text-emerald-400':'text-rose-400'}`}>Δ {isPct?fmtPct(delta):isRatio?`${delta>=0?'+':''}${delta.toFixed(2)}x`:fmt$(delta)}</div>
-  </div>;
-}
 
-function ChatTab({model, setModel, results}){
-  const [messages, setMessages] = useState([
-    {role:'assistant', content:"I can answer questions about this toll road model, run sensitivities, and propose scenario changes.\n\nTry:\n• \"What's driving min DSCR?\"\n• \"Run AADT -10% / opex +5% sensitivity\"\n• \"What if TIFIA size goes to $250M?\"\n• \"Explain why the 50% test is binding\""}
-  ]);
-  const [input, setInput] = useState('');
-  const [loading, setLoading] = useState(false);
-  const scrollRef = useRef(null);
-  useEffect(()=>{ if(scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight; }, [messages, loading]);
-  const modelSummary = useMemo(()=>({
-    general:model.general, waterfallMode:model.waterfall.mode,
-    capexTotal:results.capexSched.totalNominal, totalUses:results.totalUses,
-    capitalizedTIFIAInterest:results.capitalizedTIFIAInterest, tifiaAllInRate:results.tifiaAllInRate,
-    sources:model.financing.instruments.map(i=>({id:i.id,type:i.type,amount:i.amount,seniority:i.seniority,rate:i.rate,tenor:i.tenorYears,repayment:i.repaymentStyle})),
-    paygo:{enabled:model.paygo.enabled, total:results.paygoSched.total},
-    revenueByPeriod:results.revSched.byPeriod.slice(0,10),
-    opexByPeriod:results.opexSched.byPeriod.slice(0,10),
-    cfadsByPeriod:results.cfadsByPeriod.slice(0,10),
-    totalDSCR:results.totalDSCR.slice(0,10),
-    seniorDSCR:results.seniorDSCR.slice(0,10),
-    llcrSenior:results.llcrSenior.slice(0,10),
-    overallObligation:results.overallObligation.slice(0,10),
-    lockupPeriods:sum(results.lockup),
-    equityIRR:results.equityIRR, projectIRR:results.projectIRR,
-    minSeniorDSCR:results.minSeniorDSCR, avgSeniorDSCR:results.avgSeniorDSCR, minLLCR:results.minLLCR,
-    tifia50Test:results.tifia50Test,
-  }), [model, results]);
-  const runSensitivity = (scenario)=>{
-    const m = JSON.parse(JSON.stringify(model));
-    if(scenario.aadtPct!=null) m.revenue.aadtY1 *= (1+scenario.aadtPct);
-    if(scenario.tollPct!=null) m.revenue.vehicleClasses.forEach(c=>c.toll *= (1+scenario.tollPct));
-    if(scenario.opexPct!=null) m.opex.items.forEach(i=>i.base *= (1+scenario.opexPct));
-    if(scenario.capexPct!=null) m.capex.items.forEach(i=>i.base *= (1+scenario.capexPct));
-    if(scenario.tifiaAmount!=null){ const t = m.financing.instruments.find(i=>i.id===m.tifia.instrumentId); if(t) t.amount = scenario.tifiaAmount; }
-    if(scenario.treasuryRate!=null) m.tifia.treasuryRate = scenario.treasuryRate;
-    return buildFullModel(m);
-  };
-  const send = async ()=>{
-    if(!input.trim()||loading) return;
-    const userMsg = {role:'user', content:input};
-    const nm = [...messages, userMsg];
-    setMessages(nm); setInput(''); setLoading(true);
-    try {
-      const systemPrompt = `You are a project finance analyst assistant in a US toll-road model.
 
-Current model outputs:
-${JSON.stringify(modelSummary, null, 2)}
-
-You understand: period framework (semi-annual w/ FY/CY), TIFIA construction interest (actual/actual, semi-annual cap), 50% outstanding test, TIFIA tenor-based credit spread, LLCR/PLCR/WAL/DSCR constraints, equity lockups, control accounts (DSRA, O&M, ramp-up, MMR), paygo, debt-first vs opex-first waterfall, 1.0x overall obligation test.
-
-You can return a sensitivity request as JSON when the user wants something calculated:
-\`\`\`json
-{"sensitivity": {"aadtPct": -0.10, "opexPct": 0.05, "tifiaAmount": null, "treasuryRate": null, "label": "AADT -10% / Opex +5%"}}
-\`\`\`
-Omit fields that don't apply. Be concise, numeric, use project-finance vernacular.`;
-      const apiResponse = await fetch('https://api.anthropic.com/v1/messages', {
-        method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({
-          model:'claude-sonnet-4-20250514', max_tokens:1500, system:systemPrompt,
-          messages: nm.filter(m=>m.role!=='system').map(m=>({role:m.role, content:m.content})),
-        }),
-      });
-      const data = await apiResponse.json();
-      const text = data.content?.filter(c=>c.type==='text').map(c=>c.text).join('\n') || 'No response.';
-      const match = text.match(/```json\s*([\s\S]*?)```/);
-      let sensResults = null;
-      if(match){
-        try { const parsed = JSON.parse(match[1]);
-          if(parsed.sensitivity){ const sr = runSensitivity(parsed.sensitivity); sensResults = {scenario:parsed.sensitivity, results:sr}; }
-        } catch(e){}
-      }
-      setMessages([...nm, {role:'assistant', content:text, sensResults}]);
-    } catch(e){ setMessages([...nm, {role:'assistant', content:`Error: ${e.message}`}]); }
-    finally { setLoading(false); }
-  };
-  return <div className="flex flex-col h-[calc(100vh-200px)]">
-    <div ref={scrollRef} className="flex-1 overflow-y-auto space-y-4 mb-4 pr-2">
-      {messages.map((m,i)=>(
-        <div key={i} className={m.role==='user'?'ml-12':'mr-12'}>
-          <div className="text-[10px] uppercase tracking-wider text-stone-500 mb-1">{m.role==='user'?'You':'Model Assistant'}</div>
-          <div className={`p-3 rounded ${m.role==='user'?'bg-amber-500/10 border border-amber-500/30':'bg-stone-900/60 border border-stone-700/60'}`}>
-            <div className="text-sm text-stone-100 whitespace-pre-wrap">{m.content.replace(/```json[\s\S]*?```/g,'').trim()}</div>
-            {m.sensResults && (
-              <div className="mt-3 pt-3 border-t border-stone-700/60">
-                <div className="text-[10px] uppercase tracking-wider text-amber-300 mb-2">Scenario: {m.sensResults.scenario.label||'Custom'}</div>
-                <div className="grid grid-cols-4 gap-2 text-xs">
-                  <SensCell label="Equity IRR" base={results.equityIRR} sens={m.sensResults.results.equityIRR} isPct/>
-                  <SensCell label="Project IRR" base={results.projectIRR} sens={m.sensResults.results.projectIRR} isPct/>
-                  <SensCell label="Min Sr DSCR" base={results.minSeniorDSCR} sens={m.sensResults.results.minSeniorDSCR} isRatio/>
-                  <SensCell label="Min LLCR" base={results.minLLCR} sens={m.sensResults.results.minLLCR} isRatio/>
-                </div>
-              </div>
-            )}
-          </div>
-        </div>
-      ))}
-      {loading && <div className="mr-12"><div className="text-[10px] uppercase tracking-wider text-stone-500 mb-1">Model Assistant</div>
-        <div className="p-3 rounded bg-stone-900/60 border border-stone-700/60 text-sm text-stone-400">Thinking…</div></div>}
-    </div>
-    <div className="flex gap-2 border-t border-stone-700/60 pt-3">
-      <input type="text" value={input} onChange={e=>setInput(e.target.value)}
-        onKeyDown={e=>{if(e.key==='Enter') send();}}
-        placeholder="Ask anything about the model, or request a sensitivity…"
-        className="flex-1 bg-stone-900 border border-stone-700 rounded px-3 py-2 text-sm text-stone-100 focus:outline-none focus:border-amber-500"/>
-      <button onClick={send} disabled={loading||!input.trim()}
-        className="px-4 py-2 bg-amber-500 text-stone-900 rounded text-sm font-medium hover:bg-amber-400 disabled:opacity-50">Send</button>
-    </div>
-  </div>;
-}
-
-// ---------- SENSITIVITY TAB ----------
-// Two-way grid scenarios: pick X & Y variables, range, and an output metric. Cells are color-heatmapped.
 function SensitivityTab({model, results}){
   const [xVar, setXVar] = useState('aadt');
   const [yVar, setYVar] = useState('opex');
