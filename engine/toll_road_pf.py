@@ -172,24 +172,29 @@ def default_model() -> Dict[str, Any]:
             'instruments': [
                 {'id': 'eq1',    'type': 'Sponsor Equity',     'amount': 120_000_000, 'rate': 0.0,    'tenorYears': 30,
                  'closeDate': '2026-07-01', 'seniority': 'Equity',      'repaymentStyle': 'Sculpted (target DSCR)',
-                 'drawdownPriority': 99, 'targetDSCR': 1.30, 'ioYears': 0, 'deferralYears': 0,
-                 'dayCount': '30/360', 'covenants': 'Distribution lockup if TIFIA lockup'},
+                 'drawdownPriority': 5, 'targetDSCR': 1.30, 'ioYears': 0, 'deferralYears': 0,
+                 'dayCount': '30/360', 'covenants': 'Distribution lockup if TIFIA lockup',
+                 'issuanceCost': 0, 'issuanceCostEscalation': 0.0},
                 {'id': 'fg1',    'type': 'Federal Grant',      'amount':  60_000_000, 'rate': 0.0,    'tenorYears': 0,
                  'closeDate': '2026-07-01', 'seniority': 'Grant',       'repaymentStyle': 'Bullet',
                  'drawdownPriority': 1, 'targetDSCR': 0, 'ioYears': 0, 'deferralYears': 0,
-                 'dayCount': '30/360', 'covenants': ''},
+                 'dayCount': '30/360', 'covenants': '',
+                 'issuanceCost': 250_000, 'issuanceCostEscalation': 0.03},
                 {'id': 'sg1',    'type': 'State Grant',        'amount':  40_000_000, 'rate': 0.0,    'tenorYears': 0,
                  'closeDate': '2026-07-01', 'seniority': 'Grant',       'repaymentStyle': 'Bullet',
                  'drawdownPriority': 1, 'targetDSCR': 0, 'ioYears': 0, 'deferralYears': 0,
-                 'dayCount': '30/360', 'covenants': ''},
+                 'dayCount': '30/360', 'covenants': '',
+                 'issuanceCost': 150_000, 'issuanceCostEscalation': 0.03},
                 {'id': 'pab1',   'type': 'PABs',               'amount': 280_000_000, 'rate': 0.0525, 'tenorYears': 30,
                  'closeDate': '2026-07-01', 'seniority': 'Senior',      'repaymentStyle': 'Sculpted (target DSCR)',
                  'drawdownPriority': 3, 'targetDSCR': 1.35, 'ioYears': 0, 'deferralYears': 3,
-                 'dayCount': '30/360', 'covenants': 'Senior DSCR \u22651.20x'},
+                 'dayCount': '30/360', 'covenants': 'Senior DSCR \u22651.20x',
+                 'issuanceCost': 4_500_000, 'issuanceCostEscalation': 0.03},
                 {'id': 'tifia1', 'type': 'TIFIA Loan',         'amount': 200_000_000, 'rate': 0.0410, 'tenorYears': 35,
                  'closeDate': '2026-07-01', 'seniority': 'Subordinate', 'repaymentStyle': 'Deferred P&I then sculpted',
                  'drawdownPriority': 4, 'targetDSCR': 1.10, 'ioYears': 0, 'deferralYears': 5,
                  'dayCount': 'Actual/Actual', 'covenants': 'TIFIA springing lien',
+                 'issuanceCost': 1_750_000, 'issuanceCostEscalation': 0.03,
                  'phases': [
                      {'regime': 'defer',  'endPeriod': 10, 'targetDSCR': None},
                      {'regime': 'io',     'endPeriod': 20, 'targetDSCR': None},
@@ -199,10 +204,12 @@ def default_model() -> Dict[str, Any]:
                 {'id': 'ran1',   'type': 'RAN',                'amount':  50_000_000, 'rate': 0.0350, 'tenorYears': 2,
                  'closeDate': '2026-07-01', 'seniority': 'Short-term',  'repaymentStyle': 'Bullet',
                  'drawdownPriority': 2, 'targetDSCR': 0, 'ioYears': 0, 'deferralYears': 0,
-                 'dayCount': 'Actual/360', 'covenants': 'Repaid from first revenues'},
+                 'dayCount': 'Actual/360', 'covenants': 'Repaid from first revenues',
+                 'issuanceCost': 350_000, 'issuanceCostEscalation': 0.03},
             ],
             'financingFeesPctOfDebt': 0.015,
             'blendedIDCRateForNonTIFIA': 0.0525,
+            'issuanceCostBaseYear': 2024,   # year issuance costs were quoted; escalated to FC year
         },
         'tifia': {
             'instrumentId': 'tifia1', 'treasuryRate': 0.0395,
@@ -212,6 +219,8 @@ def default_model() -> Dict[str, Any]:
             'fiftyPercentTestYearsBeforeMaturity': 10, 'enforce50PctTest': True,
             'minDSCR': 1.10, 'minLLCR': 1.30, 'minPLCR': 1.40, 'maxWAL': 25,
             'lockupDSCR': 1.20, 'lockupLLCR': 1.20,
+            'adminFeeAnnual': 13_500,     # USD/yr fixed admin fee (US DOT TIFIA standard ~$13.5k)
+            'monitoringFeeBps': 7.5,      # bps/yr on outstanding TIFIA balance
         },
         'controlAccounts': {
             'dsraMonthsDS': 6, 'omReserveMonths': 3,
@@ -642,11 +651,15 @@ def phased_schedule(principal: float, rate_per: float, periods: List[Dict[str, A
             balance[i] = bal
         elif regime == 'level':
             if level_pmt is None:
-                # Compute level pmt ONCE at phase entry
+                # Compute level pmt ONCE at phase entry. If targetEndBalance specified, solve to that;
+                # otherwise fully amortize to zero (default behavior).
+                n_p = periods_remaining_in_phase   # RENAMED from `n` to avoid shadowing outer `n = len(periods)`
+                target_end = phase.get('targetEndBalance', 0) or 0
                 if rate_per > 0:
-                    level_pmt = (bal * rate_per) / (1 - (1 + rate_per) ** -periods_remaining_in_phase)
+                    grow = (1 + rate_per) ** n_p
+                    level_pmt = (bal * grow - target_end) * rate_per / (grow - 1)
                 else:
-                    level_pmt = bal / max(1, periods_remaining_in_phase)
+                    level_pmt = (bal - target_end) / max(1, n_p)
             pri = max(0, min(bal, level_pmt - int_p))
             interest[i] = int_p
             principal_arr[i] = pri
@@ -866,7 +879,9 @@ def build_instrument_schedule(inst: Dict[str, Any], periods: List[Dict[str, Any]
                                 inst.get('phases', []), principal)
         else:
             s = level_debt(principal, rate_per, slice_periods, io_p, def_p)
-        if is_tifia_with_50:
+        if is_tifia_with_50 and inst['repaymentStyle'] != 'Phased (multi-regime)':
+            # Phased schedules are assumed to be engineered (manually or by auto-cascade) to pass the 50% test.
+            # Running the post-hoc redistributor on top creates spurious bullets that conflict with the phase structure.
             r = apply_fifty_pct_test(s, slice_periods, principal,
                                       tifia_cfg.get('fiftyPercentTestYearsBeforeMaturity', 10), 0.5)
             s = r['schedule']
@@ -1030,7 +1045,19 @@ def build_full_model(model: Dict[str, Any]) -> Dict[str, Any]:
     financing_fees = debt_total * model['financing']['financingFeesPctOfDebt']
     if tifia_inst:
         tifia_inst['principalAfterIDC'] = tifia_inst['amount'] + tifia_constr['capitalizedInterestTotal']
-    total_uses = capex_sched['totalNominal'] + nt_idc + tifia_constr['capitalizedInterestTotal'] + financing_fees
+    # Issuance costs per instrument, escalated from base year to FC year
+    base_year = model['financing'].get('issuanceCostBaseYear', 2024)
+    fc_year = int((model['general'].get('financialCloseDate') or '2026-07-01')[:4])
+    years_to_fc = max(0, fc_year - base_year)
+    issuance_costs_by_id = {}
+    total_issuance_cost = 0
+    for inst in instruments:
+        base = inst.get('issuanceCost', 0) or 0
+        esc = inst.get('issuanceCostEscalation', 0) or 0
+        escalated = base * ((1 + esc) ** years_to_fc) if base > 0 else 0
+        issuance_costs_by_id[inst['id']] = escalated
+        total_issuance_cost += escalated
+    total_uses = capex_sched['totalNominal'] + nt_idc + tifia_constr['capitalizedInterestTotal'] + financing_fees + total_issuance_cost
 
     periods = generate_operating_periods(model)
     n = len(periods)
@@ -1066,8 +1093,23 @@ def build_full_model(model: Dict[str, Any]) -> Dict[str, Any]:
                 short_ds[i] += ds
 
     total_ds = [senior_ds[i] + sub_ds[i] + short_ds[i] for i in range(n)]
-    senior_dscr = [(cfads[i] / senior_ds[i]) if senior_ds[i] > 0 else None for i in range(n)]
-    total_dscr = [(cfads[i] / total_ds[i]) if total_ds[i] > 0 else None for i in range(n)]
+    # TIFIA admin + monitoring fees per period
+    tifia_admin_per_period = _zeros(n)
+    tifia_monitoring_per_period = _zeros(n)
+    tifia_fees_per_period = _zeros(n)
+    if tifia_inst:
+        admin_yr = model['tifia'].get('adminFeeAnnual', 0) or 0
+        mon_bps = model['tifia'].get('monitoringFeeBps', 0) or 0
+        admin_per = admin_yr / ppy
+        tifia_bal = debt_schedules.get(tifia_inst['id'], {}).get('balance', _zeros(n))
+        for i in range(n):
+            tifia_admin_per_period[i] = admin_per
+            tifia_monitoring_per_period[i] = (tifia_bal[i] * (mon_bps / 10000)) / ppy
+            tifia_fees_per_period[i] = tifia_admin_per_period[i] + tifia_monitoring_per_period[i]
+    # Net CFADS for DSCR (after TIFIA admin/monitoring — these are senior to debt service)
+    cfads_for_dscr = [cfads[i] - tifia_fees_per_period[i] for i in range(n)]
+    senior_dscr = [(cfads_for_dscr[i] / senior_ds[i]) if senior_ds[i] > 0 else None for i in range(n)]
+    total_dscr = [(cfads_for_dscr[i] / total_ds[i]) if total_ds[i] > 0 else None for i in range(n)]
     overall_obl = [(rev_sched['byPeriod'][i] / (opex_sched['byPeriod'][i] + total_ds[i]))
                    if (opex_sched['byPeriod'][i] + total_ds[i]) > 0 else None for i in range(n)]
     overall_passes = [v is not None and v >= model['waterfall']['overallObligationMin'] for v in overall_obl]
@@ -1084,9 +1126,9 @@ def build_full_model(model: Dict[str, Any]) -> Dict[str, Any]:
     raw_equity_cf = _zeros(n)
     for i in range(n):
         if model['waterfall']['mode'] == 'Debt-first (Revenue \u2192 DS \u2192 Opex)':
-            raw_equity_cf[i] = rev_sched['byPeriod'][i] - total_ds[i] - opex_sched['byPeriod'][i]
+            raw_equity_cf[i] = rev_sched['byPeriod'][i] - total_ds[i] - opex_sched['byPeriod'][i] - tifia_fees_per_period[i]
         else:
-            raw_equity_cf[i] = cfads[i] - total_ds[i]
+            raw_equity_cf[i] = cfads_for_dscr[i] - total_ds[i]
 
     lockup_acct = build_lockup_account(raw_equity_cf, lockup, periods)
     equity_cf = lockup_acct['equityCFAfterLockup']
@@ -1116,6 +1158,13 @@ def build_full_model(model: Dict[str, Any]) -> Dict[str, Any]:
         'non_tifia_idc': nt_idc, 'non_tifia_idc_monthly': nt_idc_monthly, 'financing_fees': financing_fees,
         'capitalized_tifia_interest': tifia_constr['capitalizedInterestTotal'],
         'total_uses': total_uses, 'total_sources': sources_total,
+        'total_issuance_cost': total_issuance_cost,
+        'issuance_costs_by_id': issuance_costs_by_id,
+        'tifia_admin_per_period': tifia_admin_per_period,
+        'tifia_monitoring_per_period': tifia_monitoring_per_period,
+        'tifia_fees_per_period': tifia_fees_per_period,
+        'total_tifia_fees': _sum(tifia_fees_per_period),
+        'cfads_for_dscr': cfads_for_dscr,
         'grant_total': grant_total, 'equity_total': equity_total, 'paygo_total': paygo_total, 'debt_total': debt_total,
         'rev_sched': rev_sched, 'opex_sched': opex_sched, 'cfads_by_period': cfads,
         'instruments': sorted_inst, 'debt_schedules': debt_schedules,
@@ -1249,6 +1298,324 @@ def optimize_joint_tranches(model: Dict[str, Any], targets: List[Dict[str, Any]]
             'final_results': final, 'final_gap': final['total_uses'] - final['total_sources'],
             'converged': converged, 'outer_iterations': len(outer_history),
             'total_plug_adjustment': total_plug_adj}
+
+
+# ============================================================
+# AUTO-CASCADE TIFIA (50% TEST PASSES BY CONSTRUCTION)
+# ============================================================
+def build_tifia_cascade_phases(model: Dict[str, Any], instrument_id: str,
+                                params: Dict[str, Any],
+                                cfads_by_period: List[float]) -> Dict[str, Any]:
+    """Generate a 4-phase TIFIA schedule that passes the 50% test by construction.
+
+    Phases: defer / IO / sculpt-or-annuity-to-50% / level-to-zero
+    Returns {'phases': [...], 'test_point', 'diagnosis', 'fallback_used', 'found_dscr', ...}
+    """
+    inst = next((i for i in model['financing']['instruments'] if i['id'] == instrument_id), None)
+    if not inst:
+        return {'error': 'TIFIA instrument not found', 'phases': []}
+    ppy = model['general']['periodsPerYear']
+    tenor_periods = round(inst['tenorYears'] * ppy)
+    defer_p = round((params.get('deferYears', 0) or 0) * ppy)
+    io_p = round((params.get('ioYears', 0) or 0) * ppy)
+    test_p = round((params.get('testYearsBeforeMaturity', 10) or 10) * ppy)
+    phase3_end = tenor_periods - test_p
+    phase4_end = tenor_periods
+    phase3_periods = phase3_end - defer_p - io_p
+    if phase3_periods <= 0:
+        return {'error': 'Phase 3 has no periods (check defer/IO/test years vs tenor)', 'phases': []}
+
+    P = inst['amount']
+    # Use TIFIA all-in rate (treasury + spread)
+    rate_per = tifia_all_in_rate(inst['tenorYears'], model['tifia']) / ppy
+    post_io_bal = P * (1 + rate_per) ** defer_p  # IO doesn't change balance
+    target_test_bal = 0.5 * P
+
+    phases = []
+    if defer_p > 0: phases.append({'regime': 'defer', 'endPeriod': defer_p, 'targetDSCR': None})
+    if io_p > 0:    phases.append({'regime': 'io',    'endPeriod': defer_p + io_p, 'targetDSCR': None})
+
+    fallback_used = False
+    found_dscr = None
+    diagnosis = ''
+
+    if params.get('phase3Mode') in ('annuity', 'level'):
+        phases.append({'regime': 'level', 'endPeriod': phase3_end, 'targetEndBalance': target_test_bal})
+        diagnosis = 'Phase 3 annuity (level pmt to 50% balance)'
+    else:
+        # Sculpt mode — binary search DSCR
+        cfads_slice = []
+        for i in range(defer_p + io_p, phase3_end):
+            cfads_slice.append(cfads_by_period[i] if i < len(cfads_by_period) else 0)
+
+        def simulate(dscr):
+            bal = post_io_bal
+            for i in range(len(cfads_slice)):
+                int_p = bal * rate_per
+                max_ds = cfads_slice[i] / max(dscr, 0.0001)
+                pri = max(0, min(bal, max_ds - int_p))
+                bal -= pri
+            return bal
+
+        bal_max_amort = simulate(1.0001)
+        if bal_max_amort > target_test_bal:
+            phases.append({'regime': 'level', 'endPeriod': phase3_end, 'targetEndBalance': target_test_bal, '_fallback': 'sculpt-infeasible'})
+            fallback_used = True
+            diagnosis = f'Sculpt infeasible (TIFIA too large for CFADS) — fell back to annuity. Max amort balance ${bal_max_amort/1e6:.1f}M > target 50% ${target_test_bal/1e6:.1f}M.'
+        else:
+            lo, hi = 1.0001, 200.0
+            for _ in range(60):
+                mid = (lo + hi) / 2
+                bal = simulate(mid)
+                if bal > target_test_bal:
+                    hi = mid
+                else:
+                    lo = mid
+                if hi - lo < 0.0005:
+                    break
+            found_dscr = (lo + hi) / 2
+            phases.append({'regime': 'sculpt', 'endPeriod': phase3_end, 'targetDSCR': found_dscr})
+            diagnosis = f'Phase 3 sculpt @ DSCR {found_dscr:.3f}x (solved to hit 50% test balance)'
+
+    phases.append({'regime': 'level', 'endPeriod': phase4_end, 'targetEndBalance': 0})
+
+    return {
+        'phases': phases,
+        'test_point': phase3_end - 1,
+        'post_io_balance': post_io_bal,
+        'target_test_balance': target_test_bal,
+        'fallback_used': fallback_used,
+        'found_dscr': found_dscr,
+        'diagnosis': diagnosis,
+    }
+
+
+def auto_cascade_tifia(model: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
+    """TIFIA-FIRST cascade optimizer.
+
+    Logic:
+      1. TIFIA = min(49% x eligible, max % where 50% test passes AND min Total DSCR >= floor)
+         - Total DSCR = CFADS_net / (Sr DS + TIFIA DS)
+         - TIFIA effective DSCR >= floor as secondary check
+      2. PAB = min(remaining funding need, max where (CFADS_net - TIFIA DS) / Sr DS >= Sr DSCR floor)
+         - Sized AFTER TIFIA so TIFIA gets priority on cheap senior-equivalent capacity
+      3. Equity = min(remaining funding need, NPV of distributable CF @ target IRR) — set externally
+      4. Grant = plug
+    CFADS_net = CFADS - TIFIA admin/monitoring fees.
+
+    Returns {'best': {...}, 'trace': [...], 'converged': bool}
+    """
+    working = copy.deepcopy(model)
+    trace = []
+
+    def evaluate(pct):
+        w = copy.deepcopy(working)
+        try:
+            temp_r = build_full_model(w)
+        except Exception as e:
+            return {'pct': pct, 'error': f'init build failed: {e}', 'feasible': False}
+
+        # ---- STEP 1: SIZE TIFIA ----
+        eligible_cost = 0
+        for cid in (params.get('tifiaEligibleCapexIds') or []):
+            eligible_cost += _sum(temp_r['capex_sched']['byItem'].get(cid, []))
+        tifia_amount = round(eligible_cost * pct)
+        tifia = next((i for i in w['financing']['instruments'] if i['id'] == params.get('tifiaInstrumentId')), None)
+        if not tifia:
+            return {'pct': pct, 'error': 'TIFIA not found', 'feasible': False}
+        tifia['amount'] = tifia_amount
+
+        # Temporarily zero PAB so TIFIA gets first shot at the structure
+        pab_inst = next((i for i in w['financing']['instruments']
+                         if i['id'] == params.get('pabInstrumentId')), None) if params.get('pabInstrumentId') else None
+        if pab_inst:
+            pab_inst['amount'] = 0
+
+        pre_r = build_full_model(w)
+        # CFADS available to TIFIA = full CFADS_for_DSCR (after admin fees) since no PAB yet
+        cfads_for_tifia = list(pre_r['cfads_for_dscr'])
+
+        # Build TIFIA phases that pass 50% test by construction, sculpted against TIFIA-available CFADS
+        phase_res = build_tifia_cascade_phases(w, params['tifiaInstrumentId'], {
+            'deferYears': params.get('deferYears'),
+            'ioYears': params.get('ioYears'),
+            'testYearsBeforeMaturity': params.get('testYearsBeforeMaturity'),
+            'phase3Mode': params.get('phase3Mode'),
+        }, cfads_for_tifia)
+        if 'error' in phase_res:
+            return {'pct': pct, 'tifiaAmount': tifia_amount, 'error': phase_res['error'], 'feasible': False}
+        tifia['phases'] = phase_res['phases']
+        tifia['repaymentStyle'] = 'Phased (multi-regime)'
+
+        # ---- STEP 2: SIZE PAB ----
+        # PAB only if TIFIA hit statutory ceiling (49%) AND funding gap remains
+        # Constraint: PAB = min(funding gap, max PAB where (CFADS - TIFIA DS)/Sr DS >= Sr DSCR floor)
+        pab_amount = 0
+        max_tifia_pct = params.get('maxTifiaPct', 0.49)
+        tifia_at_ceiling = pct >= max_tifia_pct - 0.005
+        if pab_inst:
+            if not tifia_at_ceiling:
+                # TIFIA stopped below ceiling — adding PAB hurts Total DSCR. No PAB.
+                pab_inst['amount'] = 0
+                pab_amount = 0
+            else:
+                # TIFIA at ceiling — check if funding gap remains with PAB=0
+                pab_inst['amount'] = 0
+                try:
+                    gap_r = build_full_model(w)
+                    funding_gap = gap_r['total_uses'] - gap_r['total_sources']
+                except Exception:
+                    funding_gap = 0
+                if funding_gap <= 0:
+                    pab_amount = 0  # no gap, no PAB needed
+                else:
+                    # Find max PAB at Sr DSCR floor, then cap at funding_gap
+                    tifia_sched = gap_r['debt_schedules'].get(tifia['id'], {})
+                    tifia_ds = [(tifia_sched.get('interest', _zeros(len(gap_r['periods'])))[i] +
+                                 tifia_sched.get('principal', _zeros(len(gap_r['periods'])))[i])
+                                for i in range(len(gap_r['periods']))]
+                    min_sr_dscr_floor = params.get('minSrDSCR', 1.30)
+
+                    def pab_feasible(amt):
+                        pab_inst['amount'] = round(amt)
+                        try:
+                            rr = build_full_model(w)
+                        except Exception:
+                            return False, None
+                        sr_ds = rr['senior_ds']
+                        worst = float('inf')
+                        for j in range(len(rr['periods'])):
+                            if tifia_ds[j] > 1000 and sr_ds[j] > 1000:
+                                d = (rr['cfads_for_dscr'][j] - tifia_ds[j]) / sr_ds[j]
+                                if d < worst:
+                                    worst = d
+                        if worst == float('inf'):
+                            worst = 999
+                        return (worst >= min_sr_dscr_floor - 0.005), worst
+
+                    # Binary search up to funding gap (no need to go higher)
+                    lo, hi = 0.0, funding_gap * 1.1
+                    max_at_floor = 0
+                    for _ in range(40):
+                        m = (lo + hi) / 2
+                        ok, _ = pab_feasible(m)
+                        if ok:
+                            max_at_floor = m
+                            lo = m
+                        else:
+                            hi = m
+                        if hi - lo < 50_000:
+                            break
+                    pab_amount = min(funding_gap, max_at_floor)
+                    pab_inst['amount'] = round(pab_amount)
+
+        # ---- STEP 4: PLUG ----
+        try:
+            final_r = build_full_model(w)
+        except Exception as e:
+            return {'pct': pct, 'tifiaAmount': tifia_amount, 'error': f'final build failed: {e}', 'feasible': False}
+        plug_applied = 0
+        if params.get('plugInstrumentId'):
+            gap = final_r['total_uses'] - final_r['total_sources']
+            plug = next((i for i in w['financing']['instruments'] if i['id'] == params['plugInstrumentId']), None)
+            if plug:
+                plug['amount'] = max(0, round(plug['amount'] + gap))
+                plug_applied = gap
+                try:
+                    final_r = build_full_model(w)
+                except Exception:
+                    pass
+
+        # ---- FEASIBILITY ----
+        # Feasibility floors measured ONLY over TIFIA-active periods (excludes RAN bullet etc.)
+        # Display values fall back to all-period min when TIFIA-active periods have no senior DS.
+        tifia_sched = final_r.get('debt_schedules', {}).get(params['tifiaInstrumentId'])
+        min_sr_dscr_feas = float('inf')   # for feasibility check
+        min_total_dscr = float('inf')
+        min_tifia_eff = float('inf')
+        if tifia_sched:
+            for i in range(len(final_r['periods'])):
+                t_ds = (tifia_sched['interest'][i] or 0) + (tifia_sched['principal'][i] or 0)
+                if t_ds > 1000:
+                    sr_ds_i = final_r['senior_ds'][i] or 0
+                    sub_ds_i = final_r['sub_ds'][i] or 0
+                    cf_i = final_r['cfads_for_dscr'][i] or 0
+                    if sr_ds_i > 1000:
+                        sr_dscr = cf_i / sr_ds_i
+                        if sr_dscr < min_sr_dscr_feas: min_sr_dscr_feas = sr_dscr
+                    td = sr_ds_i + sub_ds_i
+                    if td > 1000:
+                        if cf_i / td < min_total_dscr: min_total_dscr = cf_i / td
+                    eff = (cf_i - sr_ds_i) / t_ds
+                    if eff < min_tifia_eff: min_tifia_eff = eff
+
+        # For display: prefer the TIFIA-active value; fall back to all-period min when no senior DS overlaps TIFIA
+        if min_sr_dscr_feas != float('inf'):
+            min_sr_dscr = min_sr_dscr_feas
+        else:
+            all_sr = [v for v in (final_r.get('senior_dscr') or []) if v is not None and math.isfinite(v)]
+            min_sr_dscr = min(all_sr) if all_sr else 999
+        if min_total_dscr == float('inf'): min_total_dscr = None
+        if min_tifia_eff == float('inf'): min_tifia_eff = None
+        # Feasibility uses the TIFIA-active value (or 999 if no overlap → vacuously feasible)
+        sr_for_feas = min_sr_dscr_feas if min_sr_dscr_feas != float('inf') else 999
+
+        test_bal = (tifia_sched['balance'][phase_res['test_point']]
+                    if phase_res.get('test_point', -1) >= 0 and tifia_sched else None)
+        test_passed = test_bal is not None and test_bal <= 0.5 * tifia_amount + 1000
+
+        feasible = (
+            (min_total_dscr is None or min_total_dscr >= (params.get('minTotalDSCR', 1.10) - 0.005))
+            and (min_tifia_eff is None or min_tifia_eff >= (params.get('minTifiaDSCR', 1.10) - 0.005))
+            and (sr_for_feas >= (params.get('minSrDSCR', 1.30) - 0.005))
+            and test_passed
+        )
+
+        return {
+            'pct': pct, 'tifiaAmount': tifia_amount, 'pabAmount': round(pab_amount) if pab_amount else 0,
+            'eligibleCost': eligible_cost, 'phaseInfo': phase_res,
+            'minSrDSCR': min_sr_dscr, 'minTotalDSCR': min_total_dscr, 'minTifiaEffDSCR': min_tifia_eff,
+            'testBalAtPoint': test_bal, 'testPassed': test_passed,
+            'finalGap': final_r['total_uses'] - final_r['total_sources'],
+            'plugApplied': plug_applied, 'feasible': feasible,
+            'workingModel': w, 'finalResults': final_r,
+        }
+
+    lo = params.get('minTifiaPct', 0.10)
+    hi = params.get('maxTifiaPct', 0.49)
+    best = None
+
+    # Start from ceiling — TIFIA is cheap, push it
+    e_hi = evaluate(hi)
+    e_hi['iter'] = 1
+    trace.append(e_hi)
+    if e_hi.get('feasible'):
+        return {'best': e_hi, 'trace': trace, 'converged': True, 'ceiling_reached': True}
+
+    e_lo = evaluate(lo)
+    e_lo['iter'] = 2
+    trace.append(e_lo)
+    if not e_lo.get('feasible'):
+        return {'best': None, 'trace': trace, 'converged': False,
+                'error': 'Even min TIFIA % infeasible — relax constraints'}
+    best = e_lo
+
+    for it in range(18):
+        mid = (lo + hi) / 2
+        r = evaluate(mid)
+        r['iter'] = len(trace) + 1
+        trace.append(r)
+        if r.get('feasible'):
+            best = r
+            lo = mid
+        else:
+            hi = mid
+        if hi - lo < 0.003:
+            break
+    return {'best': best, 'trace': trace, 'converged': True}
+
+
+
 
 
 # ============================================================
