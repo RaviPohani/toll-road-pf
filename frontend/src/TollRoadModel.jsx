@@ -82,20 +82,21 @@ const defaultModel = () => ({
   },
   financing: {
     instruments: [
-      {id:'eq1',type:'Sponsor Equity',amount:120_000_000,rate:0,tenorYears:30,closeDate:'2026-07-01',seniority:'Equity',repaymentStyle:'Sculpted (target DSCR)',drawdownPriority:99,targetDSCR:1.30,ioYears:0,deferralYears:0,dayCount:'30/360',covenants:'Distribution lockup if TIFIA lockup triggered'},
-      {id:'fg1',type:'Federal Grant',amount:60_000_000,rate:0,tenorYears:0,closeDate:'2026-07-01',seniority:'Grant',repaymentStyle:'Bullet',drawdownPriority:1,targetDSCR:0,ioYears:0,deferralYears:0,dayCount:'30/360',covenants:'Federal cost-share requirements'},
-      {id:'sg1',type:'State Grant',amount:40_000_000,rate:0,tenorYears:0,closeDate:'2026-07-01',seniority:'Grant',repaymentStyle:'Bullet',drawdownPriority:1,targetDSCR:0,ioYears:0,deferralYears:0,dayCount:'30/360',covenants:'State match requirements'},
-      {id:'pab1',type:'PABs (Private Activity Bonds)',amount:280_000_000,rate:0.0525,tenorYears:30,closeDate:'2026-07-01',seniority:'Senior',repaymentStyle:'Sculpted (target DSCR)',drawdownPriority:3,targetDSCR:1.35,ioYears:0,deferralYears:3,dayCount:'30/360',covenants:'Senior DSCR ≥1.20x; reserve fund equal to MADS'},
-      {id:'tifia1',type:'TIFIA Loan',amount:200_000_000,rate:0.0410,tenorYears:35,closeDate:'2026-07-01',seniority:'Subordinate',repaymentStyle:'Deferred P&I then sculpted',drawdownPriority:4,targetDSCR:1.10,ioYears:0,deferralYears:5,dayCount:'Actual/Actual',covenants:'TIFIA springing lien; sub DSCR ≥1.10x after deferral',
+      {id:'eq1',type:'Sponsor Equity',amount:120_000_000,rate:0,tenorYears:30,closeDate:'2026-07-01',seniority:'Equity',repaymentStyle:'Sculpted (target DSCR)',drawdownPriority:5,targetDSCR:1.30,ioYears:0,deferralYears:0,dayCount:'30/360',covenants:'Distribution lockup if TIFIA lockup triggered', issuanceCost:0, issuanceCostEscalation:0},
+      {id:'fg1',type:'Federal Grant',amount:60_000_000,rate:0,tenorYears:0,closeDate:'2026-07-01',seniority:'Grant',repaymentStyle:'Bullet',drawdownPriority:1,targetDSCR:0,ioYears:0,deferralYears:0,dayCount:'30/360',covenants:'Federal cost-share requirements', issuanceCost:250_000, issuanceCostEscalation:0.03},
+      {id:'sg1',type:'State Grant',amount:40_000_000,rate:0,tenorYears:0,closeDate:'2026-07-01',seniority:'Grant',repaymentStyle:'Bullet',drawdownPriority:1,targetDSCR:0,ioYears:0,deferralYears:0,dayCount:'30/360',covenants:'State match requirements', issuanceCost:150_000, issuanceCostEscalation:0.03},
+      {id:'pab1',type:'PABs (Private Activity Bonds)',amount:280_000_000,rate:0.0525,tenorYears:30,closeDate:'2026-07-01',seniority:'Senior',repaymentStyle:'Sculpted (target DSCR)',drawdownPriority:3,targetDSCR:1.35,ioYears:0,deferralYears:3,dayCount:'30/360',covenants:'Senior DSCR ≥1.20x; reserve fund equal to MADS', issuanceCost:4_500_000, issuanceCostEscalation:0.03},
+      {id:'tifia1',type:'TIFIA Loan',amount:200_000_000,rate:0.0410,tenorYears:35,closeDate:'2026-07-01',seniority:'Subordinate',repaymentStyle:'Deferred P&I then sculpted',drawdownPriority:4,targetDSCR:1.10,ioYears:0,deferralYears:5,dayCount:'Actual/Actual',covenants:'TIFIA springing lien; sub DSCR ≥1.10x after deferral', issuanceCost:1_750_000, issuanceCostEscalation:0.03,
         phases:[
           {regime:'defer',           endPeriod:10, targetDSCR:null},
           {regime:'io',              endPeriod:20, targetDSCR:null},
           {regime:'sculpt',          endPeriod:60, targetDSCR:1.10},
           {regime:'level',           endPeriod:70, targetDSCR:null}
         ]},
-      {id:'ran1',type:'RAN (Revenue Anticipation Note)',amount:50_000_000,rate:0.0350,tenorYears:2,closeDate:'2026-07-01',seniority:'Short-term',repaymentStyle:'Bullet',drawdownPriority:2,targetDSCR:0,ioYears:0,deferralYears:0,dayCount:'Actual/360',covenants:'Repaid from first revenues'},
+      {id:'ran1',type:'RAN (Revenue Anticipation Note)',amount:50_000_000,rate:0.0350,tenorYears:2,closeDate:'2026-07-01',seniority:'Short-term',repaymentStyle:'Bullet',drawdownPriority:2,targetDSCR:0,ioYears:0,deferralYears:0,dayCount:'Actual/360',covenants:'Repaid from first revenues', issuanceCost:350_000, issuanceCostEscalation:0.03},
     ],
     financingFeesPctOfDebt:0.015, blendedIDCRateForNonTIFIA:0.0525,
+    issuanceCostBaseYear:2024,
   },
   tifia: {
     instrumentId:'tifia1', treasuryRate:0.0395, spreadBps:1, useTenorSpreadCurve:true,
@@ -104,6 +105,7 @@ const defaultModel = () => ({
     fiftyPercentTestYearsBeforeMaturity:10, enforce50PctTest:true,
     minDSCR:1.10, minLLCR:1.30, minPLCR:1.40, maxWAL:25,
     lockupDSCR:1.20, lockupLLCR:1.20,
+    adminFeeAnnual:13_500, monitoringFeeBps:7.5,
   },
   controlAccounts: {
     dsraMonthsDS:6, omReserveMonths:3, rampUpReserveAmount:15_000_000, rampUpReleaseYears:5,
@@ -131,10 +133,24 @@ const defaultModel = () => ({
       targetEquityIRR:0.12,
       // Plug
       plugInstrumentId:'eq1',
+      // Auto-optimizer: when on, replaces manual tifiaPercentage with binary search
+      autoOptimizeTifia: false,
+      autoTifiaParams: {
+        deferYears: 5,
+        ioYears: 5,
+        testYearsBeforeMaturity: 10,
+        phase3Mode: 'annuity',
+        minTifiaPct: 0.10,
+        maxTifiaPct: 0.49,
+        minTotalDSCR: 1.10,
+        minSrDSCR: 1.30,
+        minTifiaDSCR: 1.10,
+      },
     },
     lastRun:null,
     lastJointRun:null,
     lastCascadeRun:null,
+    lastAutoCascadeRun:null,
   },
   vfm: {
     pscDiscountRate: 0.045,
@@ -493,9 +509,18 @@ function phasedSchedule(principal, ratePer, periods, cfads, phases, originalPrin
     }
     else if(phase.regime === 'level'){
       if(levelPmt === null){
-        // Compute level pmt ONCE at phase entry, based on balance at entry + periods within phase
+        // Compute level pmt ONCE at phase entry. If targetEndBalance specified, solve to that;
+        // otherwise fully amortize to zero (default behavior).
         const r = ratePer;
-        levelPmt = r > 0 ? (bal * r) / (1 - Math.pow(1 + r, -periodsRemainingInPhase)) : bal / Math.max(1, periodsRemainingInPhase);
+        const n = periodsRemainingInPhase;
+        const targetEnd = phase.targetEndBalance != null ? phase.targetEndBalance : 0;
+        if(r > 0){
+          const grow = Math.pow(1 + r, n);
+          // bal*grow - pmt*(grow-1)/r = targetEnd  →  pmt = (bal*grow - targetEnd) * r / (grow-1)
+          levelPmt = (bal * grow - targetEnd) * r / (grow - 1);
+        } else {
+          levelPmt = (bal - targetEnd) / Math.max(1, n);
+        }
       }
       const pri = Math.max(0, Math.min(bal, levelPmt - intP));
       interest[i] = intP;
@@ -683,7 +708,9 @@ function buildInstrumentSchedule(inst, periods, cfads, tifiaCfg, ppy){
     else if(inst.repaymentStyle === 'Sculpted (target DSCR)') s = sculptToTarget(principal, ratePer, slice, cfads, inst.targetDSCR||1.30, ioP, defP);
     else if(inst.repaymentStyle === 'Phased (multi-regime)') s = phasedSchedule(principal, ratePer, slice, cfads, inst.phases||[], principal);
     else s = levelDebt(principal, ratePer, slice, ioP, defP);
-    if(isTIFIAwith50){
+    if(isTIFIAwith50 && inst.repaymentStyle !== 'Phased (multi-regime)'){
+      // Phased schedules are assumed to be engineered (manually or by auto-cascade) to pass the 50% test.
+      // Running the post-hoc redistributor on top creates spurious bullets that conflict with the phase structure.
       const r = apply50PctTest(s, slice, principal, tifiaCfg.fiftyPercentTestYearsBeforeMaturity||10, 0.5);
       s = r.schedule; testInfo = r;
     }
@@ -818,7 +845,20 @@ function buildFullModel(model){
   }
   const financingFees = debtTotal * model.financing.financingFeesPctOfDebt;
   if(tifiaInst) tifiaInst.principalAfterIDC = tifiaInst.amount + tifiaConstr.capitalizedInterestTotal;
-  const totalUses = capexSched.totalNominal + ntIDC + tifiaConstr.capitalizedInterestTotal + financingFees;
+  // Issuance costs per instrument, escalated from base year to FC year
+  const baseYear = model.financing.issuanceCostBaseYear || 2024;
+  const fcYear = parseInt((model.general.financialCloseDate || '2026-07-01').slice(0,4), 10);
+  const yearsToFC = Math.max(0, fcYear - baseYear);
+  const issuanceCostsByID = {};
+  let totalIssuanceCost = 0;
+  for(const inst of instruments){
+    const base = inst.issuanceCost || 0;
+    const esc = inst.issuanceCostEscalation || 0;
+    const escalated = base > 0 ? base * Math.pow(1 + esc, yearsToFC) : 0;
+    issuanceCostsByID[inst.id] = escalated;
+    totalIssuanceCost += escalated;
+  }
+  const totalUses = capexSched.totalNominal + ntIDC + tifiaConstr.capitalizedInterestTotal + financingFees + totalIssuanceCost;
 
   const periods = generateOperatingPeriods(model);
   const n = periods.length;
@@ -850,8 +890,23 @@ function buildFullModel(model){
     }
   });
   const totalDS = seniorDS.map((v,i)=>v + subDS[i] + shortDS[i]);
-  const seniorDSCR = cfads.map((c,i)=> seniorDS[i] > 0 ? c/seniorDS[i] : null);
-  const totalDSCR = cfads.map((c,i)=> totalDS[i] > 0 ? c/totalDS[i] : null);
+  // TIFIA admin + monitoring fees per period
+  const tifiaAdminPerPeriod = zeros(n), tifiaMonitoringPerPeriod = zeros(n), tifiaFeesPerPeriod = zeros(n);
+  if(tifiaInst){
+    const adminYr = model.tifia.adminFeeAnnual || 0;
+    const monBps = model.tifia.monitoringFeeBps || 0;
+    const adminPer = adminYr / ppy;
+    const tifiaBal = debtSchedules[tifiaInst.id]?.balance || zeros(n);
+    for(let i=0;i<n;i++){
+      tifiaAdminPerPeriod[i] = adminPer;
+      tifiaMonitoringPerPeriod[i] = (tifiaBal[i] * (monBps/10000)) / ppy;
+      tifiaFeesPerPeriod[i] = tifiaAdminPerPeriod[i] + tifiaMonitoringPerPeriod[i];
+    }
+  }
+  const cfadsForDscr = cfads.map((c,i)=> c - tifiaFeesPerPeriod[i]);
+  const totalTifiaFees = sum(tifiaFeesPerPeriod);
+  const seniorDSCR = cfadsForDscr.map((c,i)=> seniorDS[i] > 0 ? c/seniorDS[i] : null);
+  const totalDSCR = cfadsForDscr.map((c,i)=> totalDS[i] > 0 ? c/totalDS[i] : null);
   const overallObligation = revSched.byPeriod.map((r,i)=>(opexSched.byPeriod[i]+totalDS[i])>0 ? r/(opexSched.byPeriod[i]+totalDS[i]) : null);
   const overallPasses = overallObligation.map(v=>v!=null && v >= (model.waterfall.overallObligationMin||1.0));
   const llcrSenior = computeLLCR(cfads, seniorBal, periods, model.general.discountRate, ppy);
@@ -865,9 +920,9 @@ function buildFullModel(model){
   const rawEquityCF = zeros(n);
   for(let i=0;i<n;i++){
     if(model.waterfall.mode === 'Debt-first (Revenue → DS → Opex)'){
-      rawEquityCF[i] = revSched.byPeriod[i] - totalDS[i] - opexSched.byPeriod[i];
+      rawEquityCF[i] = revSched.byPeriod[i] - totalDS[i] - opexSched.byPeriod[i] - tifiaFeesPerPeriod[i];
     } else {
-      rawEquityCF[i] = cfads[i] - totalDS[i];
+      rawEquityCF[i] = cfadsForDscr[i] - totalDS[i];
     }
   }
   // Lockup escrow: traps positive equity CF during lockup; releases on cure
@@ -895,6 +950,9 @@ function buildFullModel(model){
     nonTIFIAIDC: ntIDC, nonTIFIAIDCMonthly: ntIDCMonthly, financingFees,
     capitalizedTIFIAInterest: tifiaConstr.capitalizedInterestTotal,
     totalUses, totalSources: sourcesTotal, grantTotal, equityTotal, paygoTotal, debtTotal,
+    totalIssuanceCost, issuanceCostsByID,
+    tifiaAdminPerPeriod, tifiaMonitoringPerPeriod, tifiaFeesPerPeriod, totalTifiaFees,
+    cfadsForDscr,
     revSched, opexSched, cfadsByPeriod: cfads,
     instruments: sortedInst, debtSchedules,
     seniorDS, subDS, shortDS, totalDS,
@@ -1137,6 +1195,298 @@ function runCascadeWaterfall(model, params, maxIter = 8){
     outerIterations: trace.length,
     finalGap: trace.length > 0 ? trace[trace.length - 1].postGap : 0,
   };
+}
+
+// ============================================================
+// AUTO-CASCADE TIFIA (50% TEST PASSES BY CONSTRUCTION)
+// ============================================================
+// Generates a 4-phase TIFIA schedule (defer / IO / sculpt or annuity / level) such that:
+//   - Phase 3 ends with balance = exactly 50% of original principal (test passes by construction)
+//   - Phase 4 amortizes 50% to zero by maturity (annuity / level)
+// Phase 3 mode:
+//   'annuity' — level pmt sized to land at 50% balance at test point
+//   'sculpt'  — binary-search DSCR target so balance at test = 50% (falls back to annuity if CFADS insufficient)
+function buildTifiaCascadePhases(model, instrumentId, params, cfadsByPeriod){
+  const inst = model.financing.instruments.find(i => i.id === instrumentId);
+  if(!inst) return { error: 'TIFIA instrument not found', phases: [] };
+  const ppy = model.general.periodsPerYear;
+  const tenorPeriods = Math.round(inst.tenorYears * ppy);
+  const deferP = Math.round((params.deferYears || 0) * ppy);
+  const ioP = Math.round((params.ioYears || 0) * ppy);
+  const testP = Math.round((params.testYearsBeforeMaturity || 10) * ppy);
+  const phase3EndP = tenorPeriods - testP;
+  const phase4EndP = tenorPeriods;
+  const phase3Periods = phase3EndP - deferP - ioP;
+  if(phase3Periods <= 0) return { error: 'Phase 3 has no periods (check defer/IO/test years vs tenor)', phases: [] };
+
+  const P = inst.amount;
+  const ratePer = tifiaAllInRate(inst.tenorYears, model.tifia) / ppy;
+  // During defer interest capitalizes; IO is flat. Balance at end of IO = P * (1+r)^deferP
+  const postIOBal = P * Math.pow(1 + ratePer, deferP);
+  const targetTestBal = 0.5 * P;
+
+  const phases = [];
+  if(deferP > 0) phases.push({regime:'defer', endPeriod: deferP});
+  if(ioP > 0)    phases.push({regime:'io',    endPeriod: deferP + ioP});
+
+  let fallbackUsed = false;
+  let foundDSCR = null;
+  let diagnosis = '';
+
+  if(params.phase3Mode === 'annuity' || params.phase3Mode === 'level'){
+    phases.push({regime:'level', endPeriod: phase3EndP, targetEndBalance: targetTestBal});
+    diagnosis = 'Phase 3 annuity (level pmt to 50% balance)';
+  } else {
+    // Sculpt mode — binary search DSCR
+    const cfadsSlice = [];
+    for(let i = deferP + ioP; i < phase3EndP; i++){
+      cfadsSlice.push((cfadsByPeriod && cfadsByPeriod[i]) || 0);
+    }
+    const simulate = (dscr) => {
+      let bal = postIOBal;
+      for(let i = 0; i < cfadsSlice.length; i++){
+        const intP = bal * ratePer;
+        const maxDS = cfadsSlice[i] / Math.max(dscr, 0.0001);
+        const pri = Math.max(0, Math.min(bal, maxDS - intP));
+        bal -= pri;
+      }
+      return bal;
+    };
+    const balMaxAmort = simulate(1.0001);  // most amortization → lowest end balance
+    if(balMaxAmort > targetTestBal){
+      // Even maxing out principal can't bring balance to 50% — TIFIA too large for CFADS profile
+      phases.push({regime:'level', endPeriod: phase3EndP, targetEndBalance: targetTestBal, _fallback:'sculpt-infeasible'});
+      fallbackUsed = true;
+      diagnosis = `Sculpt infeasible (TIFIA too large for CFADS) — fell back to annuity. Required end balance ${fmt$ ? fmt$(targetTestBal) : targetTestBal}, max amort gets to ${fmt$ ? fmt$(balMaxAmort) : balMaxAmort}.`;
+    } else {
+      let lo = 1.0001, hi = 200;
+      for(let it = 0; it < 60; it++){
+        const mid = (lo + hi) / 2;
+        const bal = simulate(mid);
+        if(bal > targetTestBal) hi = mid;
+        else lo = mid;
+        if(hi - lo < 0.0005) break;
+      }
+      foundDSCR = (lo + hi) / 2;
+      phases.push({regime:'sculpt', endPeriod: phase3EndP, targetDSCR: foundDSCR});
+      diagnosis = `Phase 3 sculpt @ DSCR ${foundDSCR.toFixed(3)}x (solved to hit 50% test balance)`;
+    }
+  }
+
+  // Phase 4: level to zero
+  phases.push({regime:'level', endPeriod: phase4EndP, targetEndBalance: 0});
+
+  return {
+    phases, testPoint: phase3EndP - 1,
+    postIOBalance: postIOBal, targetTestBalance: targetTestBal,
+    fallbackUsed, foundDSCR, diagnosis,
+    phaseStructure: {
+      defer: {start: 0, end: deferP, years: params.deferYears || 0},
+      io: {start: deferP, end: deferP + ioP, years: params.ioYears || 0},
+      phase3: {start: deferP + ioP, end: phase3EndP, years: phase3Periods/ppy, mode: params.phase3Mode || 'sculpt'},
+      phase4: {start: phase3EndP, end: phase4EndP, years: (phase4EndP - phase3EndP)/ppy},
+    },
+  };
+}
+
+// Outer: binary-search TIFIA % such that all constraints satisfied (50% test passes by construction)
+
+// TIFIA-FIRST cascade optimizer. Logic:
+//   1. TIFIA = min(49% × eligible, max where 50% test passes + min Total DSCR ≥ floor + TIFIA eff DSCR ≥ floor)
+//   2. PAB = min(remaining funding need, max where (CFADS_net − TIFIA DS) / Sr DS ≥ Sr DSCR floor)
+//   3. Equity = set externally (NPV @ IRR target)
+//   4. Grant = plug
+// CFADS_net = CFADS - TIFIA admin/monitoring fees.
+function autoCascadeTifia(model, params){
+  const working = JSON.parse(JSON.stringify(model));
+  const trace = [];
+
+  const evaluate = (pct) => {
+    const w = JSON.parse(JSON.stringify(working));
+    let tempR;
+    try { tempR = buildFullModel(w); }
+    catch(e){ return { pct, error:'init build failed: '+e.message, feasible:false }; }
+
+    // STEP 1: SIZE TIFIA
+    let eligibleCost = 0;
+    for(const id of (params.tifiaEligibleCapexIds || [])){
+      eligibleCost += sum(tempR.capexSched.byItem[id] || []);
+    }
+    const tifiaAmount = Math.round(eligibleCost * pct);
+    const tifia = w.financing.instruments.find(i => i.id === params.tifiaInstrumentId);
+    if(!tifia) return { pct, error:'TIFIA not found', feasible:false };
+    tifia.amount = tifiaAmount;
+
+    // Zero PAB so TIFIA gets first shot
+    const pabInst = params.pabInstrumentId
+      ? w.financing.instruments.find(i => i.id === params.pabInstrumentId) : null;
+    if(pabInst) pabInst.amount = 0;
+
+    let preR;
+    try { preR = buildFullModel(w); }
+    catch(e){ return { pct, tifiaAmount, error:'pre-build failed: '+e.message, feasible:false }; }
+
+    // CFADS available to TIFIA = cfadsForDscr (already net of TIFIA fees) since PAB=0
+    const cfadsForTifia = preR.cfadsForDscr ? [...preR.cfadsForDscr] : [...preR.cfadsByPeriod];
+
+    const phaseRes = buildTifiaCascadePhases(w, params.tifiaInstrumentId, {
+      deferYears: params.deferYears, ioYears: params.ioYears,
+      testYearsBeforeMaturity: params.testYearsBeforeMaturity,
+      phase3Mode: params.phase3Mode,
+    }, cfadsForTifia);
+    if(phaseRes.error) return { pct, tifiaAmount, error: phaseRes.error, feasible:false };
+    tifia.phases = phaseRes.phases;
+    tifia.repaymentStyle = 'Phased (multi-regime)';
+
+    // STEP 2: SIZE PAB
+    // PAB only if TIFIA hit statutory ceiling AND funding gap remains.
+    // PAB = min(funding gap, max where (CFADS - TIFIA DS)/Sr DS >= Sr DSCR floor)
+    let pabAmount = 0;
+    const maxTifiaPct = params.maxTifiaPct || 0.49;
+    const tifiaAtCeiling = pct >= maxTifiaPct - 0.005;
+    if(pabInst){
+      if(!tifiaAtCeiling){
+        // TIFIA stopped below ceiling — adding PAB hurts Total DSCR
+        pabInst.amount = 0;
+        pabAmount = 0;
+      } else {
+        // TIFIA at ceiling — check funding gap with PAB=0
+        pabInst.amount = 0;
+        let gapR;
+        try { gapR = buildFullModel(w); } catch(e){ gapR = preR; }
+        const fundingGap = gapR.totalUses - gapR.totalSources;
+        if(fundingGap <= 0){
+          pabAmount = 0;
+        } else {
+          const tifiaSched = gapR.debtSchedules?.[tifia.id] || {interest:[], principal:[]};
+          const tifiaDS = gapR.periods.map((_, i) =>
+            (tifiaSched.interest?.[i] || 0) + (tifiaSched.principal?.[i] || 0));
+          const minSrFloor = params.minSrDSCR || 1.30;
+
+          const pabFeasible = (amt) => {
+            pabInst.amount = Math.round(amt);
+            let rr;
+            try { rr = buildFullModel(w); } catch(e){ return [false, null]; }
+            let worst = Infinity;
+            for(let j=0; j<rr.periods.length; j++){
+              if(tifiaDS[j] > 1000 && (rr.seniorDS[j] || 0) > 1000){
+                const d = ((rr.cfadsForDscr?.[j] || rr.cfadsByPeriod[j]) - tifiaDS[j]) / rr.seniorDS[j];
+                if(d < worst) worst = d;
+              }
+            }
+            if(!isFinite(worst)) worst = 999;
+            return [worst >= minSrFloor - 0.005, worst];
+          };
+
+          let lo = 0, hi = fundingGap * 1.1;
+          let maxAtFloor = 0;
+          for(let k=0; k<40; k++){
+            const m = (lo + hi) / 2;
+            const [ok] = pabFeasible(m);
+            if(ok){ maxAtFloor = m; lo = m; } else { hi = m; }
+            if(hi - lo < 50_000) break;
+          }
+          pabAmount = Math.min(fundingGap, maxAtFloor);
+          pabInst.amount = Math.round(pabAmount);
+        }
+      }
+    }
+
+    // STEP 4: PLUG
+    let finalR;
+    try { finalR = buildFullModel(w); }
+    catch(e){ return { pct, tifiaAmount, error:'final build failed: '+e.message, feasible:false }; }
+    let plugApplied = 0;
+    if(params.plugInstrumentId){
+      const gap = finalR.totalUses - finalR.totalSources;
+      const plug = w.financing.instruments.find(i => i.id === params.plugInstrumentId);
+      if(plug){
+        plug.amount = Math.max(0, Math.round(plug.amount + gap));
+        plugApplied = gap;
+        try { finalR = buildFullModel(w); } catch(e){}
+      }
+    }
+
+    // FEASIBILITY (floors measured over TIFIA-active periods; display falls back to all-period min)
+    const tifiaSchedF = finalR.debtSchedules?.[params.tifiaInstrumentId];
+    let minSrFeas = Infinity, minTotalDSCR = Infinity, minTifiaEffDSCR = Infinity;
+    if(tifiaSchedF){
+      for(let i=0; i<finalR.periods.length; i++){
+        const tDS = (tifiaSchedF.interest[i]||0) + (tifiaSchedF.principal[i]||0);
+        if(tDS > 1000){
+          const srDSi = finalR.seniorDS[i] || 0;
+          const subDSi = finalR.subDS?.[i] || 0;
+          const cfi = finalR.cfadsForDscr?.[i] || finalR.cfadsByPeriod[i] || 0;
+          if(srDSi > 1000){
+            const sd = cfi / srDSi;
+            if(sd < minSrFeas) minSrFeas = sd;
+          }
+          const td = srDSi + subDSi;
+          if(td > 1000){
+            const ttd = cfi / td;
+            if(ttd < minTotalDSCR) minTotalDSCR = ttd;
+          }
+          const eff = (cfi - srDSi) / tDS;
+          if(eff < minTifiaEffDSCR) minTifiaEffDSCR = eff;
+        }
+      }
+    }
+    // Display: prefer TIFIA-active value, fall back to all-period min
+    let minSrDSCR;
+    if(isFinite(minSrFeas)) minSrDSCR = minSrFeas;
+    else {
+      const allSr = (finalR.seniorDSCR || []).filter(v => v != null && isFinite(v));
+      minSrDSCR = allSr.length ? Math.min(...allSr) : 999;
+    }
+    if(!isFinite(minTotalDSCR)) minTotalDSCR = null;
+    if(!isFinite(minTifiaEffDSCR)) minTifiaEffDSCR = null;
+    const srForFeas = isFinite(minSrFeas) ? minSrFeas : 999;
+
+    const testBalAtPoint = (phaseRes.testPoint >= 0 && tifiaSchedF) ? tifiaSchedF.balance[phaseRes.testPoint] : null;
+    const testPassed = testBalAtPoint != null && testBalAtPoint <= 0.5 * tifiaAmount + 1000;
+
+    const feasible = (
+      (minTotalDSCR == null || minTotalDSCR >= (params.minTotalDSCR || 1.10) - 0.005)
+      && (minTifiaEffDSCR == null || minTifiaEffDSCR >= (params.minTifiaDSCR || 1.10) - 0.005)
+      && (srForFeas >= (params.minSrDSCR || 1.30) - 0.005)
+      && testPassed
+    );
+
+    return {
+      pct, tifiaAmount, pabAmount: Math.round(pabAmount), eligibleCost,
+      phaseInfo: phaseRes,
+      minSrDSCR, minTotalDSCR, minTifiaEffDSCR,
+      testBalAtPoint, testPassed,
+      finalGap: finalR.totalUses - finalR.totalSources, plugApplied,
+      feasible, workingModel: w, finalResults: finalR,
+    };
+  };
+
+  let lo = params.minTifiaPct || 0.10;
+  let hi = params.maxTifiaPct || 0.49;
+  let best = null;
+
+  const eHi = evaluate(hi);
+  trace.push({...eHi, iter:1});
+  if(eHi.feasible){
+    return { best: eHi, trace, converged: true, ceilingReached: true };
+  }
+  const eLo = evaluate(lo);
+  trace.push({...eLo, iter:2});
+  if(!eLo.feasible){
+    return { best: null, trace, converged: false, error:'Even min TIFIA % infeasible — relax constraints' };
+  }
+  best = eLo;
+
+  for(let it=0; it<18; it++){
+    const mid = (lo + hi) / 2;
+    const r = evaluate(mid);
+    trace.push({...r, iter: trace.length + 1});
+    if(r.feasible){ best = r; lo = mid; }
+    else hi = mid;
+    if(hi - lo < 0.003) break;
+  }
+  return { best, trace, converged: true };
 }
 
 // ============================================================
@@ -1570,11 +1920,12 @@ function FinancingTab({model, setModel}){
   };
   return <div>
     <Section title="Construction-Period Financing Parameters">
-      <div className="grid grid-cols-2 gap-4">
+      <div className="grid grid-cols-3 gap-4">
         <Field label="Blended IDC Rate — non-TIFIA debt"><NumInput value={f.blendedIDCRateForNonTIFIA} onChange={v=>setF({blendedIDCRateForNonTIFIA:v})} step={0.005} suffix="%"/></Field>
         <Field label="Financing Fees (% of total debt)"><NumInput value={f.financingFeesPctOfDebt} onChange={v=>setF({financingFeesPctOfDebt:v})} step={0.005} suffix="%"/></Field>
+        <Field label="Issuance Cost Base Year" hint="Per-instrument issuance costs escalated from this year to FC year"><NumInput value={f.issuanceCostBaseYear} onChange={v=>setF({issuanceCostBaseYear:v})}/></Field>
       </div>
-      <p className="text-xs text-stone-500 mt-3">TIFIA construction interest is computed separately (act/act day-count, semi-annual cap). See TIFIA tab.</p>
+      <p className="text-xs text-stone-500 mt-3">TIFIA construction interest is computed separately (act/act day-count, semi-annual cap). See TIFIA tab. Issuance costs are set per instrument below and added to Uses.</p>
     </Section>
     <Section title="Capital Stack" subtitle="Per-instrument seniority, repayment, day-count, deferral, covenants."
       action={<button onClick={addInst} className="text-xs px-3 py-1.5 bg-amber-500/10 border border-amber-500/50 text-amber-300 rounded hover:bg-amber-500/20">+ Add Instrument</button>}>
@@ -1593,6 +1944,10 @@ function FinancingTab({model, setModel}){
             <Field label="Target DSCR"><NumInput value={inst.targetDSCR} onChange={v=>updateInst(inst.id,{targetDSCR:v})} step={0.05}/></Field>
             <Field label="IO Years"><NumInput value={inst.ioYears} onChange={v=>updateInst(inst.id,{ioYears:v})}/></Field>
             <Field label="Deferral Years"><NumInput value={inst.deferralYears} onChange={v=>updateInst(inst.id,{deferralYears:v})}/></Field>
+          </div>
+          <div className="grid grid-cols-2 gap-4 mt-3">
+            <Field label="Issuance Cost ($, base year)" hint={`Base yr: ${f.issuanceCostBaseYear||2024}. Escalated to FC.`}><NumInput value={inst.issuanceCost} onChange={v=>updateInst(inst.id,{issuanceCost:v})} prefix="$"/></Field>
+            <Field label="Issuance Cost Escalation (%/yr)"><NumInput value={inst.issuanceCostEscalation} onChange={v=>updateInst(inst.id,{issuanceCostEscalation:v})} step={0.005} suffix="%"/></Field>
           </div>
           <Field label="Covenants / Notes"><TextInput value={inst.covenants} onChange={v=>updateInst(inst.id,{covenants:v})}/></Field>
           {inst.repaymentStyle === 'Phased (multi-regime)' && (()=>{
@@ -1690,6 +2045,14 @@ function TIFIATab({model, setModel, results}){
             <TD><button className="text-xs text-rose-400" onClick={()=>setT({tenorSpreadCurve:t.tenorSpreadCurve.filter((_,idx)=>idx!==i)})}>×</button></TD>
           </tr>))}</tbody></table>
         <button onClick={()=>setT({tenorSpreadCurve:[...t.tenorSpreadCurve,{maxTenor:40,bps:5}]})} className="text-xs text-amber-300 mt-2">+ add tier</button>
+      </div>
+      <div className="bg-stone-900/40 border border-stone-700/60 rounded p-3 mb-3">
+        <div className="text-[11px] uppercase tracking-wider text-stone-400 mb-2">TIFIA Admin + Monitoring Fees (throughout loan tenor)</div>
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Admin Fee (annual, $)" hint="US DOT TIFIA standard ~$13,500/yr"><NumInput value={t.adminFeeAnnual} onChange={v=>setT({adminFeeAnnual:v})} prefix="$"/></Field>
+          <Field label="Monitoring Fee (bps/yr on outstanding)" hint="Charged on outstanding TIFIA balance"><NumInput value={t.monitoringFeeBps} onChange={v=>setT({monitoringFeeBps:v})} step={0.5} suffix="bps"/></Field>
+        </div>
+        <div className="text-[11px] text-stone-500 mt-2">Total over life: <span className="text-amber-300">{fmt$(results.totalTifiaFees)}</span> · deducted from CFADS before DSCR calc.</div>
       </div>
       <div className="grid grid-cols-3 gap-3">
         <Metric label="All-in TIFIA rate" value={fmtPct(results.tifiaAllInRate,3)} sub={tifiaInst?`Treasury ${fmtPct(t.treasuryRate,3)} + ${tifiaSpreadBps(tifiaInst.tenorYears,t)}bps`:''} accent="amber"/>
@@ -1810,6 +2173,7 @@ function OptimizerTab({model, setModel, results}){
   const [output, setOutput] = useState(o.lastRun);
   const [jointOutput, setJointOutput] = useState(o.lastJointRun);
   const [cascadeOutput, setCascadeOutput] = useState(o.lastCascadeRun);
+  const [autoCascadeOutput, setAutoCascadeOutput] = useState(o.lastAutoCascadeRun);
   const mode = o.mode || 'single';
   const updateJointTarget = (i, patch) => setO({jointTargets: o.jointTargets.map((t,idx)=>idx===i?{...t,...patch}:t)});
   const addJointTarget = () => setO({jointTargets:[...o.jointTargets, {instrumentId:model.financing.instruments[0]?.id||'', minDSCR:1.20, minLLCR:1.20}]});
@@ -1842,6 +2206,39 @@ function OptimizerTab({model, setModel, results}){
         sizes: r.workingModel?.financing?.instruments?.map(i=>({id:i.id,amount:i.amount}))||[]}});
       setRunning(false);
     },50);
+  };
+  const runAutoCascade = () => {
+    setRunning(true);
+    setTimeout(()=>{
+      const c = o.cascade || {};
+      const ap = c.autoTifiaParams || {};
+      const params = {
+        tifiaInstrumentId: c.tifiaInstrumentId,
+        tifiaEligibleCapexIds: c.tifiaEligibleCapexIds || [],
+        pabInstrumentId: c.pabInstrumentId,
+        plugInstrumentId: c.plugInstrumentId,
+        deferYears: ap.deferYears,
+        ioYears: ap.ioYears,
+        testYearsBeforeMaturity: ap.testYearsBeforeMaturity,
+        phase3Mode: ap.phase3Mode,
+        minTifiaPct: ap.minTifiaPct,
+        maxTifiaPct: ap.maxTifiaPct,
+        minTotalDSCR: ap.minTotalDSCR,
+        minSrDSCR: ap.minSrDSCR,
+        minTifiaDSCR: ap.minTifiaDSCR,
+      };
+      const r = autoCascadeTifia(model, params);
+      setAutoCascadeOutput(r);
+      setO({lastAutoCascadeRun:{
+        bestPct: r.best?.pct, bestTifia: r.best?.tifiaAmount, bestPab: r.best?.pabAmount,
+        diagnosis: r.best?.phaseInfo?.diagnosis, converged: r.converged,
+      }});
+      setRunning(false);
+    },50);
+  };
+  const applyAutoCascade = () => {
+    if(!autoCascadeOutput || !autoCascadeOutput.best || !autoCascadeOutput.best.workingModel) return;
+    setModel(autoCascadeOutput.best.workingModel);
   };
   const applySingle = () => {
     if(!output || !output.best) return;
@@ -1991,6 +2388,8 @@ function OptimizerTab({model, setModel, results}){
 
     {mode==='cascade' && (()=>{
       const c = o.cascade || {};
+      const ap = c.autoTifiaParams || {};
+      const setAuto = patch => setCascade({autoTifiaParams: {...ap, ...patch}});
       const eligibleIds = c.tifiaEligibleCapexIds || [];
       const toggleEligible = (id) => {
         const newIds = eligibleIds.includes(id) ? eligibleIds.filter(x=>x!==id) : [...eligibleIds, id];
@@ -2005,6 +2404,104 @@ function OptimizerTab({model, setModel, results}){
       }
       const tifiaPreview = eligiblePreview * (c.tifiaPercentage || 0);
       return <>
+        <Section title="Auto-Optimize TIFIA %"
+          subtitle="When ON: binary-search the maximum TIFIA % such that (a) the 50% balance test passes by construction (phases built deterministically), (b) Sr DSCR ≥ floor, and (c) TIFIA effective DSCR ≥ floor. Auto-cascade overrides the manual TIFIA % in Step 1 below."
+          action={<Toggle value={c.autoOptimizeTifia} onChange={v=>setCascade({autoOptimizeTifia:v})} label={c.autoOptimizeTifia?'AUTO ON':'AUTO OFF'}/>}>
+          {c.autoOptimizeTifia && <div className="space-y-4">
+            <div className="grid grid-cols-4 gap-3">
+              <Field label="Defer Years (CapI)"><NumInput value={ap.deferYears} onChange={v=>setAuto({deferYears:v})} step={1} suffix="y"/></Field>
+              <Field label="IO Years"><NumInput value={ap.ioYears} onChange={v=>setAuto({ioYears:v})} step={1} suffix="y"/></Field>
+              <Field label="Test Point (yrs before maturity)"><NumInput value={ap.testYearsBeforeMaturity} onChange={v=>setAuto({testYearsBeforeMaturity:v})} step={1} suffix="y"/></Field>
+              <Field label="Phase 3 Mode"><Select value={ap.phase3Mode} onChange={v=>setAuto({phase3Mode:v})} options={['sculpt','annuity']}/></Field>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <Field label="Min TIFIA % (search floor)"><NumInput value={ap.minTifiaPct} onChange={v=>setAuto({minTifiaPct:v})} step={0.01} suffix="%"/></Field>
+              <Field label="Max TIFIA % (statute cap)"><NumInput value={ap.maxTifiaPct} onChange={v=>setAuto({maxTifiaPct:v})} step={0.01} suffix="%"/></Field>
+            </div>
+            <div className="grid grid-cols-3 gap-3">
+              <Field label="Min Total DSCR (Sr + TIFIA)" hint="Binds TIFIA sizing"><NumInput value={ap.minTotalDSCR} onChange={v=>setAuto({minTotalDSCR:v})} step={0.05}/></Field>
+              <Field label="Min Senior DSCR" hint="Binds PAB sizing"><NumInput value={ap.minSrDSCR} onChange={v=>setAuto({minSrDSCR:v})} step={0.05}/></Field>
+              <Field label="Min TIFIA Eff DSCR" hint="(CFADS−SrDS)/TIFIA DS"><NumInput value={ap.minTifiaDSCR} onChange={v=>setAuto({minTifiaDSCR:v})} step={0.05}/></Field>
+            </div>
+            <div className="bg-stone-900/40 border border-stone-700/60 rounded p-3 text-xs text-stone-400 space-y-1">
+              <div><span className="text-amber-300">Phase 1 — Defer (CapI):</span> {ap.deferYears}y · interest capitalizes into balance</div>
+              <div><span className="text-amber-300">Phase 2 — IO:</span> {ap.ioYears}y · pay interest only</div>
+              <div><span className="text-amber-300">Phase 3 — {ap.phase3Mode === 'annuity' ? 'Annuity (level pmt)' : 'Sculpt (binary-searched DSCR)'}:</span> from period {(ap.deferYears+ap.ioYears)*(model.general.periodsPerYear||2)} to test point · targets balance = 50% of original P at test point</div>
+              <div><span className="text-amber-300">Phase 4 — Level:</span> {ap.testYearsBeforeMaturity}y · amortize remaining 50% to zero by maturity</div>
+              {ap.phase3Mode === 'sculpt' && <div className="text-stone-500">If sculpt is infeasible (TIFIA too large for CFADS), phase 3 falls back to annuity automatically.</div>}
+            </div>
+            <div className="flex items-center gap-3">
+              <button onClick={runAutoCascade} disabled={running}
+                className="px-4 py-2 bg-amber-500 text-stone-900 rounded text-sm font-medium hover:bg-amber-400 disabled:opacity-50">
+                {running ? 'Running auto-cascade…' : 'Run Auto-Cascade TIFIA Optimizer'}
+              </button>
+              {autoCascadeOutput && autoCascadeOutput.best && <button onClick={applyAutoCascade} className="px-4 py-2 bg-emerald-500/10 border border-emerald-500/50 text-emerald-300 rounded text-sm hover:bg-emerald-500/20">Apply Optimized Stack</button>}
+            </div>
+          </div>}
+        </Section>
+
+        {c.autoOptimizeTifia && autoCascadeOutput && (
+          <Section title="Auto-Cascade Result" subtitle={autoCascadeOutput.converged?'Converged':'Did not converge'}>
+            {autoCascadeOutput.error && <div className="p-3 bg-rose-900/20 border border-rose-700/50 rounded text-rose-300 text-sm mb-3">Error: {autoCascadeOutput.error}</div>}
+            {autoCascadeOutput.best && (()=>{
+              const b = autoCascadeOutput.best;
+              return <>
+                <div className="grid grid-cols-4 gap-3 mb-4">
+                  <Metric label="Optimized TIFIA %" value={fmtPct(b.pct,2)} accent="amber" sub={b.pct >= (ap.maxTifiaPct-0.005) ? 'Ceiling reached' : 'Max feasible'}/>
+                  <Metric label="TIFIA Principal" value={fmt$(b.tifiaAmount)} accent="amber" sub={`of ${fmt$(b.eligibleCost)} eligible`}/>
+                  <Metric label="Balance @ Test Point" value={fmt$(b.testBalAtPoint)} accent={b.testPassed?'green':'red'} sub={`50% target = ${fmt$(0.5*b.tifiaAmount)} · ${b.testPassed?'PASS':'FAIL'}`}/>
+                  <Metric label="Funding Gap" value={fmt$(b.finalGap)} accent={Math.abs(b.finalGap)<1e6?'green':'amber'} sub="Post-plug"/>
+                </div>
+                <div className="grid grid-cols-4 gap-3 mb-4">
+                  <Metric label="Min Total DSCR (Sr+TIFIA)" value={fmtRatio(b.minTotalDSCR)} accent={!b.minTotalDSCR || b.minTotalDSCR >= (ap.minTotalDSCR||1.10) ? 'green':'red'} sub={`floor ${(ap.minTotalDSCR||1.10).toFixed(2)}x · binds TIFIA`}/>
+                  <Metric label="Min Senior DSCR" value={fmtRatio(b.minSrDSCR)} accent={b.minSrDSCR >= (ap.minSrDSCR||1.30) ? 'green':'red'} sub={`floor ${(ap.minSrDSCR||1.30).toFixed(2)}x`}/>
+                  <Metric label="Min TIFIA Eff DSCR" value={fmtRatio(b.minTifiaEffDSCR)} accent={!b.minTifiaEffDSCR || b.minTifiaEffDSCR >= (ap.minTifiaDSCR||1.10) ? 'green':'red'} sub={`floor ${(ap.minTifiaDSCR||1.10).toFixed(2)}x`}/>
+                  <Metric label="PAB Sized to" value={fmt$(b.pabAmount)} accent="amber" sub={`fills senior capacity`}/>
+                </div>
+                <div className="bg-stone-900/40 border border-amber-500/30 rounded p-3 mb-3">
+                  <div className="text-[11px] uppercase tracking-wider text-amber-300 mb-1">Phase Structure (auto-generated)</div>
+                  <div className="text-xs text-stone-300">{b.phaseInfo?.diagnosis}</div>
+                  {b.phaseInfo?.fallbackUsed && <div className="text-xs text-amber-400 mt-1">⚠ Sculpt failed — fell back to annuity for phase 3</div>}
+                  <div className="mt-2 flex h-6 rounded overflow-hidden border border-stone-700/60">
+                    {(b.phaseInfo?.phases || []).map((p, idx) => {
+                      const startP = idx === 0 ? 0 : (b.phaseInfo.phases[idx-1].endPeriod || 0);
+                      const widthPct = ((p.endPeriod - startP) / Math.max(1, b.phaseInfo.phases[b.phaseInfo.phases.length-1].endPeriod)) * 100;
+                      const colors = {defer:'#475569', io:'#fbbf24', sculpt:'#a78bfa', level:'#10b981', 'equal-principal':'#fb7185'};
+                      return <div key={idx} style={{width:`${widthPct}%`, background:colors[p.regime]||'#666'}} className="flex items-center justify-center text-[9px] font-medium text-stone-950" title={`${p.regime} (${startP}→${p.endPeriod})`}>
+                        {widthPct > 8 ? p.regime : ''}
+                      </div>;
+                    })}
+                  </div>
+                </div>
+                <div className="text-[11px] uppercase tracking-wider text-stone-400 mb-2">Binary Search Trace</div>
+                <div className="overflow-x-auto border border-stone-700/60 rounded">
+                  <table className="w-full text-xs">
+                    <thead className="bg-stone-900"><tr>
+                      <TH>Iter</TH><TH className="text-right">TIFIA %</TH><TH className="text-right">TIFIA $</TH><TH className="text-right">PAB $</TH>
+                      <TH className="text-right">Min Total</TH><TH className="text-right">Min Sr</TH><TH className="text-right">TIFIA Eff</TH>
+                      <TH className="text-right">Test Bal</TH><TH>Feasible</TH>
+                    </tr></thead>
+                    <tbody>{autoCascadeOutput.trace.map((t,i)=>(
+                      <tr key={i} className={`hover:bg-stone-900/40 ${t.feasible?'':'opacity-60'}`}>
+                        <TD>{t.iter}</TD>
+                        <TD className="text-right text-amber-300">{fmtPct(t.pct,2)}</TD>
+                        <TD className="text-right text-stone-300">{fmt$(t.tifiaAmount)}</TD>
+                        <TD className="text-right text-stone-300">{fmt$(t.pabAmount)}</TD>
+                        <TD className="text-right text-stone-300">{fmtRatio(t.minTotalDSCR)}</TD>
+                        <TD className="text-right text-stone-300">{fmtRatio(t.minSrDSCR)}</TD>
+                        <TD className="text-right text-stone-300">{fmtRatio(t.minTifiaEffDSCR)}</TD>
+                        <TD className="text-right text-stone-400">{fmt$(t.testBalAtPoint)}</TD>
+                        <TD className={t.feasible?'text-emerald-300':'text-rose-300'}>{t.feasible?'✓':'✗'}</TD>
+                      </tr>
+                    ))}</tbody>
+                  </table>
+                </div>
+              </>;
+            })()}
+          </Section>
+        )}
+
+        {!c.autoOptimizeTifia && (
         <Section title="Step 1 — TIFIA Sizing (% of Eligible Capex)" subtitle="Select which capex line items are TIFIA-eligible. TIFIA sized as % of summed nominal capex. (TIFIA statute caps at 33% normally, 49% in some cases.)">
           <div className="grid grid-cols-2 gap-4 mb-4">
             <Field label="TIFIA Instrument"><Select value={c.tifiaInstrumentId} onChange={v=>setCascade({tifiaInstrumentId:v})} options={model.financing.instruments.filter(i=>i.type==='TIFIA Loan').map(i=>i.id)}/></Field>
@@ -2108,6 +2605,7 @@ function OptimizerTab({model, setModel, results}){
             </div>
           </Section>
         )}
+        </>)}
       </>;
     })()}
   </div>;
