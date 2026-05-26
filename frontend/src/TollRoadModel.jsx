@@ -2501,7 +2501,7 @@ function OptimizerTab({model, setModel, results}){
           </Section>
         )}
 
-        {!c.autoOptimizeTifia && (
+        {!c.autoOptimizeTifia && (<>
         <Section title="Step 1 — TIFIA Sizing (% of Eligible Capex)" subtitle="Select which capex line items are TIFIA-eligible. TIFIA sized as % of summed nominal capex. (TIFIA statute caps at 33% normally, 49% in some cases.)">
           <div className="grid grid-cols-2 gap-4 mb-4">
             <Field label="TIFIA Instrument"><Select value={c.tifiaInstrumentId} onChange={v=>setCascade({tifiaInstrumentId:v})} options={model.financing.instruments.filter(i=>i.type==='TIFIA Loan').map(i=>i.id)}/></Field>
