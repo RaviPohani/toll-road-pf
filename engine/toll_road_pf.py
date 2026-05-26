@@ -186,7 +186,7 @@ def default_model() -> Dict[str, Any]:
                  'dayCount': '30/360', 'covenants': '',
                  'issuanceCost': 150_000, 'issuanceCostEscalation': 0.03},
                 {'id': 'pab1',   'type': 'PABs',               'amount': 280_000_000, 'rate': 0.0525, 'tenorYears': 30,
-                 'closeDate': '2026-07-01', 'seniority': 'Senior',      'repaymentStyle': 'Sculpted (target DSCR)',
+                 'closeDate': '2026-07-01', 'seniority': 'Senior',      'repaymentStyle': 'Level debt service',
                  'drawdownPriority': 3, 'targetDSCR': 1.35, 'ioYears': 0, 'deferralYears': 3,
                  'dayCount': '30/360', 'covenants': 'Senior DSCR \u22651.20x',
                  'issuanceCost': 4_500_000, 'issuanceCostEscalation': 0.03},
