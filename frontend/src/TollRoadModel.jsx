@@ -86,12 +86,12 @@ const defaultModel = () => ({
       {id:'fg1',type:'Federal Grant',amount:60_000_000,rate:0,tenorYears:0,closeDate:'2026-07-01',seniority:'Grant',repaymentStyle:'Bullet',drawdownPriority:1,targetDSCR:0,ioYears:0,deferralYears:0,dayCount:'30/360',covenants:'Federal cost-share requirements', issuanceCost:250_000, issuanceCostEscalation:0.03},
       {id:'sg1',type:'State Grant',amount:40_000_000,rate:0,tenorYears:0,closeDate:'2026-07-01',seniority:'Grant',repaymentStyle:'Bullet',drawdownPriority:1,targetDSCR:0,ioYears:0,deferralYears:0,dayCount:'30/360',covenants:'State match requirements', issuanceCost:150_000, issuanceCostEscalation:0.03},
       {id:'pab1',type:'PABs (Private Activity Bonds)',amount:280_000_000,rate:0.0525,tenorYears:30,closeDate:'2026-07-01',seniority:'Senior',repaymentStyle:'Level debt service',drawdownPriority:3,targetDSCR:1.35,ioYears:0,deferralYears:3,dayCount:'30/360',covenants:'Senior DSCR ≥1.20x; reserve fund equal to MADS', issuanceCost:4_500_000, issuanceCostEscalation:0.03},
-      {id:'tifia1',type:'TIFIA Loan',amount:200_000_000,rate:0.0410,tenorYears:35,closeDate:'2026-07-01',seniority:'Subordinate',repaymentStyle:'Deferred P&I then sculpted',drawdownPriority:4,targetDSCR:1.10,ioYears:0,deferralYears:5,dayCount:'Actual/Actual',covenants:'TIFIA springing lien; sub DSCR ≥1.10x after deferral', issuanceCost:1_750_000, issuanceCostEscalation:0.03,
+      {id:'tifia1',type:'TIFIA Loan',amount:200_000_000,rate:0.0410,tenorYears:35,closeDate:'2026-07-01',seniority:'Subordinate',repaymentStyle:'Phased (multi-regime)',drawdownPriority:4,targetDSCR:1.10,ioYears:0,deferralYears:5,dayCount:'Actual/Actual',covenants:'TIFIA springing lien; sub DSCR ≥1.10x after deferral', issuanceCost:1_750_000, issuanceCostEscalation:0.03,
         phases:[
-          {regime:'defer',           endPeriod:10, targetDSCR:null},
-          {regime:'io',              endPeriod:20, targetDSCR:null},
-          {regime:'sculpt',          endPeriod:60, targetDSCR:1.10},
-          {regime:'level',           endPeriod:70, targetDSCR:null}
+          {regime:'defer',  endPeriod:10, targetDSCR:null},                                  // CapI 5y
+          {regime:'io',     endPeriod:20, targetDSCR:null},                                  // IO 5y
+          {regime:'level',  endPeriod:50, targetEndBalance:100_000_000, targetDSCR:null},    // Annuity to 50% of $200M @ test point (10y before maturity)
+          {regime:'level',  endPeriod:70, targetEndBalance:0, targetDSCR:null}               // Level 10y to maturity, fully amortize
         ]},
       {id:'ran1',type:'RAN (Revenue Anticipation Note)',amount:50_000_000,rate:0.0350,tenorYears:2,closeDate:'2026-07-01',seniority:'Short-term',repaymentStyle:'Bullet',drawdownPriority:2,targetDSCR:0,ioYears:0,deferralYears:0,dayCount:'Actual/360',covenants:'Repaid from first revenues', issuanceCost:350_000, issuanceCostEscalation:0.03},
     ],
@@ -119,7 +119,7 @@ const defaultModel = () => ({
       {instrumentId:'pab1', minDSCR:1.30, minLLCR:1.30},
       {instrumentId:'tifia1', minDSCR:1.10, minLLCR:1.20},
     ],
-    plugInstrumentId:'eq1',
+    plugInstrumentId:'fg1',
     cascade: {
       // TIFIA sizing
       tifiaInstrumentId:'tifia1',
@@ -128,11 +128,11 @@ const defaultModel = () => ({
       // PAB sizing
       pabInstrumentId:'pab1',
       pabTargetDSCR:1.30,
-      // Equity sizing
+      // Equity sizing — to target IRR
       equityInstrumentId:'eq1',
       targetEquityIRR:0.12,
-      // Plug
-      plugInstrumentId:'eq1',
+      // Plug — grants absorb residual gap after equity is sized
+      plugInstrumentId:'fg1',
       // Auto-optimizer: when on, replaces manual tifiaPercentage with binary search
       autoOptimizeTifia: false,
       autoTifiaParams: {
@@ -1392,6 +1392,42 @@ function autoCascadeTifia(model, params){
       }
     }
 
+    // STEP 3: SIZE EQUITY TO TARGET IRR (binary search using engine's actual IRR)
+    let equityAmount = null, equityForIRRCalc = null;
+    const targetIRR = params.targetEquityIRR || 0;
+    if(params.equityInstrumentId && targetIRR > 0){
+      const equityInst = w.financing.instruments.find(i => i.id === params.equityInstrumentId);
+      if(equityInst){
+        let eqPre;
+        try { eqPre = buildFullModel(w); } catch(e){ eqPre = null; }
+        if(eqPre){
+          const otherSources = eqPre.totalSources - equityInst.amount;
+          const gapNoEq = Math.max(0, eqPre.totalUses - otherSources);
+          let loEq = 0, hiEq = gapNoEq * 1.5;
+          equityAmount = 0;
+          for(let k=0; k<30; k++){
+            const mid = (loEq + hiEq) / 2;
+            equityInst.amount = Math.round(mid);
+            let actualIRR = -1;
+            try {
+              const testR = buildFullModel(w);
+              actualIRR = (testR.equityIRR != null) ? testR.equityIRR : -1;
+            } catch(e){}
+            if(actualIRR >= targetIRR - 0.0001){
+              equityAmount = mid;
+              loEq = mid;
+            } else {
+              hiEq = mid;
+            }
+            if(hiEq - loEq < 10_000) break;
+          }
+          equityAmount = Math.min(equityAmount, gapNoEq);
+          equityForIRRCalc = equityAmount;
+          equityInst.amount = Math.round(equityAmount);
+        }
+      }
+    }
+
     // STEP 4: PLUG
     let finalR;
     try { finalR = buildFullModel(w); }
@@ -1453,7 +1489,12 @@ function autoCascadeTifia(model, params){
     );
 
     return {
-      pct, tifiaAmount, pabAmount: Math.round(pabAmount), eligibleCost,
+      pct, tifiaAmount, pabAmount: Math.round(pabAmount),
+      equityAmount: equityAmount ? Math.round(equityAmount) : 0,
+      equityForIRRCalc: equityForIRRCalc ? Math.round(equityForIRRCalc) : 0,
+      actualEquityIRR: finalR.equityIRR,
+      targetEquityIRR: targetIRR,
+      eligibleCost,
       phaseInfo: phaseRes,
       minSrDSCR, minTotalDSCR, minTifiaEffDSCR,
       testBalAtPoint, testPassed,
@@ -2187,6 +2228,8 @@ function OptimizerTab({model, setModel, results}){
         tifiaEligibleCapexIds: c.tifiaEligibleCapexIds || [],
         pabInstrumentId: c.pabInstrumentId,
         plugInstrumentId: c.plugInstrumentId,
+        equityInstrumentId: c.equityInstrumentId,
+        targetEquityIRR: c.targetEquityIRR,
         deferYears: ap.deferYears,
         ioYears: ap.ioYears,
         testYearsBeforeMaturity: ap.testYearsBeforeMaturity,
@@ -2272,16 +2315,21 @@ function OptimizerTab({model, setModel, results}){
       </div>
     </Section>
 
-    <Section title="Step 3 · Constraint Floors"
-      subtitle="TIFIA is binary-searched between min and max % to find the largest size that satisfies ALL three DSCR floors AND the 50% test.">
+    <Section title="Step 3 · Constraint Floors + Equity Target"
+      subtitle="TIFIA binary-searched for max % that satisfies ALL three DSCR floors AND the 50% test. Equity sized to target IRR. Plug fills residual.">
       <div className="grid grid-cols-2 gap-3 mb-3">
         <Field label="Min TIFIA % (search floor)"><NumInput value={ap.minTifiaPct} onChange={v=>setAuto({minTifiaPct:v})} step={0.01} suffix="%"/></Field>
         <Field label="Max TIFIA % (statute cap)" hint="49% is the federal statutory cap"><NumInput value={ap.maxTifiaPct} onChange={v=>setAuto({maxTifiaPct:v})} step={0.01} suffix="%"/></Field>
       </div>
-      <div className="grid grid-cols-3 gap-3">
+      <div className="grid grid-cols-3 gap-3 mb-3">
         <Field label="Min Total DSCR (Sr + TIFIA)" hint="Primary TIFIA-sizing constraint"><NumInput value={ap.minTotalDSCR} onChange={v=>setAuto({minTotalDSCR:v})} step={0.05}/></Field>
         <Field label="Min Senior DSCR" hint="Binds PAB sizing when TIFIA at 49%"><NumInput value={ap.minSrDSCR} onChange={v=>setAuto({minSrDSCR:v})} step={0.05}/></Field>
         <Field label="Min TIFIA Eff DSCR" hint="(CFADS − Sr DS) / TIFIA DS"><NumInput value={ap.minTifiaDSCR} onChange={v=>setAuto({minTifiaDSCR:v})} step={0.05}/></Field>
+      </div>
+      <div className="grid grid-cols-3 gap-3">
+        <Field label="Target Equity IRR" hint="Equity sized to NPV(distributable CF) @ this rate"><NumInput value={c.targetEquityIRR} onChange={v=>setCascade({targetEquityIRR:v})} step={0.005} suffix="%"/></Field>
+        <Field label="Equity Instrument"><Select value={c.equityInstrumentId} onChange={v=>setCascade({equityInstrumentId:v})} options={model.financing.instruments.filter(i=>i.seniority==='Equity').map(i=>i.id)}/></Field>
+        <Field label="Plug Instrument" hint="Absorbs any residual funding gap after debt + equity"><Select value={c.plugInstrumentId} onChange={v=>setCascade({plugInstrumentId:v})} options={model.financing.instruments.map(i=>i.id)}/></Field>
       </div>
     </Section>
 
@@ -2309,7 +2357,13 @@ function OptimizerTab({model, setModel, results}){
               <Metric label="TIFIA %" value={fmtPct(b.pct, 2)} accent="amber" sub={atCeiling ? '49% statutory ceiling' : 'Constraint-bound below 49%'}/>
               <Metric label="TIFIA Principal" value={fmt$(b.tifiaAmount)} accent="amber" sub={`of ${fmt$(b.eligibleCost)} eligible`}/>
               <Metric label="PAB Sized to" value={fmt$(b.pabAmount)} accent={b.pabAmount > 0 ? 'amber' : 'stone'} sub={b.pabAmount > 0 ? 'fills funding gap' : 'no PAB needed'}/>
-              <Metric label="Funding Gap" value={fmt$(b.finalGap)} accent={Math.abs(b.finalGap) < 1e6 ? 'green' : 'amber'} sub="post plug-equity"/>
+              <Metric label="Funding Gap" value={fmt$(b.finalGap)} accent={Math.abs(b.finalGap) < 1e6 ? 'green' : 'amber'} sub="post plug-grant"/>
+            </div>
+            <div className="grid grid-cols-4 gap-3 mb-4">
+              <Metric label="Equity Sized to" value={fmt$(b.equityAmount)} accent="amber" sub={`@ target IRR ${fmtPct(b.targetEquityIRR||0,1)}`}/>
+              <Metric label="Equity@IRR NPV" value={fmt$(b.equityForIRRCalc)} sub={b.equityAmount < b.equityForIRRCalc ? 'capped by gap' : 'binds IRR'}/>
+              <Metric label="Actual Equity IRR" value={fmtPct(b.actualEquityIRR||0,2)} accent={(b.actualEquityIRR||0) >= (b.targetEquityIRR||0)-0.005 ? 'green' : 'amber'} sub={`vs target ${fmtPct(b.targetEquityIRR||0,1)}`}/>
+              <Metric label="Plug-Grant Absorbed" value={fmt$(b.plugApplied||0)} sub="excess gap → grant"/>
             </div>
             <div className="grid grid-cols-4 gap-3 mb-4">
               <Metric label="Min Total DSCR" value={fmtRatio(b.minTotalDSCR)} accent={!b.minTotalDSCR || b.minTotalDSCR >= (ap.minTotalDSCR||1.10) ? 'green' : 'red'} sub={`floor ${(ap.minTotalDSCR||1.10).toFixed(2)}x`}/>
@@ -2430,6 +2484,38 @@ function DashboardTab({model, results}){
           <Line type="monotone" dataKey="Revenue" stroke="#10b981" strokeWidth={2} dot={false}/>
         </ComposedChart>
       </ResponsiveContainer>
+    </Section>
+
+    <Section title="Cash Inflow vs Outflow (Operating Period)"
+      subtitle="Inflow = toll revenue (line). Outflow = opex + debt service + TIFIA fees (stacked, all positive).">
+      <ResponsiveContainer width="100%" height={360}>
+        <ComposedChart data={(r.periods||[]).map((p,i)=>({
+          period: p.label,
+          Opex: r.opexSched.byPeriod[i],
+          'TIFIA Fees': (r.tifiaFeesPerPeriod||[])[i] || 0,
+          'Sr Int': r.seniorInt[i],
+          'Sr Pri': r.seniorPri[i],
+          'Sub Int': r.subInt[i],
+          'Sub Pri': r.subPri[i],
+          'ST DS': r.shortDS[i],
+          Revenue: r.revSched.byPeriod[i],
+        }))}>
+          <CartesianGrid strokeDasharray="3 3" stroke="#44403c"/>
+          <XAxis dataKey="period" tick={{fontSize:10, fill:'#a8a29e'}}/>
+          <YAxis tick={{fontSize:10, fill:'#a8a29e'}} tickFormatter={v=>`$${(v/1e6).toFixed(0)}M`}/>
+          <Tooltip contentStyle={{background:'#1c1917',border:'1px solid #44403c'}} formatter={(v)=>`$${(v/1e6).toFixed(2)}M`}/>
+          <Legend wrapperStyle={{fontSize:11}}/>
+          <Bar dataKey="Opex" stackId="out" fill="#64748b"/>
+          <Bar dataKey="TIFIA Fees" stackId="out" fill="#84cc16"/>
+          <Bar dataKey="Sr Int" stackId="out" fill="#f59e0b"/>
+          <Bar dataKey="Sr Pri" stackId="out" fill="#fbbf24"/>
+          <Bar dataKey="Sub Int" stackId="out" fill="#a78bfa"/>
+          <Bar dataKey="Sub Pri" stackId="out" fill="#c4b5fd"/>
+          <Bar dataKey="ST DS" stackId="out" fill="#fb7185"/>
+          <Line type="monotone" dataKey="Revenue" stroke="#10b981" strokeWidth={3} dot={false} name="Revenue (Inflow)"/>
+        </ComposedChart>
+      </ResponsiveContainer>
+      <div className="text-[10px] text-stone-500 mt-2">Where the green Revenue line sits ABOVE the stacked bars = positive equity cashflow (distributable). Where it sits below = lockup or DSRA draw.</div>
     </Section>
   </div>;
 }
