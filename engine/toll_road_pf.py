@@ -191,15 +191,15 @@ def default_model() -> Dict[str, Any]:
                  'dayCount': '30/360', 'covenants': 'Senior DSCR \u22651.20x',
                  'issuanceCost': 4_500_000, 'issuanceCostEscalation': 0.03},
                 {'id': 'tifia1', 'type': 'TIFIA Loan',         'amount': 200_000_000, 'rate': 0.0410, 'tenorYears': 35,
-                 'closeDate': '2026-07-01', 'seniority': 'Subordinate', 'repaymentStyle': 'Deferred P&I then sculpted',
+                 'closeDate': '2026-07-01', 'seniority': 'Subordinate', 'repaymentStyle': 'Phased (multi-regime)',
                  'drawdownPriority': 4, 'targetDSCR': 1.10, 'ioYears': 0, 'deferralYears': 5,
                  'dayCount': 'Actual/Actual', 'covenants': 'TIFIA springing lien',
                  'issuanceCost': 1_750_000, 'issuanceCostEscalation': 0.03,
                  'phases': [
-                     {'regime': 'defer',  'endPeriod': 10, 'targetDSCR': None},
-                     {'regime': 'io',     'endPeriod': 20, 'targetDSCR': None},
-                     {'regime': 'sculpt', 'endPeriod': 60, 'targetDSCR': 1.10},
-                     {'regime': 'level',  'endPeriod': 70, 'targetDSCR': None},
+                     {'regime': 'defer', 'endPeriod': 10, 'targetDSCR': None},                                      # CapI 5y
+                     {'regime': 'io',    'endPeriod': 20, 'targetDSCR': None},                                      # IO 5y
+                     {'regime': 'level', 'endPeriod': 50, 'targetEndBalance': 100_000_000, 'targetDSCR': None},     # Annuity to 50% @ test point
+                     {'regime': 'level', 'endPeriod': 70, 'targetEndBalance': 0, 'targetDSCR': None},               # Level 10y to maturity
                  ]},
                 {'id': 'ran1',   'type': 'RAN',                'amount':  50_000_000, 'rate': 0.0350, 'tenorYears': 2,
                  'closeDate': '2026-07-01', 'seniority': 'Short-term',  'repaymentStyle': 'Bullet',
@@ -1509,7 +1509,51 @@ def auto_cascade_tifia(model: Dict[str, Any], params: Dict[str, Any]) -> Dict[st
                     pab_amount = min(funding_gap, max_at_floor)
                     pab_inst['amount'] = round(pab_amount)
 
-        # ---- STEP 4: PLUG ----
+        # ---- STEP 3: SIZE EQUITY TO TARGET IRR ----
+        # Binary search equity such that actual equity IRR (from engine) = target.
+        # More equity → lower IRR; less equity → higher IRR.
+        # Find max equity that still achieves IRR ≥ target. Plug-grant fills any residual gap.
+        equity_amount = None
+        equity_for_irr_calc = None
+        target_irr = params.get('targetEquityIRR', 0.12) or 0
+        equity_inst_id = params.get('equityInstrumentId')
+        if equity_inst_id and target_irr > 0:
+            equity_inst = next((i for i in w['financing']['instruments'] if i['id'] == equity_inst_id), None)
+            if equity_inst:
+                try:
+                    eq_pre = build_full_model(w)
+                except Exception:
+                    eq_pre = None
+                if eq_pre is not None:
+                    # Funding gap excluding current equity = upper bound for equity sizing
+                    other_sources = eq_pre['total_sources'] - equity_inst['amount']
+                    gap_no_eq = max(0, eq_pre['total_uses'] - other_sources)
+                    # Binary search: find max equity where IRR ≥ target
+                    lo_eq, hi_eq = 0.0, gap_no_eq * 1.5  # 1.5x just in case target IRR low
+                    equity_amount = 0
+                    for _ in range(30):
+                        mid = (lo_eq + hi_eq) / 2
+                        equity_inst['amount'] = round(mid)
+                        try:
+                            test_r = build_full_model(w)
+                            actual_irr = test_r.get('equity_irr')
+                            if actual_irr is None:
+                                actual_irr = -1
+                        except Exception:
+                            actual_irr = -1
+                        if actual_irr >= target_irr - 0.0001:
+                            equity_amount = mid
+                            lo_eq = mid
+                        else:
+                            hi_eq = mid
+                        if hi_eq - lo_eq < 10_000:
+                            break
+                    # Cap at funding gap (don't over-fund)
+                    equity_amount = min(equity_amount, gap_no_eq)
+                    equity_for_irr_calc = equity_amount
+                    equity_inst['amount'] = round(equity_amount)
+
+        # ---- STEP 4: PLUG (grants fill any remaining gap) ----
         try:
             final_r = build_full_model(w)
         except Exception as e:
@@ -1573,6 +1617,10 @@ def auto_cascade_tifia(model: Dict[str, Any], params: Dict[str, Any]) -> Dict[st
 
         return {
             'pct': pct, 'tifiaAmount': tifia_amount, 'pabAmount': round(pab_amount) if pab_amount else 0,
+            'equityAmount': round(equity_amount) if equity_amount else 0,
+            'equityForIRRCalc': round(equity_for_irr_calc) if equity_for_irr_calc else 0,
+            'actualEquityIRR': final_r.get('equity_irr'),
+            'targetEquityIRR': target_irr,
             'eligibleCost': eligible_cost, 'phaseInfo': phase_res,
             'minSrDSCR': min_sr_dscr, 'minTotalDSCR': min_total_dscr, 'minTifiaEffDSCR': min_tifia_eff,
             'testBalAtPoint': test_bal, 'testPassed': test_passed,
