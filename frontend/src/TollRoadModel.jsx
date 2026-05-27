@@ -2365,7 +2365,220 @@ function OptimizerTab({model, setModel, results}){
   </div>;
 }
 
+// ---------- CFRow helper ----------
+function CFRow({label, data, positive, negative, bold, ratio, raw}){
+  return <tr className={`hover:bg-stone-900/40 ${bold?'bg-stone-900/40':''}`}>
+    <TD mono={false} className={`sticky left-0 bg-stone-950 ${bold?'text-stone-100 font-medium':'text-stone-300'}`}>{label}</TD>
+    {data.map((v,i)=>(
+      <TD key={i} className={`text-right ${positive?'text-emerald-300':''} ${negative?'text-rose-300':''} ${bold?'font-medium':''}`}>
+        {ratio?(v==null||!isFinite(v)?'—':`${v.toFixed(2)}x`):raw?(v!=null?v.toLocaleString():'—'):fmt$(v)}
+      </TD>))}
+  </tr>;
+}
 
+// ---------- DASHBOARD ----------
+function DashboardTab({model, results}){
+  if(!results) return <div className="p-8 text-center text-stone-500">Loading model…</div>;
+  const r = results;
+  const gap = r.totalUses - r.totalSources;
+  const minSr = r.minSeniorDSCR;
+  const minTot = r.totalDSCR ? Math.min(...r.totalDSCR.filter(v=>v!=null && isFinite(v))) : null;
+  // Debt service vs revenue chart data
+  const chartData = (r.periods || []).map((p,i)=>({
+    period: p.label,
+    Revenue: r.revSched.byPeriod[i],
+    'Sr Int': r.seniorInt[i],
+    'Sr Pri': r.seniorPri[i],
+    'Sub Int': r.subInt[i],
+    'Sub Pri': r.subPri[i],
+    'ST DS': r.shortDS[i],
+  }));
+  return <div>
+    <Section title="Key Metrics">
+      <div className="grid grid-cols-4 gap-3 mb-4">
+        <Metric label="Project IRR" value={fmtPct(r.projectIRR,2)} accent="amber"/>
+        <Metric label="Equity IRR" value={fmtPct(r.equityIRR,2)} accent="amber" sub={`vs target ${fmtPct(model.optimizer?.cascade?.targetEquityIRR||0.12,1)}`}/>
+        <Metric label="Min Senior DSCR" value={fmtRatio(minSr)} accent={minSr>=1.30?'green':'red'} sub="floor 1.30x"/>
+        <Metric label="Min Total DSCR" value={fmtRatio(minTot)} accent={minTot && minTot>=1.10?'green':'red'} sub="floor 1.10x"/>
+      </div>
+      <div className="grid grid-cols-4 gap-3 mb-4">
+        <Metric label="Min LLCR" value={fmtRatio(r.minLLCR)} accent="amber"/>
+        <Metric label="TIFIA All-in Rate" value={fmtPct(r.tifiaAllInRate||0,3)} accent="amber"/>
+        <Metric label="Total Uses" value={fmt$(r.totalUses)}/>
+        <Metric label="Funding Gap" value={fmt$(gap)} accent={Math.abs(gap)<1e6?'green':'red'}/>
+      </div>
+      <div className="grid grid-cols-4 gap-3">
+        <Metric label="Issuance Costs" value={fmt$(r.totalIssuanceCost)} sub="At FC"/>
+        <Metric label="TIFIA Admin+Mon" value={fmt$(r.totalTifiaFees)} sub="Life of loan"/>
+        <Metric label="Total Equity Sized" value={fmt$(r.equityTotal)}/>
+        <Metric label="Total Debt Sized" value={fmt$(r.debtTotal)}/>
+      </div>
+    </Section>
+    <Section title="Debt Service vs Revenue (Operating Period)">
+      <ResponsiveContainer width="100%" height={320}>
+        <ComposedChart data={chartData}>
+          <CartesianGrid strokeDasharray="3 3" stroke="#44403c"/>
+          <XAxis dataKey="period" tick={{fontSize:10, fill:'#a8a29e'}}/>
+          <YAxis tick={{fontSize:10, fill:'#a8a29e'}} tickFormatter={v=>`$${(v/1e6).toFixed(0)}M`}/>
+          <Tooltip contentStyle={{background:'#1c1917',border:'1px solid #44403c'}}/>
+          <Legend wrapperStyle={{fontSize:11}}/>
+          <Bar dataKey="Sr Int" stackId="ds" fill="#f59e0b"/>
+          <Bar dataKey="Sr Pri" stackId="ds" fill="#fbbf24"/>
+          <Bar dataKey="Sub Int" stackId="ds" fill="#a78bfa"/>
+          <Bar dataKey="Sub Pri" stackId="ds" fill="#c4b5fd"/>
+          <Bar dataKey="ST DS" stackId="ds" fill="#fb7185"/>
+          <Line type="monotone" dataKey="Revenue" stroke="#10b981" strokeWidth={2} dot={false}/>
+        </ComposedChart>
+      </ResponsiveContainer>
+    </Section>
+  </div>;
+}
+
+// ---------- CASHFLOW ----------
+function CashflowTab({model, results}){
+  if(!results) return <div className="p-8 text-center text-stone-500">Loading…</div>;
+  const periods = results.periods;
+  return <div>
+    <Section title={`Operating Cashflow — ${model.general.periodsPerYear===2?'Semi-Annual':'Annual'}`} subtitle={`${periods.length} periods · partial: ${periods.filter(p=>p.isPartial).length}`}>
+      <div className="overflow-x-auto border border-stone-700/60 rounded">
+        <table className="w-full text-xs">
+          <thead className="bg-stone-900/80 sticky top-0"><tr>
+            <TH className="sticky left-0 bg-stone-900 z-10 min-w-[240px]">Line Item ($ nominal)</TH>
+            {periods.map((p,i)=><TH key={i} className="text-right">{p.label}{p.isPartial?'*':''}</TH>)}
+          </tr></thead>
+          <tbody>
+            <CFRow label="Toll Revenue" data={results.revSched.byPeriod} positive/>
+            <CFRow label="Operating Expense" data={results.opexSched.byPeriod.map(v=>-v)} negative/>
+            <CFRow label="CFADS (gross)" data={results.cfadsByPeriod} bold/>
+            <CFRow label="TIFIA Admin+Monitoring" data={(results.tifiaFeesPerPeriod||[]).map(v=>-v)} negative/>
+            <CFRow label="CFADS for DSCR" data={results.cfadsForDscr||results.cfadsByPeriod} bold/>
+            <CFRow label="Senior Interest" data={results.seniorInt.map(v=>-v)} negative/>
+            <CFRow label="Senior Principal" data={results.seniorPri.map(v=>-v)} negative/>
+            <CFRow label="Sub Interest" data={results.subInt.map(v=>-v)} negative/>
+            <CFRow label="Sub Principal" data={results.subPri.map(v=>-v)} negative/>
+            <CFRow label="Short-term DS" data={results.shortDS.map(v=>-v)} negative/>
+            <CFRow label="Equity Cashflow" data={results.equityCF||[]} positive bold/>
+            <CFRow label="Senior DSCR" data={results.seniorDSCR} ratio/>
+            <CFRow label="Total DSCR" data={results.totalDSCR} ratio/>
+          </tbody>
+        </table>
+      </div>
+      <div className="text-[10px] text-stone-500 mt-2">* = partial period (less than full days). Senior DSCR = CFADS_for_DSCR / Sr DS. Total DSCR = CFADS_for_DSCR / (Sr+Sub) DS.</div>
+    </Section>
+  </div>;
+}
+
+// ---------- SOURCES & USES ----------
+function SourcesUsesTab({model, results}){
+  if(!results) return <div className="p-8 text-center text-stone-500">Loading…</div>;
+  const r = results;
+  const issuance = r.issuanceCostsByID || {};
+  return <div>
+    <Section title="Sources of Funds">
+      <table className="w-full text-sm">
+        <thead><tr><TH>Instrument</TH><TH>Type</TH><TH>Seniority</TH><TH className="text-right">Amount</TH><TH className="text-right">% of Sources</TH></tr></thead>
+        <tbody>
+          {model.financing.instruments.map(i=>(
+            <tr key={i.id} className="hover:bg-stone-900/40">
+              <TD className="text-stone-300">{i.id}</TD>
+              <TD className="text-stone-400">{i.type}</TD>
+              <TD className="text-stone-400">{i.seniority}</TD>
+              <TD className="text-right text-amber-300">{fmt$(i.amount)}</TD>
+              <TD className="text-right text-stone-400">{fmtPct(i.amount/Math.max(1,r.totalSources),1)}</TD>
+            </tr>
+          ))}
+          <tr className="bg-stone-900/60 font-medium">
+            <TD className="text-stone-100" colSpan={3}>Total Sources</TD>
+            <TD className="text-right text-emerald-300">{fmt$(r.totalSources)}</TD>
+            <TD></TD>
+          </tr>
+        </tbody>
+      </table>
+    </Section>
+    <Section title="Uses of Funds">
+      <table className="w-full text-sm">
+        <thead><tr><TH>Category</TH><TH className="text-right">Amount</TH><TH className="text-right">% of Uses</TH></tr></thead>
+        <tbody>
+          <tr><TD>Nominal Capex (total construction cost incl. inflation)</TD><TD className="text-right text-stone-300">{fmt$(r.capexSched.totalNominal)}</TD><TD className="text-right text-stone-400">{fmtPct(r.capexSched.totalNominal/Math.max(1,r.totalUses),1)}</TD></tr>
+          <tr><TD>Non-TIFIA IDC</TD><TD className="text-right text-stone-300">{fmt$(r.nonTIFIAIDC)}</TD><TD className="text-right text-stone-400">{fmtPct(r.nonTIFIAIDC/Math.max(1,r.totalUses),1)}</TD></tr>
+          <tr><TD>TIFIA Capitalized Interest</TD><TD className="text-right text-stone-300">{fmt$(r.tifiaConstr?.capitalizedInterestTotal||0)}</TD><TD className="text-right text-stone-400">{fmtPct((r.tifiaConstr?.capitalizedInterestTotal||0)/Math.max(1,r.totalUses),1)}</TD></tr>
+          <tr><TD>Financing Fees (% of debt)</TD><TD className="text-right text-stone-300">{fmt$(r.financingFees)}</TD><TD className="text-right text-stone-400">{fmtPct(r.financingFees/Math.max(1,r.totalUses),1)}</TD></tr>
+          <tr><TD>Issuance Costs (escalated)</TD><TD className="text-right text-stone-300">{fmt$(r.totalIssuanceCost)}</TD><TD className="text-right text-stone-400">{fmtPct(r.totalIssuanceCost/Math.max(1,r.totalUses),1)}</TD></tr>
+          <tr className="bg-stone-900/60 font-medium"><TD className="text-stone-100">Total Uses</TD><TD className="text-right text-amber-300">{fmt$(r.totalUses)}</TD><TD></TD></tr>
+          <tr className="bg-stone-900/40"><TD className="text-stone-300">Funding Gap (Uses − Sources)</TD><TD className={`text-right ${Math.abs(r.totalUses - r.totalSources) < 1e6 ? 'text-emerald-300' : 'text-rose-300'}`}>{fmt$(r.totalUses - r.totalSources)}</TD><TD></TD></tr>
+        </tbody>
+      </table>
+    </Section>
+    <Section title="Issuance Costs Detail">
+      <table className="w-full text-sm">
+        <thead><tr><TH>Instrument</TH><TH className="text-right">Base $</TH><TH className="text-right">Escalation %/yr</TH><TH className="text-right">Escalated to FC</TH></tr></thead>
+        <tbody>
+          {model.financing.instruments.map(i => i.issuanceCost > 0 && (
+            <tr key={i.id}>
+              <TD className="text-stone-300">{i.id} — {i.type}</TD>
+              <TD className="text-right text-stone-400">{fmt$(i.issuanceCost)}</TD>
+              <TD className="text-right text-stone-400">{fmtPct(i.issuanceCostEscalation||0,2)}</TD>
+              <TD className="text-right text-amber-300">{fmt$(issuance[i.id]||0)}</TD>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </Section>
+  </div>;
+}
+
+// ---------- CHAT ----------
+function ChatTab({model, setModel, results}){
+  const [messages, setMessages] = useState([]);
+  const [input, setInput] = useState('');
+  const [loading, setLoading] = useState(false);
+  const send = async () => {
+    if(!input.trim() || loading) return;
+    const userMsg = {role:'user', content: input};
+    const newMessages = [...messages, userMsg];
+    setMessages(newMessages);
+    setInput('');
+    setLoading(true);
+    try {
+      const resp = await fetch('https://api.anthropic.com/v1/messages', {
+        method:'POST',
+        headers:{'Content-Type':'application/json', 'anthropic-version':'2023-06-01', 'anthropic-dangerous-direct-browser-access':'true'},
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-20250514',
+          max_tokens: 2000,
+          system: `You are a project finance assistant for a US toll road model. Current state: TIFIA = $${(model.financing.instruments.find(i=>i.type==='TIFIA Loan')?.amount/1e6).toFixed(1)}M, Min Sr DSCR = ${results?.minSeniorDSCR?.toFixed(2)}x.`,
+          messages: newMessages,
+        })
+      });
+      const data = await resp.json();
+      const text = data.content?.[0]?.text || data.error?.message || 'No response';
+      setMessages([...newMessages, {role:'assistant', content: text}]);
+    } catch(e) {
+      setMessages([...newMessages, {role:'assistant', content: 'Error: ' + e.message + ' (requires API proxy backend — does not work from static GitHub Pages)'}]);
+    }
+    setLoading(false);
+  };
+  return <div>
+    <Section title="AI Assistant" subtitle="Ask questions about the model. Requires Anthropic API backend.">
+      <div className="bg-stone-900/40 border border-stone-700/60 rounded p-3 mb-3 h-96 overflow-y-auto">
+        {messages.length === 0 && <div className="text-stone-500 text-sm">No messages yet. Ask anything about the model.</div>}
+        {messages.map((m,i)=>(
+          <div key={i} className={`mb-3 ${m.role==='user'?'text-amber-200':'text-stone-300'}`}>
+            <div className="text-[10px] uppercase tracking-wider text-stone-500 mb-1">{m.role}</div>
+            <div className="text-sm whitespace-pre-wrap">{m.content}</div>
+          </div>
+        ))}
+        {loading && <div className="text-stone-500 text-sm italic">Thinking…</div>}
+      </div>
+      <div className="flex gap-2">
+        <input value={input} onChange={e=>setInput(e.target.value)} onKeyDown={e=>e.key==='Enter'&&send()}
+          placeholder="Ask about the model…"
+          className="flex-1 bg-stone-900 border border-stone-700 rounded px-3 py-2 text-sm text-stone-100"/>
+        <button onClick={send} disabled={loading} className="px-4 py-2 bg-amber-500 text-stone-900 rounded text-sm font-medium hover:bg-amber-400 disabled:opacity-50">Send</button>
+      </div>
+    </Section>
+  </div>;
+}
 
 function SensitivityTab({model, results}){
   const [xVar, setXVar] = useState('aadt');
