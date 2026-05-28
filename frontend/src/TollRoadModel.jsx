@@ -1982,9 +1982,13 @@ function FinancingTab({model, setModel}){
             <Field label="Repayment Style"><Select value={inst.repaymentStyle} onChange={v=>updateInst(inst.id,{repaymentStyle:v})} options={REPAYMENT_STYLES}/></Field>
             <Field label="Day Count"><Select value={inst.dayCount} onChange={v=>updateInst(inst.id,{dayCount:v})} options={DAY_COUNT}/></Field>
             <Field label="Draw Priority"><NumInput value={inst.drawdownPriority} onChange={v=>updateInst(inst.id,{drawdownPriority:v})}/></Field>
-            <Field label="Target DSCR"><NumInput value={inst.targetDSCR} onChange={v=>updateInst(inst.id,{targetDSCR:v})} step={0.05}/></Field>
-            <Field label="IO Years"><NumInput value={inst.ioYears} onChange={v=>updateInst(inst.id,{ioYears:v})}/></Field>
-            <Field label="Deferral Years"><NumInput value={inst.deferralYears} onChange={v=>updateInst(inst.id,{deferralYears:v})}/></Field>
+            {/* Style-dependent fields */}
+            {(inst.repaymentStyle === 'Sculpted (target DSCR)' || inst.repaymentStyle === 'Deferred P&I then sculpted') &&
+              <Field label="Target DSCR" hint="Sculpting target"><NumInput value={inst.targetDSCR} onChange={v=>updateInst(inst.id,{targetDSCR:v})} step={0.05}/></Field>}
+            {(inst.repaymentStyle === 'IO then amortize' || inst.repaymentStyle === 'Level debt service' || inst.repaymentStyle === 'Equal principal') &&
+              <Field label="IO Years" hint="Pay interest only for this many years before amortization starts"><NumInput value={inst.ioYears} onChange={v=>updateInst(inst.id,{ioYears:v})}/></Field>}
+            {inst.repaymentStyle !== 'Phased (multi-regime)' && inst.repaymentStyle !== 'Bullet' && inst.repaymentStyle !== 'Custom schedule' &&
+              <Field label="Deferral Years" hint="Defer all payments (P&I) for this many years"><NumInput value={inst.deferralYears} onChange={v=>updateInst(inst.id,{deferralYears:v})}/></Field>}
           </div>
           <div className="grid grid-cols-2 gap-4 mt-3">
             <Field label="Issuance Cost ($, base year)" hint={`Base yr: ${f.issuanceCostBaseYear||2024}. Escalated to FC.`}><NumInput value={inst.issuanceCost} onChange={v=>updateInst(inst.id,{issuanceCost:v})} prefix="$"/></Field>
@@ -2138,15 +2142,8 @@ function TIFIATab({model, setModel, results}){
         </div>
       )}
     </Section>
-    <Section title="Coverage & Sizing Constraints" subtitle="DSCR/LLCR/PLCR/WAL limits used by the optimizer.">
-      <div className="grid grid-cols-4 gap-3">
-        <Field label="Min DSCR"><NumInput value={t.minDSCR} onChange={v=>setT({minDSCR:v})} step={0.05}/></Field>
-        <Field label="Min LLCR"><NumInput value={t.minLLCR} onChange={v=>setT({minLLCR:v})} step={0.05}/></Field>
-        <Field label="Min PLCR"><NumInput value={t.minPLCR} onChange={v=>setT({minPLCR:v})} step={0.05}/></Field>
-        <Field label="Max WAL (yrs)"><NumInput value={t.maxWAL} onChange={v=>setT({maxWAL:v})}/></Field>
-      </div>
-    </Section>
-    <Section title="Equity Distribution Lockup Conditions">
+    <Section title="Equity Distribution Lockup Conditions"
+      subtitle="Lockup is triggered when Senior DSCR or LLCR fall below these levels. Lockup excess equity CF gets escrowed in a separate account.">
       <div className="grid grid-cols-2 gap-3">
         <Field label="Lockup if Senior DSCR <"><NumInput value={t.lockupDSCR} onChange={v=>setT({lockupDSCR:v})} step={0.05}/></Field>
         <Field label="Lockup if LLCR <"><NumInput value={t.lockupLLCR} onChange={v=>setT({lockupLLCR:v})} step={0.05}/></Field>
@@ -2308,7 +2305,7 @@ function OptimizerTab({model, setModel, results}){
           const itemTotal = results && results.capexSched ? sum(results.capexSched.byItem[it.id] || []) : 0;
           return <label key={it.id} className="flex items-center gap-2 px-2 py-1 hover:bg-stone-800/60 rounded cursor-pointer">
             <input type="checkbox" checked={eligibleIds.includes(it.id)} onChange={()=>toggleEligible(it.id)} className="accent-amber-500"/>
-            <span className="text-xs text-stone-300 flex-1 truncate">{it.name}</span>
+            <span className="text-xs text-stone-300 flex-1 truncate">{it.label}</span>
             <span className="text-[10px] text-stone-500 font-mono">{fmt$(itemTotal)}</span>
           </label>;
         })}
