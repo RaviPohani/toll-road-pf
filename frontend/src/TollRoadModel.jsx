@@ -820,19 +820,28 @@ function buildFullModel(model){
 
   const debtMonthlyDraws = zeros(cm);
   const tifiaMonthlyDraws = zeros(cm);
+  const drawsByInst = {};
+  instruments.forEach(i => { drawsByInst[i.id] = zeros(cm); });
   for(let m=0;m<cm;m++){
     const cM = capexSched.monthly[m];
     const equityShare = sourcesTotal>0 ? equityTotal/sourcesTotal : 0;
-    const grantShare = sourcesTotal>0 ? grantTotal/sourcesTotal : 0;
-    const paygoShare = sourcesTotal>0 ? paygoTotal/sourcesTotal : 0;
+    const grantShare  = sourcesTotal>0 ? grantTotal/sourcesTotal : 0;
+    const paygoShare  = sourcesTotal>0 ? paygoTotal/sourcesTotal : 0;
     const debtShare = 1 - equityShare - grantShare - paygoShare;
     const debtDraw = cM * debtShare;
     debtMonthlyDraws[m] = debtDraw;
     if(tifiaInst && debtTotal>0) tifiaMonthlyDraws[m] = debtDraw * (tifiaInst.amount/debtTotal);
+    // per-instrument splits
+    instruments.forEach(inst => {
+      if(inst.seniority==='Grant')        drawsByInst[inst.id][m] = sourcesTotal>0 ? cM*(inst.amount/sourcesTotal) : 0;
+      else if(inst.seniority==='Equity')  drawsByInst[inst.id][m] = sourcesTotal>0 ? cM*(inst.amount/sourcesTotal) : 0;
+      else if(inst.seniority==='Paygo')   drawsByInst[inst.id][m] = (paygoSched.monthly||zeros(cm))[m];
+      else if(debtTotal>0)                drawsByInst[inst.id][m] = debtDraw * (inst.amount/debtTotal);
+    });
   }
   const tifiaConstr = tifiaInst
-    ? buildTIFIAConstructionInterest(tifiaInst, tifiaMonthlyDraws, model.tifia, model)
-    : { monthlyInterest: zeros(cm), monthlyBalance: zeros(cm), capitalizations: [], capitalizedInterestTotal: 0, finalBalance: 0 };
+    ? {...buildTIFIAConstructionInterest(tifiaInst, tifiaMonthlyDraws, model.tifia, model), monthlyDraws: tifiaMonthlyDraws}
+    : { monthlyInterest: zeros(cm), monthlyBalance: zeros(cm), monthlyDraws: zeros(cm), capitalizations: [], capitalizedInterestTotal: 0, finalBalance: 0 };
   const nonTIFIADebt = debtTotal - (tifiaInst ? tifiaInst.amount : 0);
   const nonTIFIARate = model.financing.blendedIDCRateForNonTIFIA;
   let ntBal = 0, ntIDC = 0;
@@ -946,7 +955,7 @@ function buildFullModel(model){
   const finiteD = seniorDSCR.filter(v=>v!=null && isFinite(v));
   const finiteL = llcrSenior.filter(v=>v!=null && isFinite(v));
   return {
-    periods, capexSched, paygoSched, tifiaConstr,
+    periods, capexSched, paygoSched, tifiaConstr, drawsByInst,
     nonTIFIAIDC: ntIDC, nonTIFIAIDCMonthly: ntIDCMonthly, financingFees,
     capitalizedTIFIAInterest: tifiaConstr.capitalizedInterestTotal,
     totalUses, totalSources: sourcesTotal, grantTotal, equityTotal, paygoTotal, debtTotal,
@@ -2772,12 +2781,37 @@ function SourcesUsesTab({model, results}){
   if(!results) return <div className="p-8 text-center text-stone-500">Loading…</div>;
   const r = results;
   const issuance = r.issuanceCostsByID || {};
+  const cm = model.general.constructionMonths;
+  const drawsByInst = r.drawsByInst || {};
+  const capexMonthly = r.capexSched?.monthly || [];
+  const instruments = model.financing.instruments;
+
+  // Build monthly draw chart data — aggregate into semi-annual buckets for readability
+  const ppy = model.general.periodsPerYear;
+  const monthsPerPeriod = 12 / ppy;
+  const numConstrPeriods = Math.ceil(cm / monthsPerPeriod);
+  const constrChartData = Array.from({length: numConstrPeriods}, (_, pi) => {
+    const mStart = Math.round(pi * monthsPerPeriod);
+    const mEnd = Math.min(cm, Math.round((pi + 1) * monthsPerPeriod));
+    const row = {period: `M${mStart+1}–${mEnd}`, capex: 0};
+    for(let m = mStart; m < mEnd; m++) row.capex += capexMonthly[m] || 0;
+    instruments.forEach(inst => {
+      const draws = drawsByInst[inst.id] || [];
+      let d = 0; for(let m = mStart; m < mEnd; m++) d += draws[m] || 0;
+      if(d > 0) row[inst.id] = d;
+    });
+    return row;
+  });
+
+  const instColors = {'fg1':'#10b981','sg1':'#34d399','eq1':'#f59e0b','ran1':'#fb7185','pab1':'#60a5fa','tifia1':'#a78bfa'};
+  const activeInsts = instruments.filter(inst => constrChartData.some(d => d[inst.id] > 0));
+
   return <div>
     <Section title="Sources of Funds">
       <table className="w-full text-sm">
         <thead><tr><TH>Instrument</TH><TH>Type</TH><TH>Seniority</TH><TH className="text-right">Amount</TH><TH className="text-right">% of Sources</TH></tr></thead>
         <tbody>
-          {model.financing.instruments.map(i=>(
+          {instruments.map(i=>(
             <tr key={i.id} className="hover:bg-stone-900/40">
               <TD className="text-stone-300">{i.id}</TD>
               <TD className="text-stone-400">{i.type}</TD>
@@ -2794,6 +2828,48 @@ function SourcesUsesTab({model, results}){
         </tbody>
       </table>
     </Section>
+
+    <Section title="Construction Period — Periodic Draws vs Capex Uses"
+      subtitle={`${cm}-month construction, shown in ${monthsPerPeriod.toFixed(0)}-month buckets. Stacked bars = instrument draws (sources). Line = capex spend (uses).`}>
+      <ResponsiveContainer width="100%" height={320}>
+        <ComposedChart data={constrChartData}>
+          <CartesianGrid strokeDasharray="3 3" stroke="#44403c"/>
+          <XAxis dataKey="period" tick={{fontSize:10, fill:'#a8a29e'}}/>
+          <YAxis tick={{fontSize:10, fill:'#a8a29e'}} tickFormatter={v=>`$${(v/1e6).toFixed(0)}M`}/>
+          <Tooltip contentStyle={{background:'#1c1917',border:'1px solid #44403c'}} formatter={v=>`$${(v/1e6).toFixed(2)}M`}/>
+          <Legend wrapperStyle={{fontSize:11}}/>
+          {activeInsts.map(inst => (
+            <Bar key={inst.id} dataKey={inst.id} name={inst.type} stackId="draws"
+              fill={instColors[inst.id]||'#78716c'}/>
+          ))}
+          <Line type="monotone" dataKey="capex" name="Capex Uses" stroke="#f97316" strokeWidth={2} dot={false}/>
+        </ComposedChart>
+      </ResponsiveContainer>
+      <div className="overflow-x-auto mt-4 border border-stone-700/60 rounded">
+        <table className="w-full text-xs">
+          <thead className="bg-stone-900/80"><tr>
+            <TH className="sticky left-0 bg-stone-900 min-w-[160px]">Instrument</TH>
+            {constrChartData.map((d,i)=><TH key={i} className="text-right">{d.period}</TH>)}
+            <TH className="text-right">Total</TH>
+          </tr></thead>
+          <tbody>
+            {activeInsts.map(inst=>(
+              <tr key={inst.id} className="hover:bg-stone-900/40">
+                <TD className="sticky left-0 bg-stone-950 text-stone-300">{inst.type}</TD>
+                {constrChartData.map((d,i)=><TD key={i} className="text-right text-stone-400">{d[inst.id]?fmt$(d[inst.id]):'—'}</TD>)}
+                <TD className="text-right text-amber-300">{fmt$(inst.amount)}</TD>
+              </tr>
+            ))}
+            <tr className="bg-stone-900/40 font-medium">
+              <TD className="sticky left-0 bg-stone-900 text-stone-200">Capex Uses</TD>
+              {constrChartData.map((d,i)=><TD key={i} className="text-right text-orange-300">{fmt$(d.capex)}</TD>)}
+              <TD className="text-right text-orange-300">{fmt$(r.capexSched.totalNominal)}</TD>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </Section>
+
     <Section title="Uses of Funds">
       <table className="w-full text-sm">
         <thead><tr><TH>Category</TH><TH className="text-right">Amount</TH><TH className="text-right">% of Uses</TH></tr></thead>
@@ -2808,11 +2884,12 @@ function SourcesUsesTab({model, results}){
         </tbody>
       </table>
     </Section>
+
     <Section title="Issuance Costs Detail">
       <table className="w-full text-sm">
-        <thead><tr><TH>Instrument</TH><TH className="text-right">Base $</TH><TH className="text-right">Escalation %/yr</TH><TH className="text-right">Escalated to FC</TH></tr></thead>
+        <thead><tr><TH>Instrument</TH><TH className="text-right">Base $</TH><TH className="text-right">Esc %/yr</TH><TH className="text-right">Escalated to FC</TH></tr></thead>
         <tbody>
-          {model.financing.instruments.map(i => i.issuanceCost > 0 && (
+          {instruments.map(i => i.issuanceCost > 0 && (
             <tr key={i.id}>
               <TD className="text-stone-300">{i.id} — {i.type}</TD>
               <TD className="text-right text-stone-400">{fmt$(i.issuanceCost)}</TD>
@@ -2822,6 +2899,133 @@ function SourcesUsesTab({model, results}){
           ))}
         </tbody>
       </table>
+    </Section>
+  </div>;
+}
+
+// ---------- TIFIA SCHEDULE ----------
+function TifiaScheduleTab({model, results}){
+  if(!results) return <div className="p-8 text-center text-stone-500">Loading…</div>;
+  const r = results;
+  const tifiaInstId = model.tifia?.instrumentId || 'tifia1';
+  const tifiaInst = model.financing.instruments.find(i=>i.id===tifiaInstId);
+  if(!tifiaInst) return <div className="p-8 text-center text-stone-500">No TIFIA instrument found.</div>;
+
+  const sched = r.debtSchedules?.[tifiaInstId];
+  const constr = r.tifiaConstr;
+  if(!sched || !constr) return <div className="p-8 text-center text-stone-500">No TIFIA schedule data.</div>;
+
+  const cm = model.general.constructionMonths;
+  const ppy = model.general.periodsPerYear;
+  const monthsPerPeriod = 12 / ppy;
+  const fc = model.general.financialCloseDate || '2026-07-01';
+  const phases = tifiaInst.phases || [];
+
+  // Date helpers
+  const addMonths = (dateStr, n) => {
+    const d = new Date(dateStr);
+    d.setMonth(d.getMonth() + Math.round(n));
+    return d.toLocaleDateString('en-US',{month:'short',year:'numeric'});
+  };
+
+  // Figure out regime for each ops period
+  const getRegime = (periodIdx) => {
+    for(const ph of phases){
+      if(periodIdx < ph.endPeriod) return ph.regime;
+    }
+    return 'level';
+  };
+
+  // Build unified schedule rows
+  const rows = [];
+
+  // CONSTRUCTION PHASE — aggregate monthly into semi-annual periods
+  const numConstrPeriods = Math.ceil(cm / monthsPerPeriod);
+  for(let pi = 0; pi < numConstrPeriods; pi++){
+    const mStart = Math.round(pi * monthsPerPeriod);
+    const mEnd = Math.min(cm, Math.round((pi+1) * monthsPerPeriod));
+    const dateStart = addMonths(fc, mStart);
+    const dateEnd = addMonths(fc, mEnd);
+    const openBal = mStart === 0 ? 0 : (constr.monthlyBalance[mStart-1] || 0);
+    let draws = 0, intDue = 0;
+    for(let m = mStart; m < mEnd; m++){
+      draws += constr.monthlyDraws?.[m] || 0;
+      intDue += constr.monthlyInterest?.[m] || 0;
+    }
+    const closeBal = constr.monthlyBalance[mEnd - 1] || 0;
+    // All construction interest capitalizes
+    rows.push({
+      date: `${dateStart} – ${dateEnd}`, phase: 'Construction',
+      openBal, draws, intDue, capInt: intDue, intPaid: 0, principal: 0, closeBal,
+      isConstr: true,
+    });
+  }
+
+  // OPERATIONS PHASE
+  const scd = model.general.serviceCommencementDate || addMonths(fc, cm);
+  for(let i = 0; i < sched.interest.length; i++){
+    const tStart = addMonths(scd, i * monthsPerPeriod);
+    const tEnd = addMonths(scd, (i+1) * monthsPerPeriod);
+    const regime = getRegime(i);
+    const openBal = i === 0 ? constr.finalBalance : sched.balance[i-1];
+    const intDue = regime === 'defer' ? openBal * tifiaInst.rate / ppy : sched.interest[i];
+    const capInt = regime === 'defer' ? intDue : 0;
+    const intPaid = regime === 'defer' ? 0 : sched.interest[i];
+    const principal = sched.principal[i] || 0;
+    const closeBal = sched.balance[i];
+    rows.push({
+      date: `${tStart} – ${tEnd}`, phase: regime,
+      openBal, draws: 0, intDue, capInt, intPaid, principal, closeBal,
+      isConstr: false,
+    });
+  }
+
+  const phaseColor = {Construction:'text-stone-400', defer:'text-blue-400', io:'text-yellow-400', level:'text-emerald-400', sculpt:'text-purple-400'};
+
+  return <div>
+    <Section title="TIFIA Amortization Schedule"
+      subtitle={`${(tifiaInst.rate*100).toFixed(3)}% p.a. · ${tifiaInst.tenorYears}yr tenor · ${tifiaInst.dayCount} · FC: ${fc}`}>
+      <div className="grid grid-cols-4 gap-3 mb-4">
+        <Metric label="TIFIA Principal" value={fmt$(tifiaInst.amount)} accent="amber"/>
+        <Metric label="Capitalized Interest" value={fmt$(constr.capitalizedInterestTotal)} sub="construction phase"/>
+        <Metric label="Peak Balance" value={fmt$(Math.max(...sched.balance.filter(v=>v!=null)))} sub="at end of CapI/IO"/>
+        <Metric label="Final Balance" value={fmt$(sched.balance[sched.balance.length-1])} accent={sched.balance[sched.balance.length-1]<1e5?'green':'red'}/>
+      </div>
+      <div className="overflow-x-auto border border-stone-700/60 rounded">
+        <table className="w-full text-xs">
+          <thead className="bg-stone-900/80 sticky top-0"><tr>
+            <TH className="sticky left-0 bg-stone-900 min-w-[200px]">Period</TH>
+            <TH className="text-center min-w-[90px]">Phase</TH>
+            <TH className="text-right">Opening Balance</TH>
+            <TH className="text-right">Drawdown</TH>
+            <TH className="text-right">Interest Due</TH>
+            <TH className="text-right">Capitalised Int</TH>
+            <TH className="text-right">Interest Paid</TH>
+            <TH className="text-right">Principal Repaid</TH>
+            <TH className="text-right">Closing Balance</TH>
+          </tr></thead>
+          <tbody>
+            {rows.map((row, i) => (
+              <tr key={i} className={`hover:bg-stone-900/40 ${row.isConstr?'bg-stone-900/20':''}`}>
+                <TD className="sticky left-0 bg-stone-950 text-stone-400 font-mono text-[10px]">{row.date}</TD>
+                <TD className={`text-center font-medium ${phaseColor[row.phase]||'text-stone-400'}`}>{row.phase}</TD>
+                <TD className="text-right text-stone-300">{fmt$(row.openBal)}</TD>
+                <TD className="text-right text-emerald-400">{row.draws > 0 ? fmt$(row.draws) : '—'}</TD>
+                <TD className="text-right text-stone-300">{row.intDue > 0 ? fmt$(row.intDue) : '—'}</TD>
+                <TD className="text-right text-blue-300">{row.capInt > 0 ? fmt$(row.capInt) : '—'}</TD>
+                <TD className="text-right text-amber-300">{row.intPaid > 0 ? fmt$(row.intPaid) : '—'}</TD>
+                <TD className="text-right text-rose-300">{row.principal > 0 ? fmt$(row.principal) : '—'}</TD>
+                <TD className={`text-right font-medium ${row.closeBal > row.openBal ? 'text-blue-300' : row.closeBal < row.openBal ? 'text-emerald-300' : 'text-stone-300'}`}>{fmt$(row.closeBal)}</TD>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div className="text-[10px] text-stone-500 mt-2">
+        Construction: interest accrues monthly, capitalises every 6 months. 
+        Defer: interest capitalises. IO: interest paid, no principal. 
+        Level/Sculpt: interest + principal payments. Blue closing balance = growing, green = amortising.
+      </div>
     </Section>
   </div>;
 }
@@ -3429,7 +3633,8 @@ const TABS = [
   {id:'revenue',label:'Revenue'},{id:'opex',label:'Opex'},{id:'financing',label:'Financing'},
   {id:'tifia',label:'TIFIA'},{id:'controls',label:'Control Accts'},{id:'optimizer',label:'Optimizer'},
   {id:'sensitivity',label:'Sensitivity'},{id:'vfm',label:'VfM'},
-  {id:'cashflow',label:'Cashflow'},{id:'su',label:'S&U'},{id:'dashboard',label:'Dashboard'},{id:'chat',label:'Assistant'},
+  {id:'cashflow',label:'Cashflow'},{id:'su',label:'S&U'},{id:'tifiaSchedule',label:'TIFIA Schedule'},
+  {id:'dashboard',label:'Dashboard'},{id:'chat',label:'Assistant'},
 ];
 
 export default function App(){
@@ -3515,6 +3720,7 @@ export default function App(){
         {tab==='vfm' && <VfMTab model={model} setModel={setModel} results={results}/>}
         {tab==='cashflow' && <CashflowTab model={model} results={results}/>}
         {tab==='su' && <SourcesUsesTab model={model} results={results}/>}
+        {tab==='tifiaSchedule' && <TifiaScheduleTab model={model} results={results}/>}
         {tab==='dashboard' && <DashboardTab model={model} results={results}/>}
         {tab==='chat' && <ChatTab model={model} setModel={setModel} results={results}/>}
       </main>
