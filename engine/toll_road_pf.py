@@ -38,7 +38,7 @@ from calendar import monthrange
 REPAYMENT_STYLES = [
     'Sculpted (target DSCR)', 'Level debt service', 'Equal principal',
     'Bullet', 'IO then amortize', 'Deferred P&I then sculpted',
-    'Phased (multi-regime)', 'Custom schedule',
+    'Phased (multi-regime)', 'Custom schedule', 'Anticipation Note (GAN/BAN)',
 ]
 PHASE_REGIMES = ['defer', 'io', 'sculpt', 'level', 'equal-principal']
 CURVE_TYPES = ['Linear', 'S-curve', 'Front-loaded', 'Back-loaded', 'Custom']
@@ -175,16 +175,21 @@ def default_model() -> Dict[str, Any]:
                  'drawdownPriority': 5, 'targetDSCR': 1.30, 'ioYears': 0, 'deferralYears': 0,
                  'dayCount': '30/360', 'covenants': 'Distribution lockup if TIFIA lockup',
                  'issuanceCost': 0, 'issuanceCostEscalation': 0.0},
+                {'id': 'sub1',   'type': 'Upfront Subsidy',   'amount':  0,           'rate': 0.0,    'tenorYears': 0,
+                 'closeDate': '2026-07-01', 'seniority': 'Grant',       'repaymentStyle': 'Bullet',
+                 'drawdownPriority': 0, 'targetDSCR': 0, 'ioYears': 0, 'deferralYears': 0,
+                 'dayCount': '30/360', 'covenants': 'Government viability gap funding — sized by Optimizer',
+                 'issuanceCost': 0, 'issuanceCostEscalation': 0.0},
                 {'id': 'fg1',    'type': 'Federal Grant',      'amount':  60_000_000, 'rate': 0.0,    'tenorYears': 0,
                  'closeDate': '2026-07-01', 'seniority': 'Grant',       'repaymentStyle': 'Bullet',
                  'drawdownPriority': 1, 'targetDSCR': 0, 'ioYears': 0, 'deferralYears': 0,
-                 'dayCount': '30/360', 'covenants': '',
-                 'issuanceCost': 250_000, 'issuanceCostEscalation': 0.03},
+                 'dayCount': '30/360', 'covenants': 'Federal cost-share requirements',
+                 'issuanceCost': 0, 'issuanceCostEscalation': 0.0},
                 {'id': 'sg1',    'type': 'State Grant',        'amount':  40_000_000, 'rate': 0.0,    'tenorYears': 0,
                  'closeDate': '2026-07-01', 'seniority': 'Grant',       'repaymentStyle': 'Bullet',
                  'drawdownPriority': 1, 'targetDSCR': 0, 'ioYears': 0, 'deferralYears': 0,
-                 'dayCount': '30/360', 'covenants': '',
-                 'issuanceCost': 150_000, 'issuanceCostEscalation': 0.03},
+                 'dayCount': '30/360', 'covenants': 'State match requirements',
+                 'issuanceCost': 0, 'issuanceCostEscalation': 0.0},
                 {'id': 'pab1',   'type': 'PABs',               'amount': 280_000_000, 'rate': 0.0525, 'tenorYears': 30,
                  'closeDate': '2026-07-01', 'seniority': 'Senior',      'repaymentStyle': 'Level debt service',
                  'drawdownPriority': 3, 'targetDSCR': 1.35, 'ioYears': 0, 'deferralYears': 3,
@@ -630,7 +635,8 @@ def phased_schedule(principal: float, rate_per: float, periods: List[Dict[str, A
 
         phase = phases[phase_idx]
         int_p = bal * rate_per
-        phase_end = phase.get('endPeriod') or n
+        # Cap effective phase end at n — prevents over-sizing when tenor exceeds ops period
+        phase_end = min(phase.get('endPeriod') or n, n)
         periods_remaining_in_phase = phase_end - i
         regime = phase.get('regime')
 
@@ -877,6 +883,30 @@ def build_instrument_schedule(inst: Dict[str, Any], periods: List[Dict[str, Any]
         elif inst['repaymentStyle'] == 'Phased (multi-regime)':
             s = phased_schedule(principal, rate_per, slice_periods, cfads,
                                 inst.get('phases', []), principal)
+        elif inst['repaymentStyle'] == 'Anticipation Note (GAN/BAN)':
+            # Principal back-calculated from anticipated future grant/bond amount.
+            # Balance capitalises throughout tenor; bullet at maturity = anticipated_amount.
+            # Principal = PV(anticipated_amount) = anticipated / (1+r)^n
+            anticipated = inst.get('anticipatedAmount') or inst.get('anticipated_amount') or principal
+            n_sched = len(slice_periods)
+            tenor_p_inst = min(int(inst.get('tenorYears', 2) * ppy), n_sched)
+            computed_principal = (anticipated / ((1 + rate_per) ** tenor_p_inst)
+                                  if rate_per > 0 and tenor_p_inst > 0 else anticipated)
+            # Update instrument amount so Sources/Uses reflects actual draw
+            inst['amount'] = computed_principal
+            gan_interest  = _zeros(n_sched)
+            gan_principal = _zeros(n_sched)
+            gan_balance   = _zeros(n_sched)
+            bal = computed_principal
+            for i in range(n_sched):
+                if i < tenor_p_inst:
+                    bal *= (1 + rate_per)       # interest capitalises, no cash payment
+                    if i == tenor_p_inst - 1:
+                        gan_principal[i] = bal  # bullet = anticipated amount
+                        gan_balance[i] = 0      # balance = 0 after bullet
+                    else:
+                        gan_balance[i] = bal
+            s = {'interest': gan_interest, 'principal': gan_principal, 'balance': gan_balance}
         else:
             s = level_debt(principal, rate_per, slice_periods, io_p, def_p)
         if is_tifia_with_50 and inst['repaymentStyle'] != 'Phased (multi-regime)':
@@ -1012,38 +1042,57 @@ def build_full_model(model: Dict[str, Any]) -> Dict[str, Any]:
     sources_total = grant_total + equity_total + paygo_total + debt_total
     tifia_inst = next((i for i in instruments if i['id'] == model['tifia']['instrumentId'] and i['type'] == 'TIFIA Loan'), None)
 
-    debt_monthly_draws = _zeros(cm)
+    # --- CONSTRUCTION DRAWS: sequential by drawdownPriority (cheapest first) ---
+    # Grants → Short-term → Senior debt → Sub debt → Equity (last).
+    # Each month: fill capex need from lowest-priority number first; exhaust before moving on.
+    # This minimises IDC (equity drawn late = less time outstanding) and is standard PF practice.
+    draws_by_inst = {i['id']: _zeros(cm) for i in instruments}
     tifia_monthly_draws = _zeros(cm)
-    draws_by_inst = {i['id']: _zeros(cm) for i in instruments}  # per-instrument monthly draws
+    non_tifia_debt_draws = _zeros(cm)   # for non-TIFIA IDC calc
+
+    # Track remaining capacity per instrument (Paygo handled separately)
+    inst_remaining = {i['id']: float(i['amount']) for i in instruments if i.get('seniority') != 'Paygo'}
+    sorted_insts = sorted(
+        [i for i in instruments if i.get('seniority') != 'Paygo'],
+        key=lambda i: (i.get('drawdownPriority') or 99)
+    )
+    paygo_monthly = paygo_sched.get('monthly', _zeros(cm))
+
     for m in range(cm):
-        c_m = capex_sched['monthly'][m]
-        eq_share  = equity_total  / sources_total if sources_total > 0 else 0
-        gr_share  = grant_total   / sources_total if sources_total > 0 else 0
-        pg_share  = paygo_total   / sources_total if sources_total > 0 else 0
-        debt_share = 1 - eq_share - gr_share - pg_share
-        dd = c_m * debt_share
-        debt_monthly_draws[m] = dd
-        if tifia_inst and debt_total > 0:
-            tifia_monthly_draws[m] = dd * (tifia_inst['amount'] / debt_total)
-        # per-instrument splits
+        # Paygo draws first (follows its own schedule, not priority queue)
+        pg_m = paygo_monthly[m] if m < len(paygo_monthly) else 0
         for inst in instruments:
-            if inst['seniority'] == 'Grant':
-                draws_by_inst[inst['id']][m] = c_m * (inst['amount'] / sources_total) if sources_total > 0 else 0
-            elif inst['seniority'] == 'Equity':
-                draws_by_inst[inst['id']][m] = c_m * (inst['amount'] / sources_total) if sources_total > 0 else 0
-            elif inst['seniority'] == 'Paygo':
-                draws_by_inst[inst['id']][m] = paygo_sched.get('monthly', _zeros(cm))[m]
-            elif debt_total > 0:
-                draws_by_inst[inst['id']][m] = dd * (inst['amount'] / debt_total)
+            if inst.get('seniority') == 'Paygo':
+                draws_by_inst[inst['id']][m] = pg_m
+
+        # Remaining capex after paygo
+        remaining = max(0, capex_sched['monthly'][m] - pg_m)
+
+        for inst in sorted_insts:
+            if remaining <= 0:
+                break
+            avail = inst_remaining.get(inst['id'], 0)
+            if avail <= 0:
+                continue
+            draw = min(remaining, avail)
+            draws_by_inst[inst['id']][m] += draw
+            inst_remaining[inst['id']] -= draw
+            remaining -= draw
+            # Track sub-totals for IDC calcs
+            if tifia_inst and inst['id'] == tifia_inst['id']:
+                tifia_monthly_draws[m] = draw
+            elif inst.get('seniority') not in ('Grant', 'Equity', 'Paygo'):
+                non_tifia_debt_draws[m] += draw
 
     if tifia_inst:
         tifia_constr = build_tifia_construction_interest(tifia_inst, tifia_monthly_draws, model['tifia'], model)
-        tifia_constr['monthlyDraws'] = tifia_monthly_draws   # expose draws
+        tifia_constr['monthlyDraws'] = tifia_monthly_draws
     else:
         tifia_constr = {'monthlyInterest': _zeros(cm), 'monthlyBalance': _zeros(cm),
-                        'capitalizations': [], 'capitalizedInterestTotal': 0, 'finalBalance': 0}
+                        'monthlyDraws': _zeros(cm), 'capitalizations': [],
+                        'capitalizedInterestTotal': 0, 'finalBalance': 0}
 
-    non_tifia_debt = debt_total - (tifia_inst['amount'] if tifia_inst else 0)
+    # Non-TIFIA IDC: uses actual non-TIFIA debt draws (sequential, not proportional)
     non_tifia_rate = model['financing']['blendedIDCRateForNonTIFIA']
     nt_bal, nt_idc = 0.0, 0.0
     nt_idc_monthly = _zeros(cm)
@@ -1051,8 +1100,7 @@ def build_full_model(model: Dict[str, Any]) -> Dict[str, Any]:
         i_m = nt_bal * (non_tifia_rate / 12)
         nt_idc += i_m
         nt_idc_monthly[m] = i_m
-        sh = non_tifia_debt / debt_total if debt_total > 0 else 0
-        nt_bal += debt_monthly_draws[m] * sh
+        nt_bal += non_tifia_debt_draws[m]
 
     financing_fees = debt_total * model['financing']['financingFeesPctOfDebt']
     if tifia_inst:
