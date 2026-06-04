@@ -1392,55 +1392,63 @@ function autoCascadeTifia(model, params){
       }
     }
 
-    // STEP 3: SIZE EQUITY TO TARGET IRR (binary search using engine's actual IRR)
-    let equityAmount = null, equityForIRRCalc = null;
+    // STEP 3: SIZE EQUITY TO TARGET IRR (plug = Upfront Subsidy, kept closed in every iteration)
+    let equityAmount = null, equityForIRRCalc = null, upfrontSubsidy = 0;
     const targetIRR = params.targetEquityIRR || 0;
-    if(params.equityInstrumentId && targetIRR > 0){
-      const equityInst = w.financing.instruments.find(i => i.id === params.equityInstrumentId);
-      if(equityInst){
-        let eqPre;
-        try { eqPre = buildFullModel(w); } catch(e){ eqPre = null; }
-        if(eqPre){
-          const otherSources = eqPre.totalSources - equityInst.amount;
-          const gapNoEq = Math.max(0, eqPre.totalUses - otherSources);
-          let loEq = 0, hiEq = gapNoEq * 1.5;
-          equityAmount = 0;
-          for(let k=0; k<30; k++){
-            const mid = (loEq + hiEq) / 2;
-            equityInst.amount = Math.round(mid);
-            let actualIRR = -1;
-            try {
-              const testR = buildFullModel(w);
-              actualIRR = (testR.equityIRR != null) ? testR.equityIRR : -1;
-            } catch(e){}
-            if(actualIRR >= targetIRR - 0.0001){
-              equityAmount = mid;
-              loEq = mid;
-            } else {
-              hiEq = mid;
-            }
-            if(hiEq - loEq < 10_000) break;
+    const plugInst = params.plugInstrumentId
+      ? w.financing.instruments.find(i => i.id === params.plugInstrumentId) : null;
+    const equityInst = params.equityInstrumentId
+      ? w.financing.instruments.find(i => i.id === params.equityInstrumentId) : null;
+
+    if(equityInst && targetIRR > 0){
+      // max_equity = gap when equity=0 AND plug=0
+      if(plugInst) plugInst.amount = 0;
+      equityInst.amount = 0;
+      let baseR;
+      try { baseR = buildFullModel(w); } catch(e){ baseR = null; }
+      if(baseR){
+        const maxEquity = Math.max(0, baseR.totalUses - baseR.totalSources);
+        let loEq = 0, hiEq = maxEquity;
+        equityAmount = 0;
+        for(let k=0; k<30; k++){
+          const mid = (loEq + hiEq) / 2;
+          equityInst.amount = Math.round(mid);
+          if(plugInst) plugInst.amount = Math.max(0, Math.round(maxEquity - mid));
+          let actualIRR = -1;
+          try {
+            const testR = buildFullModel(w);
+            actualIRR = (testR.equityIRR != null) ? testR.equityIRR : -1;
+          } catch(e){}
+          if(actualIRR >= targetIRR - 0.0001){
+            equityAmount = mid;
+            loEq = mid;
+          } else {
+            hiEq = mid;
           }
-          equityAmount = Math.min(equityAmount, gapNoEq);
-          equityForIRRCalc = equityAmount;
-          equityInst.amount = Math.round(equityAmount);
+          if(hiEq - loEq < 10_000) break;
         }
+        equityInst.amount = Math.round(equityAmount);
+        if(plugInst){
+          plugInst.amount = Math.max(0, Math.round(maxEquity - equityAmount));
+          upfrontSubsidy = plugInst.amount;
+        }
+        equityForIRRCalc = equityAmount;
       }
     }
 
-    // STEP 4: PLUG
+    // STEP 4: FINAL BUILD + UPFRONT SUBSIDY (plug already set in Step 3; verify)
     let finalR;
     try { finalR = buildFullModel(w); }
     catch(e){ return { pct, tifiaAmount, error:'final build failed: '+e.message, feasible:false }; }
     let plugApplied = 0;
-    if(params.plugInstrumentId){
+    if(plugInst){
       const gap = finalR.totalUses - finalR.totalSources;
-      const plug = w.financing.instruments.find(i => i.id === params.plugInstrumentId);
-      if(plug){
-        plug.amount = Math.max(0, Math.round(plug.amount + gap));
+      if(Math.abs(gap) > 100){
+        plugInst.amount = Math.max(0, Math.round(plugInst.amount + gap));
         plugApplied = gap;
         try { finalR = buildFullModel(w); } catch(e){}
       }
+      upfrontSubsidy = plugInst.amount;
     }
 
     // FEASIBILITY (floors measured over TIFIA-active periods; display falls back to all-period min)
@@ -1492,6 +1500,7 @@ function autoCascadeTifia(model, params){
       pct, tifiaAmount, pabAmount: Math.round(pabAmount),
       equityAmount: equityAmount ? Math.round(equityAmount) : 0,
       equityForIRRCalc: equityForIRRCalc ? Math.round(equityForIRRCalc) : 0,
+      upfrontSubsidy: Math.round(upfrontSubsidy),
       actualEquityIRR: finalR.equityIRR,
       targetEquityIRR: targetIRR,
       eligibleCost,
@@ -1968,9 +1977,9 @@ function FinancingTab({model, setModel}){
       </div>
       <p className="text-xs text-stone-500 mt-3">TIFIA construction interest is computed separately (act/act day-count, semi-annual cap). See TIFIA tab. Issuance costs are set per instrument below and added to Uses.</p>
     </Section>
-    <Section title="Capital Stack" subtitle="Per-instrument seniority, repayment, day-count, deferral, covenants."
+    <Section title="Capital Stack" subtitle="Per-instrument seniority, repayment, day-count, deferral, covenants. TIFIA is configured in the Optimizer tab."
       action={<button onClick={addInst} className="text-xs px-3 py-1.5 bg-amber-500/10 border border-amber-500/50 text-amber-300 rounded hover:bg-amber-500/20">+ Add Instrument</button>}>
-      <div className="space-y-3">{f.instruments.map(inst=>(
+      <div className="space-y-3">{f.instruments.filter(inst => inst.type !== 'TIFIA Loan').map(inst=>(
         <div key={inst.id} className="bg-stone-900/50 border border-stone-700/60 rounded p-4">
           <div className="grid grid-cols-4 gap-3 mb-3">
             <Field label="Type"><Select value={inst.type} onChange={v=>updateInst(inst.id,{type:v})} options={INSTRUMENT_TYPES}/></Field>
@@ -2239,11 +2248,16 @@ function OptimizerTab({model, setModel, results}){
       };
       const r = autoCascadeTifia(model, params);
       setOutput(r);
-      setO({lastAutoCascadeRun:{bestPct: r.best?.pct, bestTifia: r.best?.tifiaAmount, bestPab: r.best?.pabAmount, diagnosis: r.best?.phaseInfo?.diagnosis, converged: r.converged}});
+      setO({lastAutoCascadeRun:{bestPct: r.best?.pct, bestTifia: r.best?.tifiaAmount, bestPab: r.best?.pabAmount, bestSubsidy: r.best?.upfrontSubsidy, diagnosis: r.best?.phaseInfo?.diagnosis, converged: r.converged}});
+      // AUTO-APPLY: commit optimized stack to model state so Sensitivity, Dashboard, Cashflow all reflect it
+      if(r.best && r.best.workingModel){
+        setModel(r.best.workingModel);
+      }
       setRunning(false);
     }, 50);
   };
   const applyOpt = () => {
+    // Re-apply (useful if user manually edited something and wants to revert to last optimizer output)
     if(!output || !output.best || !output.best.workingModel) return;
     setModel(output.best.workingModel);
   };
@@ -2266,8 +2280,28 @@ function OptimizerTab({model, setModel, results}){
       </div>
     </Section>
 
-    <Section title="Step 1 · TIFIA Amortization Profile"
-      subtitle={`Tenor: ${tifiaTenor}y (${tifiaTenor*ppy} periods at ${ppy}/yr). Auto-builds 4 phases that pass the 50% test by construction.`}>
+    <Section title="Step 1 · TIFIA Terms + Amortization Profile"
+      subtitle={`Tenor: ${tifiaTenor}y (${tifiaTenor*ppy} periods at ${ppy}/yr). Amount is set by the optimizer — configure rate, fees, and phase profile here.`}>
+      {/* TIFIA instrument terms — shown here instead of Financing tab */}
+      {tifiaInst && (()=>{
+        const updateTifia = patch => setModel({...model, financing:{...model.financing, instruments: model.financing.instruments.map(i => i.id === tifiaInst.id ? {...i,...patch} : i)}});
+        return <div className="bg-stone-900/40 border border-amber-500/20 rounded p-3 mb-4">
+          <div className="text-[10px] uppercase tracking-wider text-amber-400 mb-3">Instrument Terms (optimizer controls amount)</div>
+          <div className="grid grid-cols-4 gap-3 mb-3">
+            <Field label="Rate (%)" hint="Fixed coupon rate"><NumInput value={tifiaInst.rate} onChange={v=>updateTifia({rate:v})} step={0.0025} suffix="%"/></Field>
+            <Field label="Tenor (yrs)"><NumInput value={tifiaInst.tenorYears} onChange={v=>updateTifia({tenorYears:v})}/></Field>
+            <Field label="Close Date"><TextInput value={tifiaInst.closeDate} onChange={v=>updateTifia({closeDate:v})}/></Field>
+            <Field label="Day Count"><Select value={tifiaInst.dayCount} onChange={v=>updateTifia({dayCount:v})} options={DAY_COUNT}/></Field>
+            <Field label="Draw Priority"><NumInput value={tifiaInst.drawdownPriority} onChange={v=>updateTifia({drawdownPriority:v})}/></Field>
+            <Field label="Issuance Cost ($)" hint="Base-year amount, escalated to FC"><NumInput value={tifiaInst.issuanceCost} onChange={v=>updateTifia({issuanceCost:v})} prefix="$"/></Field>
+            <Field label="Issuance Cost Esc (%/yr)"><NumInput value={tifiaInst.issuanceCostEscalation} onChange={v=>updateTifia({issuanceCostEscalation:v})} step={0.005} suffix="%"/></Field>
+            <Field label="Covenants / Notes"><TextInput value={tifiaInst.covenants} onChange={v=>updateTifia({covenants:v})}/></Field>
+          </div>
+          <div className="text-[10px] text-stone-500">Admin fee, monitoring fee, 50% test enforcement → TIFIA tab. Amount shown: {fmt$(tifiaInst.amount)} (overwritten by Run).</div>
+        </div>;
+      })()}
+      {/* Amortization profile */}
+      <div className="text-[10px] uppercase tracking-wider text-stone-400 mb-3">Amortization Profile — Auto-builds 4 phases that pass the 50% test by construction</div>
       <div className="grid grid-cols-4 gap-4">
         <Field label="Phase 1 — CapI (years)" hint="Interest capitalizes into balance"><NumInput value={ap.deferYears} onChange={v=>setAuto({deferYears:v})} step={1} suffix="y"/></Field>
         <Field label="Phase 2 — IO (years)" hint="Pay interest only"><NumInput value={ap.ioYears} onChange={v=>setAuto({ioYears:v})} step={1} suffix="y"/></Field>
@@ -2279,7 +2313,6 @@ function OptimizerTab({model, setModel, results}){
           hint="Annuity = deterministic level pmt to 50% balance. Sculpt = DSCR-driven (falls back to annuity if CFADS infeasible)">
           <Select value={ap.phase3Mode} onChange={v=>setAuto({phase3Mode:v})} options={['annuity','sculpt']}/>
         </Field>
-        <Field label="TIFIA Instrument"><Select value={c.tifiaInstrumentId} onChange={v=>setCascade({tifiaInstrumentId:v})} options={model.financing.instruments.filter(i=>i.type==='TIFIA Loan').map(i=>i.id)}/></Field>
       </div>
       <div className="mt-4 flex h-6 rounded overflow-hidden border border-stone-700/60">
         {(()=>{
@@ -2330,15 +2363,16 @@ function OptimizerTab({model, setModel, results}){
       </div>
     </Section>
 
-    <Section title="Step 4 · Run">
+    <Section title="Step 4 · Run"
+      subtitle="Run sizes TIFIA → PAB → Equity (to target IRR) → Upfront Subsidy (plug). Stack is auto-applied to the model so Dashboard, Cashflow, Sensitivity all reflect the result.">
       <div className="flex items-center gap-3">
         <button onClick={runOpt} disabled={running}
           className="px-6 py-3 bg-amber-500 text-stone-900 rounded text-sm font-medium hover:bg-amber-400 disabled:opacity-50">
-          {running ? 'Running…' : '▶ Run Cascade Optimizer'}
+          {running ? 'Running…' : '▶ Run Cascade & Apply'}
         </button>
         {output && output.best && <button onClick={applyOpt}
           className="px-6 py-3 bg-emerald-500/10 border border-emerald-500/50 text-emerald-300 rounded text-sm hover:bg-emerald-500/20">
-          ✓ Apply Optimized Stack
+          ↺ Re-apply Last Result
         </button>}
       </div>
     </Section>
@@ -2360,7 +2394,14 @@ function OptimizerTab({model, setModel, results}){
               <Metric label="Equity Sized to" value={fmt$(b.equityAmount)} accent="amber" sub={`@ target IRR ${fmtPct(b.targetEquityIRR||0,1)}`}/>
               <Metric label="Equity@IRR NPV" value={fmt$(b.equityForIRRCalc)} sub={b.equityAmount < b.equityForIRRCalc ? 'capped by gap' : 'binds IRR'}/>
               <Metric label="Actual Equity IRR" value={fmtPct(b.actualEquityIRR||0,2)} accent={(b.actualEquityIRR||0) >= (b.targetEquityIRR||0)-0.005 ? 'green' : 'amber'} sub={`vs target ${fmtPct(b.targetEquityIRR||0,1)}`}/>
-              <Metric label="Plug-Grant Absorbed" value={fmt$(b.plugApplied||0)} sub="excess gap → grant"/>
+              <Metric label="Plug Absorbed" value={fmt$(b.plugApplied||0)} sub="rounding residual"/>
+            </div>
+            <div className="grid grid-cols-1 gap-3 mb-4">
+              <div className="bg-gradient-to-r from-amber-500/10 to-amber-500/5 border-2 border-amber-500/40 rounded-lg p-4">
+                <div className="text-[10px] uppercase tracking-widest text-amber-400 mb-1">Final Output — Upfront Subsidy Required</div>
+                <div className="text-3xl font-light text-amber-300">{fmt$(b.upfrontSubsidy||0)}</div>
+                <div className="text-xs text-stone-400 mt-1">Government / sponsor cash needed at financial close to make the deal bankable at TIFIA={fmtPct(b.pct,1)}, PAB={fmt$(b.pabAmount)}, Equity@{fmtPct(b.targetEquityIRR||0,1)} IRR. This is the project's headline ask.</div>
+              </div>
             </div>
             <div className="grid grid-cols-4 gap-3 mb-4">
               <Metric label="Min Total DSCR" value={fmtRatio(b.minTotalDSCR)} accent={!b.minTotalDSCR || b.minTotalDSCR >= (ap.minTotalDSCR||1.10) ? 'green' : 'red'} sub={`floor ${(ap.minTotalDSCR||1.10).toFixed(2)}x`}/>
@@ -2434,6 +2475,162 @@ function DashboardTab({model, results}){
   const gap = r.totalUses - r.totalSources;
   const minSr = r.minSeniorDSCR;
   const minTot = r.totalDSCR ? Math.min(...r.totalDSCR.filter(v=>v!=null && isFinite(v))) : null;
+
+  // Excel export via SheetJS (CDN load)
+  const [exporting, setExporting] = useState(false);
+  const loadSheetJS = () => new Promise((resolve, reject)=>{
+    if(window.XLSX){ resolve(window.XLSX); return; }
+    const script = document.createElement('script');
+    script.src = 'https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js';
+    script.onload = ()=> resolve(window.XLSX);
+    script.onerror = ()=> reject(new Error('SheetJS CDN load failed'));
+    document.head.appendChild(script);
+  });
+  const exportXLSX = async () => {
+    setExporting(true);
+    try {
+      const XLSX = await loadSheetJS();
+      const wb = XLSX.utils.book_new();
+
+      // SHEET 1: ASSUMPTIONS
+      const assumptions = [
+        ['Toll Road PF Model — Assumptions Export'],
+        ['Project Name', model.general.projectName],
+        ['State', model.general.state],
+        ['Construction Months', model.general.constructionMonths],
+        ['Operations Years', model.general.operationsYears],
+        ['Concession Years', model.general.concessionYears],
+        ['Periods per Year', model.general.periodsPerYear],
+        ['Financial Close', model.general.financialCloseDate],
+        ['Service Commencement', model.general.serviceCommencementDate],
+        [],
+        ['=== REVENUE ==='],
+        ['AADT Year 1', model.revenue.aadtY1],
+        ['AADT Mature', model.revenue.aadtMature],
+        ['Mature Year', model.revenue.matureYear],
+        ['Ramp Curve', model.revenue.rampCurve],
+        ['Base Toll Rate ($)', model.revenue.baseTollRate],
+        ['Toll Escalation (%/yr)', model.revenue.tollEscalation],
+        ['Leakage (%)', model.revenue.leakage],
+        ['Truck Mix (%)', model.revenue.truckMix],
+        ['Truck Toll Multiplier', model.revenue.truckTollMultiplier],
+        [],
+        ['=== OPEX ==='],
+        ...model.opex.items.map(it => [`Opex — ${it.label}`, it.base, `escalation ${(it.escalation*100).toFixed(1)}%/yr`]),
+        [],
+        ['=== CAPEX ITEMS ==='],
+        ['Item', 'Label', 'Group', 'Base $', 'Inflation', 'Curve'],
+        ...model.capex.items.map(it => [it.id, it.label, it.group, it.base, it.inflRate, it.curve]),
+        [],
+        ['=== FINANCING INSTRUMENTS ==='],
+        ['ID', 'Type', 'Seniority', 'Style', 'Amount $', 'Rate %', 'Tenor y', 'Close', 'IO y', 'Defer y', 'Tgt DSCR', 'Issuance Cost $'],
+        ...model.financing.instruments.map(i => [i.id, i.type, i.seniority, i.repaymentStyle, i.amount, i.rate, i.tenorYears, i.closeDate, i.ioYears, i.deferralYears, i.targetDSCR, i.issuanceCost]),
+        [],
+        ['=== TIFIA CONFIG ==='],
+        ['Admin Fee Annual', model.tifia.adminFeeAnnual],
+        ['Monitoring Fee bps', model.tifia.monitoringFeeBps],
+        ['50% test years before maturity', model.tifia.fiftyPercentTestYearsBeforeMaturity],
+        ['Lockup if Sr DSCR <', model.tifia.lockupDSCR],
+        ['Lockup if LLCR <', model.tifia.lockupLLCR],
+        [],
+        ['=== CASCADE OPTIMIZER CONFIG ==='],
+        ['Target Equity IRR', model.optimizer?.cascade?.targetEquityIRR],
+        ['Equity Instrument', model.optimizer?.cascade?.equityInstrumentId],
+        ['Plug Instrument (Subsidy)', model.optimizer?.cascade?.plugInstrumentId],
+        ['CapI years', model.optimizer?.cascade?.autoTifiaParams?.deferYears],
+        ['IO years', model.optimizer?.cascade?.autoTifiaParams?.ioYears],
+        ['Test years before maturity', model.optimizer?.cascade?.autoTifiaParams?.testYearsBeforeMaturity],
+        ['Min Total DSCR', model.optimizer?.cascade?.autoTifiaParams?.minTotalDSCR],
+        ['Min Sr DSCR', model.optimizer?.cascade?.autoTifiaParams?.minSrDSCR],
+        ['Min TIFIA Eff DSCR', model.optimizer?.cascade?.autoTifiaParams?.minTifiaDSCR],
+      ];
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(assumptions), 'Assumptions');
+
+      // SHEET 2: KEY OUTPUTS
+      const lastRun = model.optimizer?.lastAutoCascadeRun;
+      const outputs = [
+        ['Toll Road PF Model — Key Outputs'],
+        [],
+        ['Project IRR', r.projectIRR],
+        ['Equity IRR', r.equityIRR],
+        ['Min Senior DSCR', r.minSeniorDSCR],
+        ['Min LLCR', r.minLLCR],
+        ['TIFIA All-in Rate', r.tifiaAllInRate],
+        ['Total Uses', r.totalUses],
+        ['Total Sources', r.totalSources],
+        ['Funding Gap', r.totalUses - r.totalSources],
+        ['Issuance Costs', r.totalIssuanceCost],
+        ['TIFIA Admin+Mon Total', r.totalTifiaFees],
+        [],
+        ['=== LAST OPTIMIZER RUN ==='],
+        ['TIFIA %', lastRun?.bestPct],
+        ['TIFIA Principal', lastRun?.bestTifia],
+        ['PAB Principal', lastRun?.bestPab],
+        ['Upfront Subsidy Required', lastRun?.bestSubsidy],
+        ['Converged', lastRun?.converged],
+      ];
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(outputs), 'Key Outputs');
+
+      // SHEET 3: CASHFLOW
+      const cf = [['Period', 'Label', 'Toll Revenue', 'Opex', 'CFADS Gross', 'TIFIA Fees', 'CFADS for DSCR',
+        'Sr Int', 'Sr Pri', 'Sub Int', 'Sub Pri', 'ST DS', 'Total DS', 'Sr DSCR', 'Total DSCR', 'Equity CF']];
+      r.periods.forEach((p, i) => {
+        cf.push([
+          i, p.label,
+          r.revSched.byPeriod[i],
+          r.opexSched.byPeriod[i],
+          r.cfadsByPeriod[i],
+          (r.tifiaFeesPerPeriod||[])[i] || 0,
+          (r.cfadsForDscr||r.cfadsByPeriod)[i],
+          r.seniorInt[i],
+          r.seniorPri[i],
+          r.subInt[i],
+          r.subPri[i],
+          r.shortDS[i],
+          (r.seniorInt[i]||0)+(r.seniorPri[i]||0)+(r.subInt[i]||0)+(r.subPri[i]||0)+(r.shortDS[i]||0),
+          r.seniorDSCR[i],
+          r.totalDSCR[i],
+          (r.rawEquityCF||r.equityCF||[])[i],
+        ]);
+      });
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(cf), 'Cashflow');
+
+      // SHEET 4: SOURCES & USES
+      const su = [
+        ['SOURCES OF FUNDS'],
+        ['Instrument', 'Type', 'Seniority', 'Amount', '% of Sources'],
+        ...model.financing.instruments.map(i => [i.id, i.type, i.seniority, i.amount, i.amount / Math.max(1, r.totalSources)]),
+        ['TOTAL SOURCES', '', '', r.totalSources],
+        [],
+        ['USES OF FUNDS'],
+        ['Category', 'Amount', '% of Uses'],
+        ['Nominal Capex', r.capexSched.totalNominal, r.capexSched.totalNominal / Math.max(1, r.totalUses)],
+        ['Non-TIFIA IDC', r.nonTIFIAIDC, r.nonTIFIAIDC / Math.max(1, r.totalUses)],
+        ['TIFIA Capitalized Interest', r.tifiaConstr?.capitalizedInterestTotal || 0, (r.tifiaConstr?.capitalizedInterestTotal || 0) / Math.max(1, r.totalUses)],
+        ['Financing Fees', r.financingFees, r.financingFees / Math.max(1, r.totalUses)],
+        ['Issuance Costs (escalated)', r.totalIssuanceCost, r.totalIssuanceCost / Math.max(1, r.totalUses)],
+        ['TOTAL USES', r.totalUses],
+        [],
+        ['FUNDING GAP', r.totalUses - r.totalSources],
+      ];
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(su), 'Sources & Uses');
+
+      // SHEET 5: TIFIA SCHEDULE
+      const tifiaSched = r.debtSchedules?.[model.optimizer?.cascade?.tifiaInstrumentId || 'tifia1'];
+      if(tifiaSched){
+        const tfRows = [['Period', 'Label', 'Interest', 'Principal', 'Balance']];
+        r.periods.forEach((p, i) => tfRows.push([i, p.label, tifiaSched.interest[i], tifiaSched.principal[i], tifiaSched.balance[i]]));
+        XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(tfRows), 'TIFIA Schedule');
+      }
+
+      const filename = `TollRoad_${(model.general.projectName||'model').replace(/[^a-z0-9]/gi,'_')}_${new Date().toISOString().slice(0,10)}.xlsx`;
+      XLSX.writeFile(wb, filename);
+    } catch(e) {
+      alert('Export failed: ' + e.message);
+    }
+    setExporting(false);
+  };
+
   // Debt service vs revenue chart data
   const chartData = (r.periods || []).map((p,i)=>({
     period: p.label,
@@ -2445,6 +2642,25 @@ function DashboardTab({model, results}){
     'ST DS': r.shortDS[i],
   }));
   return <div>
+    <div className="flex justify-end mb-3">
+      <button onClick={exportXLSX} disabled={exporting}
+        className="px-4 py-2 bg-emerald-500/10 border border-emerald-500/50 text-emerald-300 rounded text-xs font-medium hover:bg-emerald-500/20 disabled:opacity-50">
+        {exporting ? 'Exporting…' : '⬇ Export All to Excel'}
+      </button>
+    </div>
+    {model.optimizer?.lastAutoCascadeRun?.bestSubsidy != null && (
+      <Section title="Project Funding Ask — Upfront Subsidy" subtitle="From the last optimizer run. Government / sponsor capital needed at financial close to close the funding gap after maximum debt and equity sized to target IRR.">
+        <div className="bg-gradient-to-r from-amber-500/15 to-amber-500/5 border-2 border-amber-500/50 rounded-lg p-5">
+          <div className="text-[11px] uppercase tracking-widest text-amber-400 mb-2">Upfront Subsidy Required</div>
+          <div className="text-5xl font-extralight text-amber-300 mb-2">{fmt$(model.optimizer.lastAutoCascadeRun.bestSubsidy)}</div>
+          <div className="grid grid-cols-3 gap-6 mt-4 text-xs">
+            <div><span className="text-stone-500">TIFIA: </span><span className="text-stone-200">{fmt$(model.optimizer.lastAutoCascadeRun.bestTifia)}</span> ({fmtPct(model.optimizer.lastAutoCascadeRun.bestPct||0,1)})</div>
+            <div><span className="text-stone-500">PAB: </span><span className="text-stone-200">{fmt$(model.optimizer.lastAutoCascadeRun.bestPab)}</span></div>
+            <div><span className="text-stone-500">Target Equity IRR: </span><span className="text-stone-200">{fmtPct(model.optimizer?.cascade?.targetEquityIRR||0.12,1)}</span></div>
+          </div>
+        </div>
+      </Section>
+    )}
     <Section title="Key Metrics">
       <div className="grid grid-cols-4 gap-3 mb-4">
         <Metric label="Project IRR" value={fmtPct(r.projectIRR,2)} accent="amber"/>
