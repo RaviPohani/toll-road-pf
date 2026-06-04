@@ -10,7 +10,7 @@ import {
    paygo, waterfall toggle w/ 1.0x overall obligation, optimizer.
    ============================================================ */
 
-const REPAYMENT_STYLES = ['Sculpted (target DSCR)','Level debt service','Equal principal','Bullet','IO then amortize','Deferred P&I then sculpted','Phased (multi-regime)','Custom schedule'];
+const REPAYMENT_STYLES = ['Sculpted (target DSCR)','Level debt service','Equal principal','Bullet','IO then amortize','Deferred P&I then sculpted','Phased (multi-regime)','Custom schedule','Anticipation Note (GAN/BAN)'];
 const PHASE_REGIMES = ['defer','io','sculpt','level','equal-principal'];
 const INSTRUMENT_TYPES = ['TIFIA Loan','PABs (Private Activity Bonds)','CIBs (Current Interest Bonds)','CABs (Capital Appreciation Bonds)','Federal Grant','State Grant','Local Grant','RAN (Revenue Anticipation Note)','BAN (Bond Anticipation Note)','GAN (Grant Anticipation Note)','Bank Loan','Sponsor Equity','Paygo (Existing Net Revenues)'];
 const SENIORITY = ['Senior','Subordinate','Short-term','Grant','Equity','Paygo'];
@@ -83,8 +83,9 @@ const defaultModel = () => ({
   financing: {
     instruments: [
       {id:'eq1',type:'Sponsor Equity',amount:120_000_000,rate:0,tenorYears:30,closeDate:'2026-07-01',seniority:'Equity',repaymentStyle:'Sculpted (target DSCR)',drawdownPriority:5,targetDSCR:1.30,ioYears:0,deferralYears:0,dayCount:'30/360',covenants:'Distribution lockup if TIFIA lockup triggered', issuanceCost:0, issuanceCostEscalation:0},
-      {id:'fg1',type:'Federal Grant',amount:60_000_000,rate:0,tenorYears:0,closeDate:'2026-07-01',seniority:'Grant',repaymentStyle:'Bullet',drawdownPriority:1,targetDSCR:0,ioYears:0,deferralYears:0,dayCount:'30/360',covenants:'Federal cost-share requirements', issuanceCost:250_000, issuanceCostEscalation:0.03},
-      {id:'sg1',type:'State Grant',amount:40_000_000,rate:0,tenorYears:0,closeDate:'2026-07-01',seniority:'Grant',repaymentStyle:'Bullet',drawdownPriority:1,targetDSCR:0,ioYears:0,deferralYears:0,dayCount:'30/360',covenants:'State match requirements', issuanceCost:150_000, issuanceCostEscalation:0.03},
+      {id:'sub1',type:'Upfront Subsidy',amount:0,rate:0,tenorYears:0,closeDate:'2026-07-01',seniority:'Grant',repaymentStyle:'Bullet',drawdownPriority:0,targetDSCR:0,ioYears:0,deferralYears:0,dayCount:'30/360',covenants:'Government viability gap funding — sized by Optimizer', issuanceCost:0, issuanceCostEscalation:0},
+      {id:'fg1',type:'Federal Grant',amount:60_000_000,rate:0,tenorYears:0,closeDate:'2026-07-01',seniority:'Grant',repaymentStyle:'Bullet',drawdownPriority:1,targetDSCR:0,ioYears:0,deferralYears:0,dayCount:'30/360',covenants:'Federal cost-share requirements', issuanceCost:0, issuanceCostEscalation:0},
+      {id:'sg1',type:'State Grant',amount:40_000_000,rate:0,tenorYears:0,closeDate:'2026-07-01',seniority:'Grant',repaymentStyle:'Bullet',drawdownPriority:1,targetDSCR:0,ioYears:0,deferralYears:0,dayCount:'30/360',covenants:'State match requirements', issuanceCost:0, issuanceCostEscalation:0},
       {id:'pab1',type:'PABs (Private Activity Bonds)',amount:280_000_000,rate:0.0525,tenorYears:30,closeDate:'2026-07-01',seniority:'Senior',repaymentStyle:'Level debt service',drawdownPriority:3,targetDSCR:1.35,ioYears:0,deferralYears:3,dayCount:'30/360',covenants:'Senior DSCR ≥1.20x; reserve fund equal to MADS', issuanceCost:4_500_000, issuanceCostEscalation:0.03},
       {id:'tifia1',type:'TIFIA Loan',amount:200_000_000,rate:0.0410,tenorYears:35,closeDate:'2026-07-01',seniority:'Subordinate',repaymentStyle:'Phased (multi-regime)',drawdownPriority:4,targetDSCR:1.10,ioYears:0,deferralYears:5,dayCount:'Actual/Actual',covenants:'TIFIA springing lien; sub DSCR ≥1.10x after deferral', issuanceCost:1_750_000, issuanceCostEscalation:0.03,
         phases:[
@@ -119,7 +120,7 @@ const defaultModel = () => ({
       {instrumentId:'pab1', minDSCR:1.30, minLLCR:1.30},
       {instrumentId:'tifia1', minDSCR:1.10, minLLCR:1.20},
     ],
-    plugInstrumentId:'fg1',
+    plugInstrumentId:'sub1',
     cascade: {
       // TIFIA sizing
       tifiaInstrumentId:'tifia1',
@@ -132,7 +133,7 @@ const defaultModel = () => ({
       equityInstrumentId:'eq1',
       targetEquityIRR:0.12,
       // Plug — grants absorb residual gap after equity is sized
-      plugInstrumentId:'fg1',
+      plugInstrumentId:'sub1',
       // Auto-optimizer: when on, replaces manual tifiaPercentage with binary search
       autoOptimizeTifia: false,
       autoTifiaParams: {
@@ -486,7 +487,7 @@ function phasedSchedule(principal, ratePer, periods, cfads, phases, originalPrin
 
     const phase = phases[phaseIdx];
     const intP = bal * ratePer;
-    const phaseEnd = phase.endPeriod || n;
+    const phaseEnd = Math.min(phase.endPeriod || n, n);   // cap at n — prevents bullet when tenor > ops period
     const periodsRemainingInPhase = phaseEnd - i;
 
     if(phase.regime === 'defer'){
@@ -707,6 +708,32 @@ function buildInstrumentSchedule(inst, periods, cfads, tifiaCfg, ppy){
     else if(inst.repaymentStyle === 'Deferred P&I then sculpted') s = sculptToTarget(principal, ratePer, slice, cfads, inst.targetDSCR||1.20, 0, Math.max(1, defP||ppy*3));
     else if(inst.repaymentStyle === 'Sculpted (target DSCR)') s = sculptToTarget(principal, ratePer, slice, cfads, inst.targetDSCR||1.30, ioP, defP);
     else if(inst.repaymentStyle === 'Phased (multi-regime)') s = phasedSchedule(principal, ratePer, slice, cfads, inst.phases||[], principal);
+    else if(inst.repaymentStyle === 'Anticipation Note (GAN/BAN)'){
+      // Back-calculate principal from anticipated future grant/bond amount.
+      // Balance grows via CapI throughout tenor; bullet at maturity = anticipatedAmount.
+      // Principal = PV(anticipatedAmount) = anticipated / (1+r)^n
+      const anticipated = inst.anticipatedAmount || inst.amount;
+      const tenorP = Math.min(Math.round((inst.tenorYears||2)*ppy), n);
+      const computedPrincipal = (ratePer > 0 && tenorP > 0)
+        ? anticipated / Math.pow(1 + ratePer, tenorP)
+        : anticipated;
+      // Update instrument amount so Sources/Uses reflects the actual draw
+      inst.amount = computedPrincipal;
+      const ganInterest = zeros(n), ganPrincipal = zeros(n), ganBalance = zeros(n);
+      let bal = computedPrincipal;
+      for(let i=0; i<n; i++){
+        if(i < tenorP){
+          bal *= (1 + ratePer);        // interest capitalises, no cash payment
+          if(i === tenorP - 1){
+            ganPrincipal[i] = bal;     // bullet = anticipated amount
+            ganBalance[i] = 0;         // balance = 0 after bullet
+          } else {
+            ganBalance[i] = bal;
+          }
+        } // else balance stays 0
+      }
+      s = {interest: ganInterest, principal: ganPrincipal, balance: ganBalance};
+    }
     else s = levelDebt(principal, ratePer, slice, ioP, defP);
     if(isTIFIAwith50 && inst.repaymentStyle !== 'Phased (multi-regime)'){
       // Phased schedules are assumed to be engineered (manually or by auto-cascade) to pass the 50% test.
@@ -818,39 +845,49 @@ function buildFullModel(model){
   const sourcesTotal = grantTotal + equityTotal + paygoTotal + debtTotal;
   const tifiaInst = instruments.find(i=>i.id===model.tifia.instrumentId && i.type==='TIFIA Loan');
 
-  const debtMonthlyDraws = zeros(cm);
-  const tifiaMonthlyDraws = zeros(cm);
+  // --- CONSTRUCTION DRAWS: sequential by drawdownPriority (cheapest/lowest number first) ---
+  // Grants → RAN → PABs → TIFIA → Equity. Exhausts each source before drawing the next.
+  // This minimises IDC, maximises equity IRR, and matches standard PF practice.
   const drawsByInst = {};
   instruments.forEach(i => { drawsByInst[i.id] = zeros(cm); });
-  for(let m=0;m<cm;m++){
-    const cM = capexSched.monthly[m];
-    const equityShare = sourcesTotal>0 ? equityTotal/sourcesTotal : 0;
-    const grantShare  = sourcesTotal>0 ? grantTotal/sourcesTotal : 0;
-    const paygoShare  = sourcesTotal>0 ? paygoTotal/sourcesTotal : 0;
-    const debtShare = 1 - equityShare - grantShare - paygoShare;
-    const debtDraw = cM * debtShare;
-    debtMonthlyDraws[m] = debtDraw;
-    if(tifiaInst && debtTotal>0) tifiaMonthlyDraws[m] = debtDraw * (tifiaInst.amount/debtTotal);
-    // per-instrument splits
-    instruments.forEach(inst => {
-      if(inst.seniority==='Grant')        drawsByInst[inst.id][m] = sourcesTotal>0 ? cM*(inst.amount/sourcesTotal) : 0;
-      else if(inst.seniority==='Equity')  drawsByInst[inst.id][m] = sourcesTotal>0 ? cM*(inst.amount/sourcesTotal) : 0;
-      else if(inst.seniority==='Paygo')   drawsByInst[inst.id][m] = (paygoSched.monthly||zeros(cm))[m];
-      else if(debtTotal>0)                drawsByInst[inst.id][m] = debtDraw * (inst.amount/debtTotal);
-    });
+  const tifiaMonthlyDraws = zeros(cm);
+  const nonTifiaDebtDraws = zeros(cm);
+
+  const instRemaining = {};
+  instruments.forEach(i => { if(i.seniority !== 'Paygo') instRemaining[i.id] = i.amount; });
+  const sortedInsts = [...instruments.filter(i => i.seniority !== 'Paygo')]
+    .sort((a,b) => (a.drawdownPriority||99) - (b.drawdownPriority||99));
+  const paygoMonthly = paygoSched.monthly || zeros(cm);
+
+  for(let m=0; m<cm; m++){
+    const pgM = paygoMonthly[m] || 0;
+    instruments.forEach(i => { if(i.seniority === 'Paygo') drawsByInst[i.id][m] = pgM; });
+    let remaining = Math.max(0, capexSched.monthly[m] - pgM);
+    for(const inst of sortedInsts){
+      if(remaining <= 0) break;
+      const avail = instRemaining[inst.id] || 0;
+      if(avail <= 0) continue;
+      const draw = Math.min(remaining, avail);
+      drawsByInst[inst.id][m] += draw;
+      instRemaining[inst.id] -= draw;
+      remaining -= draw;
+      if(tifiaInst && inst.id === tifiaInst.id) tifiaMonthlyDraws[m] = draw;
+      else if(!['Grant','Equity','Paygo'].includes(inst.seniority)) nonTifiaDebtDraws[m] += draw;
+    }
   }
+
   const tifiaConstr = tifiaInst
     ? {...buildTIFIAConstructionInterest(tifiaInst, tifiaMonthlyDraws, model.tifia, model), monthlyDraws: tifiaMonthlyDraws}
     : { monthlyInterest: zeros(cm), monthlyBalance: zeros(cm), monthlyDraws: zeros(cm), capitalizations: [], capitalizedInterestTotal: 0, finalBalance: 0 };
-  const nonTIFIADebt = debtTotal - (tifiaInst ? tifiaInst.amount : 0);
+
+  // Non-TIFIA IDC: actual sequential draws (not proportional)
   const nonTIFIARate = model.financing.blendedIDCRateForNonTIFIA;
   let ntBal = 0, ntIDC = 0;
   const ntIDCMonthly = zeros(cm);
-  for(let m=0;m<cm;m++){
+  for(let m=0; m<cm; m++){
     const i = ntBal * (nonTIFIARate/12);
     ntIDC += i; ntIDCMonthly[m] = i;
-    const sh = debtTotal>0 ? nonTIFIADebt/debtTotal : 0;
-    ntBal += debtMonthlyDraws[m] * sh;
+    ntBal += nonTifiaDebtDraws[m];
   }
   const financingFees = debtTotal * model.financing.financingFeesPctOfDebt;
   if(tifiaInst) tifiaInst.principalAfterIDC = tifiaInst.amount + tifiaConstr.capitalizedInterestTotal;
@@ -1986,9 +2023,39 @@ function FinancingTab({model, setModel}){
       </div>
       <p className="text-xs text-stone-500 mt-3">TIFIA construction interest is computed separately (act/act day-count, semi-annual cap). See TIFIA tab. Issuance costs are set per instrument below and added to Uses.</p>
     </Section>
-    <Section title="Capital Stack" subtitle="Per-instrument seniority, repayment, day-count, deferral, covenants. TIFIA is configured in the Optimizer tab."
+    <Section title="Capital Stack" subtitle="TIFIA and Equity are configured in the Optimizer tab. Upfront Subsidy (sub1) is set by the Optimizer."
       action={<button onClick={addInst} className="text-xs px-3 py-1.5 bg-amber-500/10 border border-amber-500/50 text-amber-300 rounded hover:bg-amber-500/20">+ Add Instrument</button>}>
-      <div className="space-y-3">{f.instruments.filter(inst => inst.type !== 'TIFIA Loan').map(inst=>(
+      <div className="space-y-3">{f.instruments.filter(inst =>
+        inst.type !== 'TIFIA Loan' &&
+        inst.seniority !== 'Equity' &&
+        inst.id !== 'sub1'
+      ).map(inst=>{
+        const isGrant = inst.seniority === 'Grant';
+        const isGANBAN = inst.repaymentStyle === 'Anticipation Note (GAN/BAN)';
+        if(isGrant && !isGANBAN) return (
+          // Simplified grant row — no rate/tenor/repayment/issuance fields
+          <div key={inst.id} className="bg-stone-900/40 border border-emerald-800/40 rounded p-3">
+            <div className="flex items-center gap-3 mb-3">
+              <span className="text-sm font-medium text-emerald-300">{inst.type}</span>
+              <span className="text-[10px] font-mono text-stone-500 bg-stone-800 px-1.5 py-0.5 rounded">{inst.id}</span>
+              <span className="ml-auto text-[10px] text-emerald-500 bg-emerald-500/10 border border-emerald-500/30 px-2 py-0.5 rounded">Grant — no repayment · no rate · no issuance</span>
+              <button onClick={()=>removeInst(inst.id)} className="text-stone-600 hover:text-rose-400 text-xs px-2">✕</button>
+            </div>
+            <div className="grid grid-cols-3 gap-3">
+              <Field label="Grant Amount ($)"><NumInput value={inst.amount} onChange={v=>updateInst(inst.id,{amount:v})} prefix="$"/></Field>
+              <Field label="Expected Date" hint="When grant funds arrive at FC"><TextInput value={inst.closeDate} onChange={v=>updateInst(inst.id,{closeDate:v})}/></Field>
+              <Field label="Draw Priority" hint="Lower = drawn earlier in construction waterfall"><NumInput value={inst.drawdownPriority} onChange={v=>updateInst(inst.id,{drawdownPriority:v})}/></Field>
+            </div>
+            <div className="mt-2">
+              <Field label="Covenants / Grant Conditions"><TextInput value={inst.covenants} onChange={v=>updateInst(inst.id,{covenants:v})}/></Field>
+            </div>
+            <div className="text-[10px] text-stone-500 mt-2">
+              Grant is drawn proportionally into the construction waterfall by priority. Not a debt instrument — no DSCR impact, no repayment obligations.
+              To model a Grant/Bond Anticipation Note against this grant, add a new instrument with style "Anticipation Note (GAN/BAN)".
+            </div>
+          </div>
+        );
+        return (
         <div key={inst.id} className="bg-stone-900/50 border border-stone-700/60 rounded p-4">
           <div className="grid grid-cols-4 gap-3 mb-3">
             <Field label="Type"><Select value={inst.type} onChange={v=>updateInst(inst.id,{type:v})} options={INSTRUMENT_TYPES}/></Field>
@@ -2008,10 +2075,26 @@ function FinancingTab({model, setModel}){
             {inst.repaymentStyle !== 'Phased (multi-regime)' && inst.repaymentStyle !== 'Bullet' && inst.repaymentStyle !== 'Custom schedule' &&
               <Field label="Deferral Years" hint="Defer all payments (P&I) for this many years"><NumInput value={inst.deferralYears} onChange={v=>updateInst(inst.id,{deferralYears:v})}/></Field>}
           </div>
-          <div className="grid grid-cols-2 gap-4 mt-3">
-            <Field label="Issuance Cost ($, base year)" hint={`Base yr: ${f.issuanceCostBaseYear||2024}. Escalated to FC.`}><NumInput value={inst.issuanceCost} onChange={v=>updateInst(inst.id,{issuanceCost:v})} prefix="$"/></Field>
-            <Field label="Issuance Cost Escalation (%/yr)"><NumInput value={inst.issuanceCostEscalation} onChange={v=>updateInst(inst.id,{issuanceCostEscalation:v})} step={0.005} suffix="%"/></Field>
-          </div>
+            {inst.repaymentStyle === 'Anticipation Note (GAN/BAN)' && (
+              <div className="col-span-4 bg-amber-500/5 border border-amber-500/30 rounded p-3 mt-1">
+                <div className="text-[10px] uppercase tracking-wider text-amber-400 mb-2">GAN/BAN Configuration</div>
+                <div className="grid grid-cols-2 gap-3">
+                  <Field label="Anticipated Grant/Bond Amount ($)" hint="The future grant or bond that will retire this note at maturity. Principal is back-calculated as PV of this amount.">
+                    <NumInput value={inst.anticipatedAmount||inst.amount} onChange={v=>updateInst(inst.id,{anticipatedAmount:v})} prefix="$"/>
+                  </Field>
+                  <div className="text-xs text-stone-400 flex items-end pb-2">
+                    Computed principal (PV) ≈ {inst.rate>0 ? `$${((inst.anticipatedAmount||inst.amount)/Math.pow(1+inst.rate/(model.general.periodsPerYear||2), Math.round((inst.tenorYears||0)*(model.general.periodsPerYear||2)))/1e6).toFixed(2)}M` : 'set rate + tenor'}
+                    . Balance grows via CapI to exactly {inst.anticipatedAmount ? `$${((inst.anticipatedAmount||0)/1e6).toFixed(2)}M` : 'anticipated amount'} at maturity — retired by arriving grant/bond.
+                  </div>
+                </div>
+              </div>
+            )}
+            {!isGrant && (
+              <div className="grid grid-cols-2 gap-4 mt-3">
+                <Field label="Issuance Cost ($, base year)" hint={`Base yr: ${f.issuanceCostBaseYear||2024}. Escalated to FC.`}><NumInput value={inst.issuanceCost} onChange={v=>updateInst(inst.id,{issuanceCost:v})} prefix="$"/></Field>
+                <Field label="Issuance Cost Escalation (%/yr)"><NumInput value={inst.issuanceCostEscalation} onChange={v=>updateInst(inst.id,{issuanceCostEscalation:v})} step={0.005} suffix="%"/></Field>
+              </div>
+            )}
           <Field label="Covenants / Notes"><TextInput value={inst.covenants} onChange={v=>updateInst(inst.id,{covenants:v})}/></Field>
           {inst.repaymentStyle === 'Phased (multi-regime)' && (()=>{
             const phases = inst.phases || [];
@@ -2076,7 +2159,8 @@ function FinancingTab({model, setModel}){
             </div>;
           })()}
           <div className="mt-2 flex justify-end"><button onClick={()=>setF({instruments:f.instruments.filter(i=>i.id!==inst.id)})} className="text-xs text-rose-400 hover:text-rose-300">Remove instrument</button></div>
-        </div>))}</div>
+        </div>);
+      })}</div>
     </Section>
   </div>;
 }
@@ -2485,161 +2569,655 @@ function DashboardTab({model, results}){
   const minSr = r.minSeniorDSCR;
   const minTot = r.totalDSCR ? Math.min(...r.totalDSCR.filter(v=>v!=null && isFinite(v))) : null;
 
-  // Excel export via SheetJS (CDN load)
+  // ── Excel export via ExcelJS (full styling + formula support) ──────────────
   const [exporting, setExporting] = useState(false);
-  const loadSheetJS = () => new Promise((resolve, reject)=>{
-    if(window.XLSX){ resolve(window.XLSX); return; }
-    const script = document.createElement('script');
-    script.src = 'https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js';
-    script.onload = ()=> resolve(window.XLSX);
-    script.onerror = ()=> reject(new Error('SheetJS CDN load failed'));
-    document.head.appendChild(script);
+
+  const loadExcelJS = () => new Promise((resolve, reject) => {
+    if(window.ExcelJS){ resolve(window.ExcelJS); return; }
+    const s = document.createElement('script');
+    s.src = 'https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js';
+    s.onload  = () => resolve(window.ExcelJS);
+    s.onerror = () => reject(new Error('ExcelJS CDN load failed'));
+    document.head.appendChild(s);
   });
+
   const exportXLSX = async () => {
     setExporting(true);
     try {
-      const XLSX = await loadSheetJS();
-      const wb = XLSX.utils.book_new();
+      const EJS = await loadExcelJS();
+      const wb  = new EJS.Workbook();
+      wb.creator = 'Toll Road PF Model';
+      wb.created = new Date();
+      wb.views = [{ x:0, y:0, width:20000, height:15000, firstSheet:0, activeTab:0, visibility:'visible' }];
 
-      // SHEET 1: ASSUMPTIONS
-      const assumptions = [
-        ['Toll Road PF Model — Assumptions Export'],
-        ['Project Name', model.general.projectName],
-        ['State', model.general.state],
-        ['Construction Months', model.general.constructionMonths],
-        ['Operations Years', model.general.operationsYears],
-        ['Concession Years', model.general.concessionYears],
-        ['Periods per Year', model.general.periodsPerYear],
-        ['Financial Close', model.general.financialCloseDate],
-        ['Service Commencement', model.general.serviceCommencementDate],
-        [],
-        ['=== REVENUE ==='],
-        ['AADT Year 1', model.revenue.aadtY1],
-        ['AADT Mature', model.revenue.aadtMature],
-        ['Mature Year', model.revenue.matureYear],
-        ['Ramp Curve', model.revenue.rampCurve],
-        ['Base Toll Rate ($)', model.revenue.baseTollRate],
-        ['Toll Escalation (%/yr)', model.revenue.tollEscalation],
-        ['Leakage (%)', model.revenue.leakage],
-        ['Truck Mix (%)', model.revenue.truckMix],
-        ['Truck Toll Multiplier', model.revenue.truckTollMultiplier],
-        [],
-        ['=== OPEX ==='],
-        ...model.opex.items.map(it => [`Opex — ${it.label}`, it.base, `escalation ${(it.escalation*100).toFixed(1)}%/yr`]),
-        [],
-        ['=== CAPEX ITEMS ==='],
-        ['Item', 'Label', 'Group', 'Base $', 'Inflation', 'Curve'],
-        ...model.capex.items.map(it => [it.id, it.label, it.group, it.base, it.inflRate, it.curve]),
-        [],
-        ['=== FINANCING INSTRUMENTS ==='],
-        ['ID', 'Type', 'Seniority', 'Style', 'Amount $', 'Rate %', 'Tenor y', 'Close', 'IO y', 'Defer y', 'Tgt DSCR', 'Issuance Cost $'],
-        ...model.financing.instruments.map(i => [i.id, i.type, i.seniority, i.repaymentStyle, i.amount, i.rate, i.tenorYears, i.closeDate, i.ioYears, i.deferralYears, i.targetDSCR, i.issuanceCost]),
-        [],
-        ['=== TIFIA CONFIG ==='],
-        ['Admin Fee Annual', model.tifia.adminFeeAnnual],
-        ['Monitoring Fee bps', model.tifia.monitoringFeeBps],
-        ['50% test years before maturity', model.tifia.fiftyPercentTestYearsBeforeMaturity],
-        ['Lockup if Sr DSCR <', model.tifia.lockupDSCR],
-        ['Lockup if LLCR <', model.tifia.lockupLLCR],
-        [],
-        ['=== CASCADE OPTIMIZER CONFIG ==='],
-        ['Target Equity IRR', model.optimizer?.cascade?.targetEquityIRR],
-        ['Equity Instrument', model.optimizer?.cascade?.equityInstrumentId],
-        ['Plug Instrument (Subsidy)', model.optimizer?.cascade?.plugInstrumentId],
-        ['CapI years', model.optimizer?.cascade?.autoTifiaParams?.deferYears],
-        ['IO years', model.optimizer?.cascade?.autoTifiaParams?.ioYears],
-        ['Test years before maturity', model.optimizer?.cascade?.autoTifiaParams?.testYearsBeforeMaturity],
-        ['Min Total DSCR', model.optimizer?.cascade?.autoTifiaParams?.minTotalDSCR],
-        ['Min Sr DSCR', model.optimizer?.cascade?.autoTifiaParams?.minSrDSCR],
-        ['Min TIFIA Eff DSCR', model.optimizer?.cascade?.autoTifiaParams?.minTifiaDSCR],
-      ];
-      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(assumptions), 'Assumptions');
+      // ── Colour palette (ARGB strings) ──
+      const C = {
+        darkBg:'FF1C1917', medBg:'FF292524', rowAlt:'FFF5F5F4',
+        amber:'FFFBBF24',  amberBg:'FFFFF8E1', amberDark:'FFF59E0B',
+        green:'FF16A34A',  greenBg:'FFF0FDF4',
+        red:'FFDC2626',    redBg:'FFFEF2F2',
+        blue:'FF3B82F6',   violet:'FFA78BFA',
+        stone:'FF78716C',  white:'FFFFFFFF',
+        border:'FFD6D3D1', borderDark:'FF78716C',
+      };
 
-      // SHEET 2: KEY OUTPUTS
-      const lastRun = model.optimizer?.lastAutoCascadeRun;
-      const outputs = [
-        ['Toll Road PF Model — Key Outputs'],
-        [],
-        ['Project IRR', r.projectIRR],
-        ['Equity IRR', r.equityIRR],
-        ['Min Senior DSCR', r.minSeniorDSCR],
-        ['Min LLCR', r.minLLCR],
-        ['TIFIA All-in Rate', r.tifiaAllInRate],
-        ['Total Uses', r.totalUses],
-        ['Total Sources', r.totalSources],
-        ['Funding Gap', r.totalUses - r.totalSources],
-        ['Issuance Costs', r.totalIssuanceCost],
-        ['TIFIA Admin+Mon Total', r.totalTifiaFees],
-        [],
-        ['=== LAST OPTIMIZER RUN ==='],
-        ['TIFIA %', lastRun?.bestPct],
-        ['TIFIA Principal', lastRun?.bestTifia],
-        ['PAB Principal', lastRun?.bestPab],
-        ['Upfront Subsidy Required', lastRun?.bestSubsidy],
-        ['Converged', lastRun?.converged],
-      ];
-      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(outputs), 'Key Outputs');
-
-      // SHEET 3: CASHFLOW
-      const cf = [['Period', 'Label', 'Toll Revenue', 'Opex', 'CFADS Gross', 'TIFIA Fees', 'CFADS for DSCR',
-        'Sr Int', 'Sr Pri', 'Sub Int', 'Sub Pri', 'ST DS', 'Total DS', 'Sr DSCR', 'Total DSCR', 'Equity CF']];
-      r.periods.forEach((p, i) => {
-        cf.push([
-          i, p.label,
-          r.revSched.byPeriod[i],
-          r.opexSched.byPeriod[i],
-          r.cfadsByPeriod[i],
-          (r.tifiaFeesPerPeriod||[])[i] || 0,
-          (r.cfadsForDscr||r.cfadsByPeriod)[i],
-          r.seniorInt[i],
-          r.seniorPri[i],
-          r.subInt[i],
-          r.subPri[i],
-          r.shortDS[i],
-          (r.seniorInt[i]||0)+(r.seniorPri[i]||0)+(r.subInt[i]||0)+(r.subPri[i]||0)+(r.shortDS[i]||0),
-          r.seniorDSCR[i],
-          r.totalDSCR[i],
-          (r.rawEquityCF||r.equityCF||[])[i],
-        ]);
+      // ── Style helpers ──
+      const hdr = (cell, txt, bg=C.darkBg, fg=C.amber, sz=11, bold=true) => {
+        cell.value = txt;
+        cell.font  = { bold, size:sz, color:{argb:fg} };
+        cell.fill  = { type:'pattern', pattern:'solid', fgColor:{argb:bg} };
+        cell.alignment = { vertical:'middle', horizontal:'left', wrapText:true };
+        cell.border = { bottom:{style:'thin', color:{argb:C.borderDark}} };
+      };
+      const colHdr = (cell, txt) => {
+        cell.value = txt;
+        cell.font  = { bold:true, size:10, color:{argb:C.white} };
+        cell.fill  = { type:'pattern', pattern:'solid', fgColor:{argb:C.medBg} };
+        cell.alignment = { vertical:'middle', horizontal:'right', wrapText:true };
+        cell.border = { bottom:{style:'medium', color:{argb:C.amber}},
+                        right:{style:'thin', color:{argb:C.border}} };
+      };
+      const rowHdr = (cell, txt, indent=0) => {
+        cell.value = '  '.repeat(indent) + txt;
+        cell.font  = { size:10, color:{argb:C.medBg.replace('FF','FF4A4A4A')||'FF404040'} };
+        cell.alignment = { vertical:'middle', horizontal:'left' };
+      };
+      const money = (cell, val, formula=null) => {
+        cell.value = formula ? {formula, result:val} : val;
+        cell.numFmt = '$#,##0';
+        cell.font = { size:10 };
+        cell.alignment = { horizontal:'right' };
+      };
+      const moneyM = (cell, val, formula=null) => {
+        cell.value = formula ? {formula, result:val} : val;
+        cell.numFmt = '"$"#,##0.00,"M"';
+        cell.font = { size:10 };
+        cell.alignment = { horizontal:'right' };
+      };
+      const pct = (cell, val) => {
+        cell.value = val;
+        cell.numFmt = '0.00%';
+        cell.font = { size:10 };
+        cell.alignment = { horizontal:'right' };
+      };
+      const ratio = (cell, val, formula=null) => {
+        cell.value = formula ? {formula, result:val??''} : (val??'');
+        cell.numFmt = '0.00"x"';
+        cell.font = { size:10 };
+        cell.alignment = { horizontal:'right' };
+      };
+      const setBorder = (cell) => {
+        cell.border = { top:{style:'thin',color:{argb:C.border}},
+          left:{style:'thin',color:{argb:C.border}},
+          bottom:{style:'thin',color:{argb:C.border}},
+          right:{style:'thin',color:{argb:C.border}} };
+      };
+      const setRowFill = (row, argb) => row.eachCell(c => {
+        c.fill = {type:'pattern', pattern:'solid', fgColor:{argb}};
       });
-      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(cf), 'Cashflow');
+      const sectionHdr = (ws, rowNum, txt) => {
+        const row = ws.getRow(rowNum);
+        const cell = row.getCell(1);
+        cell.value = txt;
+        cell.font = {bold:true, size:11, color:{argb:C.amber}};
+        cell.fill = {type:'pattern', pattern:'solid', fgColor:{argb:C.medBg}};
+        cell.alignment = {vertical:'middle'};
+        row.height = 20;
+        return rowNum + 1;
+      };
+      const addKV = (ws, rn, label, val, fmt='text', formula=null) => {
+        const r = ws.getRow(rn);
+        const lc = r.getCell(1); lc.value = label;
+        lc.font = {size:10}; lc.alignment = {horizontal:'left'};
+        const vc = r.getCell(2);
+        if(fmt==='money')       money(vc, val, formula);
+        else if(fmt==='moneyM') moneyM(vc, val, formula);
+        else if(fmt==='pct')    pct(vc, val);
+        else if(fmt==='ratio')  ratio(vc, val, formula);
+        else { vc.value = val; vc.font={size:10}; vc.alignment={horizontal:'right'}; }
+        r.eachCell(c => setBorder(c));
+        return rn + 1;
+      };
 
-      // SHEET 4: SOURCES & USES
-      const su = [
-        ['SOURCES OF FUNDS'],
-        ['Instrument', 'Type', 'Seniority', 'Amount', '% of Sources'],
-        ...model.financing.instruments.map(i => [i.id, i.type, i.seniority, i.amount, i.amount / Math.max(1, r.totalSources)]),
-        ['TOTAL SOURCES', '', '', r.totalSources],
-        [],
-        ['USES OF FUNDS'],
-        ['Category', 'Amount', '% of Uses'],
-        ['Nominal Capex', r.capexSched.totalNominal, r.capexSched.totalNominal / Math.max(1, r.totalUses)],
-        ['Non-TIFIA IDC', r.nonTIFIAIDC, r.nonTIFIAIDC / Math.max(1, r.totalUses)],
-        ['TIFIA Capitalized Interest', r.tifiaConstr?.capitalizedInterestTotal || 0, (r.tifiaConstr?.capitalizedInterestTotal || 0) / Math.max(1, r.totalUses)],
-        ['Financing Fees', r.financingFees, r.financingFees / Math.max(1, r.totalUses)],
-        ['Issuance Costs (escalated)', r.totalIssuanceCost, r.totalIssuanceCost / Math.max(1, r.totalUses)],
-        ['TOTAL USES', r.totalUses],
-        [],
-        ['FUNDING GAP', r.totalUses - r.totalSources],
+      const lastRun = model.optimizer?.lastAutoCascadeRun || {};
+
+      // ════════════════════════════════════════
+      // SHEET 1 — COVER
+      // ════════════════════════════════════════
+      const wsCover = wb.addWorksheet('Cover', {
+        views:[{showGridLines:false}],
+        pageSetup:{paperSize:9, orientation:'portrait'}
+      });
+      wsCover.columns = [{width:30},{width:22},{width:22},{width:22},{width:22}];
+      // Title block
+      wsCover.mergeCells('A1:E1');
+      const titleCell = wsCover.getCell('A1');
+      titleCell.value = 'TOLL ROAD PROJECT FINANCE MODEL';
+      titleCell.font = {bold:true, size:20, color:{argb:C.amber}};
+      titleCell.fill = {type:'pattern', pattern:'solid', fgColor:{argb:C.darkBg}};
+      titleCell.alignment = {vertical:'middle', horizontal:'center'};
+      wsCover.getRow(1).height = 42;
+
+      wsCover.mergeCells('A2:E2');
+      const subTitle = wsCover.getCell('A2');
+      subTitle.value = `${model.general.projectName || 'I-XXX Express Lanes'}  ·  ${model.general.state || 'TX'}  ·  ${new Date().toLocaleDateString('en-US',{year:'numeric',month:'long',day:'numeric'})}`;
+      subTitle.font = {size:12, color:{argb:'FFA8A29E'}};
+      subTitle.fill = {type:'pattern', pattern:'solid', fgColor:{argb:C.darkBg}};
+      subTitle.alignment = {horizontal:'center', vertical:'middle'};
+      wsCover.getRow(2).height = 24;
+
+      // Key metrics cards
+      const metrics = [
+        ['Upfront Subsidy Required', lastRun.bestSubsidy, 'money', C.amberBg, C.amberDark],
+        ['TIFIA Sized',              lastRun.bestTifia,   'money', 'FFF3F4F6', C.medBg],
+        ['PAB Sized',                lastRun.bestPab,     'money', 'FFF3F4F6', C.medBg],
+        ['Equity IRR (Target)',      model.optimizer?.cascade?.targetEquityIRR, 'pct', C.greenBg, C.green],
+        ['Min Total DSCR',           r.totalDSCR ? Math.min(...r.totalDSCR.filter(v=>v&&isFinite(v))) : null, 'ratio', 'FFF3F4F6', C.medBg],
+        ['TIFIA All-in Rate',        r.tifiaAllInRate, 'pct', 'FFF3F4F6', C.medBg],
+        ['Total Uses',               r.totalUses, 'money', 'FFF3F4F6', C.medBg],
+        ['Concession Period',        `${model.general.concessionYears}y`, 'text', 'FFF3F4F6', C.medBg],
+        ['Operations Period',        `${model.general.operationsYears}y`, 'text', 'FFF3F4F6', C.medBg],
+        ['Periods per Year',         model.general.periodsPerYear === 2 ? 'Semi-Annual' : 'Annual', 'text', 'FFF3F4F6', C.medBg],
       ];
-      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(su), 'Sources & Uses');
+      let mRow = 4;
+      metrics.forEach(([label, val, fmt, bg, fg]) => {
+        if(!val && val !== 0) return;
+        const r2 = wsCover.getRow(mRow);
+        const lc = r2.getCell(1);
+        lc.value = label;
+        lc.font = {size:11, color:{argb:'FF374151'}};
+        lc.fill = {type:'pattern', pattern:'solid', fgColor:{argb:bg}};
+        lc.alignment = {vertical:'middle', indent:1};
+        const vc = r2.getCell(2);
+        vc.fill = {type:'pattern', pattern:'solid', fgColor:{argb:bg}};
+        if(fmt==='money'){ money(vc,val); vc.font={size:12,bold:true,color:{argb:'FF'+fg.replace('FF','')}}; }
+        else if(fmt==='pct'){ pct(vc,val); vc.font={size:12,bold:true,color:{argb:fg}}; }
+        else if(fmt==='ratio'){ ratio(vc,val); vc.font={size:12,bold:true,color:{argb:fg}}; }
+        else { vc.value=val; vc.font={size:12,bold:true,color:{argb:fg}}; vc.alignment={horizontal:'right'}; }
+        r2.height = 26;
+        [1,2].forEach(c => { r2.getCell(c).border = {bottom:{style:'thin',color:{argb:C.border}}}; });
+        mRow++;
+      });
 
-      // SHEET 5: TIFIA SCHEDULE
-      const tifiaSched = r.debtSchedules?.[model.optimizer?.cascade?.tifiaInstrumentId || 'tifia1'];
-      if(tifiaSched){
-        const tfRows = [['Period', 'Label', 'Interest', 'Principal', 'Balance']];
-        r.periods.forEach((p, i) => tfRows.push([i, p.label, tifiaSched.interest[i], tifiaSched.principal[i], tifiaSched.balance[i]]));
-        XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(tfRows), 'TIFIA Schedule');
+      // Sheet index
+      mRow += 2;
+      sectionHdr(wsCover, mRow++, 'Workbook Contents');
+      [['Assumptions','All model inputs — General, Revenue, Opex, Capex, Financing'],
+       ['Sources & Uses','Construction draw schedule by period + S&U summary'],
+       ['Cashflow','Full operating period cashflow with DSCR formulas'],
+       ['TIFIA Schedule','TIFIA amortization table — opening/closing balance + cap interest'],
+       ['Outputs','Optimizer results — TIFIA sizing, equity IRR, upfront subsidy'],
+      ].forEach(([sheet, desc]) => {
+        const r2 = wsCover.getRow(mRow++);
+        const nc = r2.getCell(1);
+        nc.value = sheet;
+        nc.font = {bold:true, size:10, color:{argb:C.blue}, underline:true};
+        const dc = r2.getCell(2);
+        dc.value = desc;
+        dc.font = {size:10, color:{argb:C.stone}};
+        r2.height = 18;
+      });
+
+      // ════════════════════════════════════════
+      // SHEET 2 — ASSUMPTIONS
+      // ════════════════════════════════════════
+      const wsAsm = wb.addWorksheet('Assumptions', {views:[{showGridLines:false}]});
+      wsAsm.columns = [{width:38},{width:20},{width:20},{width:14}];
+      let aRow = 1;
+      const A = (label, val, fmt='text') => { aRow = addKV(wsAsm, aRow, label, val, fmt); };
+
+      aRow = sectionHdr(wsAsm, aRow, '▸  GENERAL');
+      A('Project Name', model.general.projectName||'');
+      A('State', model.general.state||'');
+      A('Financial Close Date', model.general.financialCloseDate||'');
+      A('Construction Months', model.general.constructionMonths);
+      A('Operations Years', model.general.operationsYears);
+      A('Concession Years', model.general.concessionYears);
+      A('Periods per Year', model.general.periodsPerYear);
+      aRow++;
+
+      aRow = sectionHdr(wsAsm, aRow, '▸  REVENUE');
+      A('AADT Year 1', model.revenue.aadtY1);
+      A('AADT Mature', model.revenue.aadtMature);
+      A('Year at Mature Traffic', model.revenue.matureYear);
+      A('Ramp Curve Type', model.revenue.rampCurve||'S-curve');
+      A('Base Toll Rate ($/vehicle)', model.revenue.baseTollRate);
+      A('Toll Escalation (%/yr)', model.revenue.tollEscalation, 'pct');
+      A('Leakage (%)', model.revenue.leakage||0, 'pct');
+      A('Truck Mix (%)', model.revenue.truckMix||0, 'pct');
+      A('Truck Toll Multiplier', model.revenue.truckTollMultiplier||1);
+      aRow++;
+
+      aRow = sectionHdr(wsAsm, aRow, '▸  OPEX');
+      (model.opex.items||[]).forEach(it => {
+        A(`${it.label||it.id} (base $/period)`, it.base, 'money');
+        A(`  Escalation (%/yr)`, it.escalation||0, 'pct');
+      });
+      aRow++;
+
+      aRow = sectionHdr(wsAsm, aRow, '▸  CAPEX (BASE $, THEN INFLATED)');
+      (model.capex.items||[]).forEach(it => {
+        A(`${it.label||it.id}`, it.base, 'money');
+        A(`  Inflation (%/yr)`, it.inflRate||0, 'pct');
+        A(`  Drawdown Curve`, it.curve||'');
+      });
+      aRow++;
+
+      aRow = sectionHdr(wsAsm, aRow, '▸  FINANCING INSTRUMENTS');
+      model.financing.instruments.forEach(inst => {
+        const r2 = wsAsm.getRow(aRow++);
+        const c1 = r2.getCell(1); c1.value = `${inst.type} (${inst.id})`;
+        c1.font = {bold:true, size:10, color:{argb:C.amberDark}};
+        c1.fill = {type:'pattern', pattern:'solid', fgColor:{argb:C.medBg}};
+        A('  Amount', inst.amount, 'money');
+        A('  Rate (%/yr)', inst.rate||0, 'pct');
+        A('  Tenor (yrs)', inst.tenorYears||0);
+        A('  Seniority', inst.seniority||'');
+        A('  Repayment Style', inst.repaymentStyle||'');
+        A('  Drawdown Priority', inst.drawdownPriority||'');
+        A('  Issuance Cost ($)', inst.issuanceCost||0, 'money');
+        aRow++;
+      });
+      aRow++;
+
+      aRow = sectionHdr(wsAsm, aRow, '▸  TIFIA CONFIG');
+      A('TIFIA Admin Fee ($/yr)', model.tifia?.adminFeeAnnual||0, 'money');
+      A('Monitoring Fee (bps)', model.tifia?.monitoringFeeBps||0);
+      A('50% Test Years Before Maturity', model.tifia?.fiftyPercentTestYearsBeforeMaturity||10);
+      A('Lockup Sr DSCR Trigger', model.tifia?.lockupDSCR||1.20);
+      A('Enforce 50% Test', model.tifia?.enforce50PctTest ? 'Yes' : 'No');
+      aRow++;
+
+      aRow = sectionHdr(wsAsm, aRow, '▸  CASCADE OPTIMIZER INPUTS');
+      A('Target Equity IRR', model.optimizer?.cascade?.targetEquityIRR||0.12, 'pct');
+      A('Min Total DSCR', model.optimizer?.cascade?.autoTifiaParams?.minTotalDSCR||1.10, 'ratio');
+      A('Min Senior DSCR', model.optimizer?.cascade?.autoTifiaParams?.minSrDSCR||1.30, 'ratio');
+      A('Min TIFIA Eff DSCR', model.optimizer?.cascade?.autoTifiaParams?.minTifiaDSCR||1.10, 'ratio');
+      A('Max TIFIA % (cap)', model.optimizer?.cascade?.autoTifiaParams?.maxTifiaPct||0.49, 'pct');
+      A('TIFIA CapI Years', model.optimizer?.cascade?.autoTifiaParams?.deferYears||5);
+      A('TIFIA IO Years', model.optimizer?.cascade?.autoTifiaParams?.ioYears||5);
+      A('Test Years Before Maturity', model.optimizer?.cascade?.autoTifiaParams?.testYearsBeforeMaturity||10);
+
+      // Freeze first row, auto-filter
+      wsAsm.views = [{state:'frozen', xSplit:0, ySplit:1, showGridLines:false}];
+
+      // ════════════════════════════════════════
+      // SHEET 3 — SOURCES & USES
+      // ════════════════════════════════════════
+      const wsSU = wb.addWorksheet('Sources & Uses', {views:[{showGridLines:false}]});
+      wsSU.columns = [{width:36},{width:16},{width:12},...Array(12).fill({width:14})];
+      let sRow = 1;
+
+      sRow = sectionHdr(wsSU, sRow, '▸  SOURCES OF FUNDS');
+      const suColHdrs = ['Instrument','Type','Seniority','Amount ($)','% of Sources'];
+      suColHdrs.forEach((h,c) => colHdr(wsSU.getRow(sRow).getCell(c+1), h));
+      const suHdrRow = sRow;
+      sRow++;
+
+      const sourceRows = {};
+      model.financing.instruments.forEach((inst, idx) => {
+        const row = wsSU.getRow(sRow);
+        row.getCell(1).value = inst.id; row.getCell(1).font = {size:10};
+        row.getCell(2).value = inst.type; row.getCell(2).font = {size:10};
+        row.getCell(3).value = inst.seniority; row.getCell(3).font = {size:10};
+        money(row.getCell(4), inst.amount);
+        sourceRows[inst.id] = sRow;
+        row.eachCell(c => { c.border = {bottom:{style:'thin',color:{argb:C.border}}, right:{style:'thin',color:{argb:C.border}}}; });
+        // % formula references the instrument amount cell and a total cell (added later)
+        const pctCell = row.getCell(5);
+        pctCell.value = {formula: `=D${sRow}/D${sRow + model.financing.instruments.length - idx}`, result: inst.amount / Math.max(1, r.totalSources)};
+        pctCell.numFmt = '0.0%'; pctCell.font = {size:10}; pctCell.alignment = {horizontal:'right'};
+        if(idx % 2 === 1) setRowFill(row, C.rowAlt);
+        sRow++;
+      });
+      // Total Sources row
+      const totalSrcRow = wsSU.getRow(sRow);
+      totalSrcRow.getCell(1).value = 'TOTAL SOURCES';
+      totalSrcRow.getCell(1).font = {bold:true, size:11, color:{argb:C.white}};
+      totalSrcRow.getCell(4).value = {formula: `=SUM(D${suHdrRow+1}:D${sRow-1})`, result: r.totalSources};
+      totalSrcRow.getCell(4).numFmt = '$#,##0'; totalSrcRow.getCell(4).font = {bold:true, size:11, color:{argb:C.amber}};
+      setRowFill(totalSrcRow, C.medBg);
+      totalSrcRow.height = 20;
+      sRow += 2;
+
+      // Update % formulas now we know total row
+      model.financing.instruments.forEach((inst, idx) => {
+        const pctCell = wsSU.getRow(sourceRows[inst.id]).getCell(5);
+        pctCell.value = {formula: `=D${sourceRows[inst.id]}/D${sRow-2}`, result: inst.amount / Math.max(1, r.totalSources)};
+      });
+
+      sRow = sectionHdr(wsSU, sRow, '▸  USES OF FUNDS');
+      colHdr(wsSU.getRow(sRow).getCell(1), 'Category');
+      colHdr(wsSU.getRow(sRow).getCell(2), 'Amount ($)');
+      colHdr(wsSU.getRow(sRow).getCell(3), '% of Uses');
+      sRow++;
+      const usesData = [
+        ['Nominal Capex (inflation-inclusive)', r.capexSched.totalNominal],
+        ['Non-TIFIA IDC', r.nonTIFIAIDC],
+        ['TIFIA Capitalised Interest', r.tifiaConstr?.capitalizedInterestTotal||0],
+        ['Financing Fees (% of debt)', r.financingFees],
+        ['Issuance Costs (escalated to FC)', r.totalIssuanceCost],
+      ];
+      const usesStartRow = sRow;
+      usesData.forEach(([label, val], i) => {
+        const row = wsSU.getRow(sRow);
+        row.getCell(1).value = label; row.getCell(1).font = {size:10};
+        money(row.getCell(2), val);
+        row.getCell(3).value = {formula:`=B${sRow}/B${usesStartRow+usesData.length}`, result: val/Math.max(1,r.totalUses)};
+        row.getCell(3).numFmt = '0.0%'; row.getCell(3).font = {size:10}; row.getCell(3).alignment = {horizontal:'right'};
+        row.eachCell(c => setBorder(c));
+        if(i%2===1) setRowFill(row, C.rowAlt);
+        sRow++;
+      });
+      const usesTotalRow = wsSU.getRow(sRow);
+      usesTotalRow.getCell(1).value = 'TOTAL USES';
+      usesTotalRow.getCell(1).font = {bold:true, size:11, color:{argb:C.white}};
+      usesTotalRow.getCell(2).value = {formula:`=SUM(B${usesStartRow}:B${sRow-1})`, result:r.totalUses};
+      usesTotalRow.getCell(2).numFmt = '$#,##0'; usesTotalRow.getCell(2).font = {bold:true,size:11,color:{argb:C.amber}};
+      setRowFill(usesTotalRow, C.medBg);
+      usesTotalRow.height = 20;
+      sRow++;
+      const gapRow = wsSU.getRow(sRow);
+      gapRow.getCell(1).value = 'Funding Gap  (Uses − Sources)';
+      gapRow.getCell(1).font = {size:10, italic:true};
+      const gapVal = r.totalUses - r.totalSources;
+      gapRow.getCell(2).value = {formula:`=B${sRow-1}-D${suHdrRow + model.financing.instruments.length + 1}`, result:gapVal};
+      gapRow.getCell(2).numFmt = '$#,##0';
+      gapRow.getCell(2).font = {bold:true, size:11, color:{argb: Math.abs(gapVal)<1e6 ? C.green : C.red}};
+      sRow += 2;
+
+      // Construction draw schedule
+      const cm = model.general.constructionMonths;
+      const ppy2 = model.general.periodsPerYear;
+      const mpp = 12/ppy2;
+      const numBkts = Math.ceil(cm/mpp);
+      sRow = sectionHdr(wsSU, sRow, '▸  CONSTRUCTION DRAW SCHEDULE (semi-annual)');
+      // Header row
+      const drHdrRow = wsSU.getRow(sRow++);
+      colHdr(drHdrRow.getCell(1), 'Source');
+      for(let b=0; b<numBkts; b++){
+        const ms = Math.round(b*mpp)+1, me = Math.min(cm, Math.round((b+1)*mpp));
+        colHdr(drHdrRow.getCell(b+2), `M${ms}–${me}`);
+      }
+      colHdr(drHdrRow.getCell(numBkts+2), 'TOTAL');
+      // Data rows
+      const drInsts = [...model.financing.instruments, {id:'_paygo', type:'Paygo / Availability'}];
+      drInsts.forEach((inst, ii) => {
+        const draws = inst.id === '_paygo' ? null : (r.drawsByInst||{})[inst.id];
+        const paygoMo = r.paygoSched?.monthly||[];
+        const bktVals = Array.from({length:numBkts}, (_,b) => {
+          const ms=Math.round(b*mpp), me=Math.min(cm,Math.round((b+1)*mpp));
+          let v=0; for(let m=ms;m<me;m++) v+= inst.id==='_paygo' ? (paygoMo[m]||0) : (draws?.[m]||0);
+          return v;
+        });
+        if(bktVals.every(v=>v===0)) return;
+        const row = wsSU.getRow(sRow);
+        row.getCell(1).value = inst.type; row.getCell(1).font={size:10};
+        bktVals.forEach((v,b) => { money(row.getCell(b+2), v); });
+        // Total formula
+        row.getCell(numBkts+2).value = {formula:`=SUM(B${sRow}:${String.fromCharCode(65+numBkts)}${sRow})`, result:bktVals.reduce((a,b)=>a+b,0)};
+        row.getCell(numBkts+2).numFmt = '$#,##0';
+        row.getCell(numBkts+2).font = {bold:true, size:10, color:{argb:C.amberDark}};
+        if(ii%2===1) setRowFill(row, C.rowAlt);
+        row.eachCell(c => setBorder(c));
+        sRow++;
+      });
+      // Capex uses row
+      const capexRow = wsSU.getRow(sRow);
+      capexRow.getCell(1).value = '— Capex Uses —';
+      capexRow.getCell(1).font = {bold:true, size:10, color:{argb:C.white}};
+      let capexTotal = 0;
+      for(let b=0; b<numBkts; b++){
+        const ms=Math.round(b*mpp), me=Math.min(cm,Math.round((b+1)*mpp));
+        let v=0; for(let m=ms;m<me;m++) v+=r.capexSched.monthly[m]||0;
+        money(capexRow.getCell(b+2), v);
+        capexRow.getCell(b+2).font = {bold:true, size:10, color:{argb:C.amber}};
+        capexTotal += v;
+      }
+      capexRow.getCell(numBkts+2).value = {formula:`=SUM(B${sRow}:${String.fromCharCode(65+numBkts)}${sRow})`, result:capexTotal};
+      capexRow.getCell(numBkts+2).numFmt = '$#,##0'; capexRow.getCell(numBkts+2).font={bold:true, color:{argb:C.amber}};
+      setRowFill(capexRow, C.darkBg); capexRow.height = 20;
+
+      wsSU.views = [{state:'frozen', xSplit:1, ySplit:0, showGridLines:false}];
+
+      // ════════════════════════════════════════
+      // SHEET 4 — CASHFLOW (formula-driven DSCR)
+      // ════════════════════════════════════════
+      const wsCF = wb.addWorksheet('Cashflow', {views:[{showGridLines:false}]});
+      wsCF.columns = [
+        {width:22},{width:16}, // period, date
+        {width:14},{width:14},{width:14},{width:14},{width:14}, // rev, opex, cfads, tifia fees, cfads_dscr
+        {width:12},{width:12},{width:12}, // sr int, sr pri, sr ds
+        {width:12},{width:12},{width:12}, // sub int, sub pri, sub ds
+        {width:12},{width:12}, // total ds, ST DS
+        {width:10},{width:10}, // sr dscr, total dscr
+        {width:14}, // equity CF
+      ];
+      const cfCols = ['Period','Date','Revenue','Opex','CFADS (Gross)','TIFIA Fees',
+        'CFADS for DSCR','Sr Int','Sr Pri','Sr DS','Sub Int','Sub Pri','Sub DS',
+        'Total DS','Short-term DS','Sr DSCR','Total DSCR','Equity CF'];
+      const cfHdrRow = wsCF.getRow(1);
+      cfCols.forEach((h,c) => colHdr(cfHdrRow.getCell(c+1), h));
+      cfHdrRow.height = 28;
+      wsCF.views = [{state:'frozen', xSplit:2, ySplit:1, showGridLines:false}];
+
+      const cfStartRow = 2;
+      r.periods.forEach((p, i) => {
+        const ri = cfStartRow + i;
+        const row = wsCF.getRow(ri);
+        row.height = 16;
+        // Cols A-B: label/date
+        row.getCell(1).value = p.label; row.getCell(1).font={size:9};
+        row.getCell(2).value = p.startDate ? new Date(p.startDate) : ''; row.getCell(2).numFmt='MMM-YY'; row.getCell(2).font={size:9};
+        // C: Revenue
+        moneyM(row.getCell(3), r.revSched.byPeriod[i]);
+        // D: Opex
+        moneyM(row.getCell(4), r.opexSched.byPeriod[i]);
+        // E: CFADS = Revenue - Opex (formula)
+        moneyM(row.getCell(5), (r.revSched.byPeriod[i]||0)-(r.opexSched.byPeriod[i]||0),
+          `=C${ri}-D${ri}`);
+        row.getCell(5).font = {bold:true, size:9};
+        // F: TIFIA Fees
+        moneyM(row.getCell(6), (r.tifiaFeesPerPeriod||[])[i]||0);
+        // G: CFADS for DSCR = CFADS - TIFIA Fees (formula)
+        moneyM(row.getCell(7), (r.cfadsForDscr||r.cfadsByPeriod||[])[i]||0, `=E${ri}-F${ri}`);
+        row.getCell(7).font = {bold:true, size:9};
+        // H,I: Sr Int, Sr Pri
+        moneyM(row.getCell(8), r.seniorInt[i]||0);
+        moneyM(row.getCell(9), r.seniorPri[i]||0);
+        // J: Sr DS (formula)
+        moneyM(row.getCell(10), (r.seniorInt[i]||0)+(r.seniorPri[i]||0), `=H${ri}+I${ri}`);
+        // K,L: Sub Int, Sub Pri
+        moneyM(row.getCell(11), r.subInt[i]||0);
+        moneyM(row.getCell(12), r.subPri[i]||0);
+        // M: Sub DS (formula)
+        moneyM(row.getCell(13), (r.subInt[i]||0)+(r.subPri[i]||0), `=K${ri}+L${ri}`);
+        // N: Total DS (formula)
+        moneyM(row.getCell(14), (r.seniorInt[i]||0)+(r.seniorPri[i]||0)+(r.subInt[i]||0)+(r.subPri[i]||0), `=J${ri}+M${ri}`);
+        // O: ST DS
+        moneyM(row.getCell(15), r.shortDS[i]||0);
+        // P: Sr DSCR (formula)
+        const srDs = (r.seniorInt[i]||0)+(r.seniorPri[i]||0);
+        ratio(row.getCell(16), srDs>0 ? (r.cfadsForDscr||r.cfadsByPeriod||[])[i]/srDs : null,
+          `=IF(J${ri}=0,"—",G${ri}/J${ri})`);
+        row.getCell(16).font = {size:9, bold:true, color:{argb: srDs>0 && (r.seniorDSCR?.[i]||0)>=1.20 ? C.green : C.red}};
+        // Q: Total DSCR (formula)
+        const totDs = srDs + (r.subInt[i]||0)+(r.subPri[i]||0);
+        ratio(row.getCell(17), totDs>0 ? (r.cfadsForDscr||r.cfadsByPeriod||[])[i]/totDs : null,
+          `=IF(N${ri}=0,"—",G${ri}/N${ri})`);
+        row.getCell(17).font = {size:9, bold:true, color:{argb: totDs>0 && (r.totalDSCR?.[i]||0)>=1.10 ? C.green : C.red}};
+        // R: Equity CF (formula)
+        moneyM(row.getCell(18), ((r.rawEquityCF||r.equityCF||[])[i]||0), `=G${ri}-N${ri}-O${ri}`);
+        // Alternating row fill
+        if(i%2===1) setRowFill(row, C.rowAlt);
+        row.eachCell(c => setBorder(c));
+      });
+
+      // ════════════════════════════════════════
+      // SHEET 5 — TIFIA SCHEDULE (formula-driven balance)
+      // ════════════════════════════════════════
+      const wsTIFIA = wb.addWorksheet('TIFIA Schedule', {views:[{showGridLines:false}]});
+      wsTIFIA.columns = [
+        {width:22},{width:10},{width:14},{width:16},
+        {width:14},{width:14},{width:14},{width:14},{width:14},{width:16}
+      ];
+      const tifiaInstObj = model.financing.instruments.find(i=>i.id===(model.tifia?.instrumentId||'tifia1'));
+      const tSched = r.debtSchedules?.[model.tifia?.instrumentId||'tifia1'];
+      const tConstr = r.tifiaConstr;
+
+      const tiHdrs = ['Period','Phase','Opening Balance','Drawdown','Interest Due',
+        'Capitalised Int','Interest Paid','Principal Repaid','Closing Balance','Check'];
+      const tiHdrRow = wsTIFIA.getRow(1);
+      tiHdrs.forEach((h,c) => colHdr(tiHdrRow.getCell(c+1), h));
+      tiHdrRow.height = 28;
+      wsTIFIA.views = [{state:'frozen', xSplit:2, ySplit:1, showGridLines:false}];
+
+      const tifc = model.general.financialCloseDate||'2026-07-01';
+      const addMonths2 = (ds, n) => { const d=new Date(ds); d.setMonth(d.getMonth()+Math.round(n)); return d; };
+      const tifPhases = tifiaInstObj?.phases||[];
+      const getPhase = (idx) => { for(const ph of tifPhases) if(idx<ph.endPeriod) return ph.regime; return 'level'; };
+
+      let tiRow = 2;
+      // Construction rows (semi-annual buckets)
+      const tiMpp = 12/ppy2;
+      const tiNumBkts = Math.ceil(cm/tiMpp);
+      for(let b=0; b<tiNumBkts; b++){
+        const ms=Math.round(b*tiMpp), me=Math.min(cm,Math.round((b+1)*tiMpp));
+        const openBal = ms===0 ? 0 : (tConstr?.monthlyBalance?.[ms-1]||0);
+        let draws=0, intDue=0;
+        for(let m=ms;m<me;m++){ draws+=tConstr?.monthlyDraws?.[m]||0; intDue+=tConstr?.monthlyInterest?.[m]||0; }
+        const closeBal = tConstr?.monthlyBalance?.[me-1]||0;
+        const row = wsTIFIA.getRow(tiRow);
+        row.getCell(1).value = `${addMonths2(tifc,ms).toLocaleDateString('en-US',{month:'short',year:'numeric'})} – ${addMonths2(tifc,me).toLocaleDateString('en-US',{month:'short',year:'numeric'})}`;
+        row.getCell(1).font = {size:9};
+        row.getCell(2).value = 'Constr'; row.getCell(2).font={size:9,color:{argb:C.stone}};
+        money(row.getCell(3), openBal);
+        money(row.getCell(4), draws); row.getCell(4).font={size:9,color:{argb:C.green}};
+        money(row.getCell(5), intDue);
+        money(row.getCell(6), intDue); row.getCell(6).font={size:9,color:{argb:'FF3B82F6'}};
+        money(row.getCell(7), 0);
+        money(row.getCell(8), 0);
+        // Closing balance formula: =Opening + Draw + CapInt - IntPaid - Principal
+        money(row.getCell(9), closeBal, `=C${tiRow}+D${tiRow}+F${tiRow}-G${tiRow}-H${tiRow}`);
+        row.getCell(9).font={size:9,bold:true,color:{argb:'FF3B82F6'}};
+        // Check formula: should be 0
+        row.getCell(10).value = {formula:`=I${tiRow}-${closeBal}`, result:0};
+        row.getCell(10).numFmt='$#,##0'; row.getCell(10).font={size:8,color:{argb:C.stone}};
+        if(b%2===1) setRowFill(row, C.rowAlt);
+        row.eachCell(c => setBorder(c));
+        tiRow++;
       }
 
-      const filename = `TollRoad_${(model.general.projectName||'model').replace(/[^a-z0-9]/gi,'_')}_${new Date().toISOString().slice(0,10)}.xlsx`;
-      XLSX.writeFile(wb, filename);
+      // Ops rows
+      const scdDate = model.general.serviceCommencementDate || addMonths2(tifc,cm).toISOString().slice(0,10);
+      if(tSched){
+        tSched.interest.forEach((_, i) => {
+          const regime = getPhase(i);
+          const openBal = i===0 ? (tConstr?.finalBalance||0) : tSched.balance[i-1];
+          const intDue = regime==='defer' ? openBal*(tifiaInstObj?.rate||0.041)/ppy2 : tSched.interest[i];
+          const capInt = regime==='defer' ? intDue : 0;
+          const intPaid = regime==='defer' ? 0 : tSched.interest[i];
+          const principal = tSched.principal[i]||0;
+          const closeBal = tSched.balance[i];
+          const tStart = addMonths2(scdDate, i*tiMpp);
+          const tEnd   = addMonths2(scdDate, (i+1)*tiMpp);
+
+          const row = wsTIFIA.getRow(tiRow);
+          row.getCell(1).value = `${tStart.toLocaleDateString('en-US',{month:'short',year:'numeric'})} – ${tEnd.toLocaleDateString('en-US',{month:'short',year:'numeric'})}`;
+          row.getCell(1).font={size:9};
+          const phaseColors = {defer:'FF3B82F6',io:'FFF59E0B',level:'FF16A34A',sculpt:'FFA78BFA',Construction:C.stone};
+          row.getCell(2).value = regime; row.getCell(2).font={size:9,color:{argb:phaseColors[regime]||C.stone},bold:true};
+          money(row.getCell(3), openBal);
+          money(row.getCell(4), 0); // no draws in ops
+          money(row.getCell(5), intDue);
+          money(row.getCell(6), capInt); if(capInt>0) row.getCell(6).font={size:9,color:{argb:'FF3B82F6'}};
+          money(row.getCell(7), intPaid); if(intPaid>0) row.getCell(7).font={size:9,color:{argb:C.amberDark}};
+          money(row.getCell(8), principal); if(principal>0) row.getCell(8).font={size:9,color:{argb:C.red}};
+          // Closing balance formula
+          money(row.getCell(9), closeBal, `=C${tiRow}+D${tiRow}+F${tiRow}-G${tiRow}-H${tiRow}`);
+          row.getCell(9).font={size:9,bold:true,color:{argb:closeBal>openBal?'FF3B82F6':'FF16A34A'}};
+          // Check
+          row.getCell(10).value={formula:`=I${tiRow}-${closeBal}`,result:0};
+          row.getCell(10).numFmt='$#,##0'; row.getCell(10).font={size:8,color:{argb:C.stone}};
+
+          if(i%2===1) setRowFill(row, C.rowAlt);
+          row.eachCell(c => setBorder(c));
+          tiRow++;
+        });
+      }
+
+      // ════════════════════════════════════════
+      // SHEET 6 — OUTPUTS
+      // ════════════════════════════════════════
+      const wsOut = wb.addWorksheet('Outputs', {views:[{showGridLines:false}]});
+      wsOut.columns = [{width:36},{width:22},{width:22}];
+      let oRow = 1;
+      const O = (label, val, fmt='text') => { oRow = addKV(wsOut, oRow, label, val, fmt); };
+
+      oRow = sectionHdr(wsOut, oRow, '▸  OPTIMIZER RESULT  (last cascade run)');
+      O('TIFIA Sized (%)', lastRun.bestPct||0, 'pct');
+      O('TIFIA Sized ($)', lastRun.bestTifia||0, 'money');
+      O('PAB Sized ($)', lastRun.bestPab||0, 'money');
+      O('Equity Sized ($)', 0, 'money'); // will be overwritten with actual
+      O('Target Equity IRR', model.optimizer?.cascade?.targetEquityIRR||0.12, 'pct');
+      O('Actual Equity IRR', r.equityIRR||0, 'pct');
+      // Highlight subsidy
+      oRow++;
+      const subRow = wsOut.getRow(oRow);
+      wsOut.mergeCells(`A${oRow}:B${oRow}`);
+      subRow.getCell(1).value = '★  UPFRONT SUBSIDY REQUIRED  ★';
+      subRow.getCell(1).font={bold:true,size:14,color:{argb:C.amber}};
+      subRow.getCell(1).fill={type:'pattern',pattern:'solid',fgColor:{argb:C.medBg}};
+      subRow.getCell(1).alignment={horizontal:'center',vertical:'middle'};
+      subRow.height=32;
+      oRow++;
+      const subValRow = wsOut.getRow(oRow++);
+      subValRow.getCell(1).value='';
+      money(subValRow.getCell(2), lastRun.bestSubsidy||0);
+      subValRow.getCell(2).font={bold:true,size:18,color:{argb:C.amber}};
+      subValRow.getCell(2).fill={type:'pattern',pattern:'solid',fgColor:{argb:C.amberBg}};
+      subValRow.getCell(2).alignment={horizontal:'right'};
+      subValRow.height=36;
+      oRow++;
+
+      oRow = sectionHdr(wsOut, oRow, '▸  PROJECT METRICS');
+      O('Project IRR', r.projectIRR||0, 'pct');
+      O('Min Senior DSCR', r.minSeniorDSCR, 'ratio');
+      O('Min Total DSCR', r.totalDSCR?Math.min(...r.totalDSCR.filter(v=>v&&isFinite(v))):0, 'ratio');
+      O('Min LLCR', r.minLLCR, 'ratio');
+      O('TIFIA All-in Rate', r.tifiaAllInRate||0, 'pct');
+      O('Total Uses', r.totalUses, 'money');
+      O('Total Sources', r.totalSources, 'money');
+      O('Funding Gap', r.totalUses - r.totalSources, 'money');
+      O('Issuance Costs (total)', r.totalIssuanceCost, 'money');
+      O('TIFIA Admin + Monitoring (life)', r.totalTifiaFees, 'money');
+      oRow++;
+
+      oRow = sectionHdr(wsOut, oRow, '▸  TIFIA AMORTIZATION CHECKPOINTS');
+      const tS = r.debtSchedules?.[model.tifia?.instrumentId||'tifia1'];
+      if(tS){
+        O('TIFIA Principal', tifiaInstObj?.amount||0, 'money');
+        O('TIFIA Capitalised Interest', r.tifiaConstr?.capitalizedInterestTotal||0, 'money');
+        O('TIFIA Peak Balance', Math.max(...tS.balance.filter(v=>v!=null)), 'money');
+        O('TIFIA Balance at Test Point', tS.balance[49]||0, 'money');
+        O('TIFIA Final Balance', tS.balance[tS.balance.length-1]||0, 'money');
+        O('50% Test Result', Math.abs((tS.balance[49]||0) - 0.5*(tifiaInstObj?.amount||0)) < 1e5 ? 'PASS ✓' : 'FAIL ✗');
+      }
+
+      // ── Write file ──────────────────────────
+      const buffer = await wb.xlsx.writeBuffer();
+      const blob = new Blob([buffer], {type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `TollRoad_${(model.general.projectName||'Model').replace(/[^a-z0-9]/gi,'_')}_${new Date().toISOString().slice(0,10)}.xlsx`;
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      URL.revokeObjectURL(url);
     } catch(e) {
       alert('Export failed: ' + e.message);
     }
     setExporting(false);
   };
-
   // Debt service vs revenue chart data
   const chartData = (r.periods || []).map((p,i)=>({
     period: p.label,
@@ -2793,8 +3371,11 @@ function SourcesUsesTab({model, results}){
   const constrChartData = Array.from({length: numConstrPeriods}, (_, pi) => {
     const mStart = Math.round(pi * monthsPerPeriod);
     const mEnd = Math.min(cm, Math.round((pi + 1) * monthsPerPeriod));
-    const row = {period: `M${mStart+1}–${mEnd}`, capex: 0};
-    for(let m = mStart; m < mEnd; m++) row.capex += capexMonthly[m] || 0;
+    const row = {period: `M${mStart+1}–${mEnd}`, capex: 0, Paygo: 0};
+    for(let m = mStart; m < mEnd; m++){
+      row.capex += capexMonthly[m] || 0;
+      row.Paygo += (r.paygoSched?.monthly?.[m] || 0);
+    }
     instruments.forEach(inst => {
       const draws = drawsByInst[inst.id] || [];
       let d = 0; for(let m = mStart; m < mEnd; m++) d += draws[m] || 0;
@@ -2842,6 +3423,7 @@ function SourcesUsesTab({model, results}){
             <Bar key={inst.id} dataKey={inst.id} name={inst.type} stackId="draws"
               fill={instColors[inst.id]||'#78716c'}/>
           ))}
+          {constrChartData.some(d=>d.Paygo>0) && <Bar dataKey="Paygo" name="Paygo / Availability" stackId="draws" fill="#2dd4bf"/>}
           <Line type="monotone" dataKey="capex" name="Capex Uses" stroke="#f97316" strokeWidth={2} dot={false}/>
         </ComposedChart>
       </ResponsiveContainer>
@@ -2860,6 +3442,13 @@ function SourcesUsesTab({model, results}){
                 <TD className="text-right text-amber-300">{fmt$(inst.amount)}</TD>
               </tr>
             ))}
+            {constrChartData.some(d=>d.Paygo>0) && (
+              <tr className="hover:bg-stone-900/40">
+                <TD className="sticky left-0 bg-stone-950 text-teal-300">Paygo / Availability</TD>
+                {constrChartData.map((d,i)=><TD key={i} className="text-right text-teal-400">{d.Paygo?fmt$(d.Paygo):'—'}</TD>)}
+                <TD className="text-right text-teal-300">{fmt$(r.paygoSched?.total||0)}</TD>
+              </tr>
+            )}
             <tr className="bg-stone-900/40 font-medium">
               <TD className="sticky left-0 bg-stone-900 text-stone-200">Capex Uses</TD>
               {constrChartData.map((d,i)=><TD key={i} className="text-right text-orange-300">{fmt$(d.capex)}</TD>)}
