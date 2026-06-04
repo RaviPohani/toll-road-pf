@@ -1014,19 +1014,31 @@ def build_full_model(model: Dict[str, Any]) -> Dict[str, Any]:
 
     debt_monthly_draws = _zeros(cm)
     tifia_monthly_draws = _zeros(cm)
+    draws_by_inst = {i['id']: _zeros(cm) for i in instruments}  # per-instrument monthly draws
     for m in range(cm):
         c_m = capex_sched['monthly'][m]
-        eq_share = equity_total / sources_total if sources_total > 0 else 0
-        gr_share = grant_total / sources_total if sources_total > 0 else 0
-        pg_share = paygo_total / sources_total if sources_total > 0 else 0
+        eq_share  = equity_total  / sources_total if sources_total > 0 else 0
+        gr_share  = grant_total   / sources_total if sources_total > 0 else 0
+        pg_share  = paygo_total   / sources_total if sources_total > 0 else 0
         debt_share = 1 - eq_share - gr_share - pg_share
         dd = c_m * debt_share
         debt_monthly_draws[m] = dd
         if tifia_inst and debt_total > 0:
             tifia_monthly_draws[m] = dd * (tifia_inst['amount'] / debt_total)
+        # per-instrument splits
+        for inst in instruments:
+            if inst['seniority'] == 'Grant':
+                draws_by_inst[inst['id']][m] = c_m * (inst['amount'] / sources_total) if sources_total > 0 else 0
+            elif inst['seniority'] == 'Equity':
+                draws_by_inst[inst['id']][m] = c_m * (inst['amount'] / sources_total) if sources_total > 0 else 0
+            elif inst['seniority'] == 'Paygo':
+                draws_by_inst[inst['id']][m] = paygo_sched.get('monthly', _zeros(cm))[m]
+            elif debt_total > 0:
+                draws_by_inst[inst['id']][m] = dd * (inst['amount'] / debt_total)
 
     if tifia_inst:
         tifia_constr = build_tifia_construction_interest(tifia_inst, tifia_monthly_draws, model['tifia'], model)
+        tifia_constr['monthlyDraws'] = tifia_monthly_draws   # expose draws
     else:
         tifia_constr = {'monthlyInterest': _zeros(cm), 'monthlyBalance': _zeros(cm),
                         'capitalizations': [], 'capitalizedInterestTotal': 0, 'finalBalance': 0}
@@ -1155,6 +1167,7 @@ def build_full_model(model: Dict[str, Any]) -> Dict[str, Any]:
     return {
         'periods': periods,
         'capex_sched': capex_sched, 'paygo_sched': paygo_sched, 'tifia_constr': tifia_constr,
+        'draws_by_inst': draws_by_inst,
         'non_tifia_idc': nt_idc, 'non_tifia_idc_monthly': nt_idc_monthly, 'financing_fees': financing_fees,
         'capitalized_tifia_interest': tifia_constr['capitalizedInterestTotal'],
         'total_uses': total_uses, 'total_sources': sources_total,
