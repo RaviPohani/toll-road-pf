@@ -834,21 +834,20 @@ function computeIRR(flows, guess=0.1){
 
 // ---------- FULL MODEL ASSEMBLER ----------
 function buildFullModel(rawModel){
-  // Defensive merge: ensure all required top-level keys exist
-  // (guards against stale localStorage states missing fields)
+  // Defensive merge: ensure all required top-level keys exist by merging over a fresh default.
+  // Guards against stale localStorage states missing any field.
   const DM = defaultModel();  // defaultModel is a factory function
-  const model = {
-    general:    rawModel?.general    || DM.general,
-    capex:      rawModel?.capex      || DM.capex,
-    paygo:      rawModel?.paygo      || DM.paygo,
-    revenue:    rawModel?.revenue    || DM.revenue,
-    opex:       rawModel?.opex       || DM.opex,
-    financing:  rawModel?.financing  || DM.financing,
-    tifia:      rawModel?.tifia      || DM.tifia,
-    controlAccounts: rawModel?.controlAccounts || DM.controlAccounts,
-    optimizer:  rawModel?.optimizer  || DM.optimizer,
-    vfm:        rawModel?.vfm        || DM.vfm,
-  };
+  const model = {...DM};
+  if(rawModel && typeof rawModel === 'object'){
+    for(const k of Object.keys(rawModel)){
+      // use the saved value only if it's non-null; otherwise keep default
+      if(rawModel[k] != null) model[k] = rawModel[k];
+    }
+  }
+  // Belt-and-suspenders: guarantee every default key is present
+  for(const k of Object.keys(DM)){
+    if(model[k] == null) model[k] = DM[k];
+  }
   const ppy = model.general.periodsPerYear || 2;
   const capexSched = buildCapexSchedule(model);
   const cm = model.general.constructionMonths;
