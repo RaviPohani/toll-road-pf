@@ -194,7 +194,7 @@ def default_model() -> Dict[str, Any]:
                  'closeDate': '2026-07-01', 'seniority': 'Senior',      'repaymentStyle': 'Level debt service',
                  'drawdownPriority': 3, 'targetDSCR': 1.35, 'ioYears': 0, 'deferralYears': 3,
                  'dayCount': '30/360', 'covenants': 'Senior DSCR \u22651.20x',
-                 'issuanceCost': 4_500_000, 'issuanceCostEscalation': 0.03},
+                 'issuanceCost': 4_500_000, 'issuanceCostEscalation': 0.03, 'escrowRate': 0.0425},
                 {'id': 'tifia1', 'type': 'TIFIA Loan',         'amount': 200_000_000, 'rate': 0.0410, 'tenorYears': 35,
                  'closeDate': '2026-07-01', 'seniority': 'Subordinate', 'repaymentStyle': 'Phased (multi-regime)',
                  'drawdownPriority': 4, 'targetDSCR': 1.10, 'ioYears': 0, 'deferralYears': 5,
@@ -1093,14 +1093,41 @@ def build_full_model(model: Dict[str, Any]) -> Dict[str, Any]:
                         'capitalizedInterestTotal': 0, 'finalBalance': 0}
 
     # Non-TIFIA IDC: uses actual non-TIFIA debt draws (sequential, not proportional)
-    non_tifia_rate = model['financing']['blendedIDCRateForNonTIFIA']
-    nt_bal, nt_idc = 0.0, 0.0
+    # ── Per-instrument IDC: escrow model for public bonds, sequential for bank debt ──
+    nt_idc = 0.0
     nt_idc_monthly = _zeros(cm)
-    for m in range(cm):
-        i_m = nt_bal * (non_tifia_rate / 12)
-        nt_idc += i_m
-        nt_idc_monthly[m] = i_m
-        nt_bal += non_tifia_debt_draws[m]
+    idc_by_inst = {}   # {inst_id: {gross, escrow, net, monthly}}
+
+    for inst in instruments:
+        if tifia_inst and inst['id'] == tifia_inst['id']:
+            continue
+        if inst.get('seniority') in ('Grant', 'Equity', 'Paygo'):
+            continue
+        escrow_rate = inst.get('escrowRate', 0) or 0
+        coupon_rate = inst.get('rate', 0) or 0
+        full_amt    = inst.get('amount', 0) or 0
+        if escrow_rate > 0 and full_amt > 0:
+            # Public bond: gross IDC on full face from day 1, net of escrow earnings on undrawn
+            cum_drawn, gross, escrow = 0.0, 0.0, 0.0
+            monthly = _zeros(cm)
+            for m in range(cm):
+                g = full_amt * coupon_rate / 12
+                undrawn = max(0, full_amt - cum_drawn)
+                e = undrawn * escrow_rate / 12
+                net_m = g - e
+                monthly[m] = net_m
+                gross += g; escrow += e; nt_idc += net_m; nt_idc_monthly[m] += net_m
+                cum_drawn = min(full_amt, cum_drawn + (draws_by_inst.get(inst['id'], _zeros(cm))[m] or 0))
+            idc_by_inst[inst['id']] = {'gross': gross, 'escrow': escrow, 'net': gross - escrow, 'monthly': monthly}
+        elif coupon_rate > 0:
+            # Bank debt: IDC on drawn balance (sequential)
+            bal, net = 0.0, 0.0
+            monthly = _zeros(cm)
+            for m in range(cm):
+                i_m = bal * (coupon_rate / 12)
+                monthly[m] = i_m; net += i_m; nt_idc += i_m; nt_idc_monthly[m] += i_m
+                bal += draws_by_inst.get(inst['id'], _zeros(cm))[m] or 0
+            idc_by_inst[inst['id']] = {'gross': net, 'escrow': 0.0, 'net': net, 'monthly': monthly}
 
     financing_fees = debt_total * model['financing']['financingFeesPctOfDebt']
     if tifia_inst:
@@ -1216,7 +1243,7 @@ def build_full_model(model: Dict[str, Any]) -> Dict[str, Any]:
         'periods': periods,
         'capex_sched': capex_sched, 'paygo_sched': paygo_sched, 'tifia_constr': tifia_constr,
         'draws_by_inst': draws_by_inst,
-        'non_tifia_idc': nt_idc, 'non_tifia_idc_monthly': nt_idc_monthly, 'financing_fees': financing_fees,
+        'non_tifia_idc': nt_idc, 'non_tifia_idc_monthly': nt_idc_monthly, 'idc_by_inst': idc_by_inst, 'financing_fees': financing_fees,
         'capitalized_tifia_interest': tifia_constr['capitalizedInterestTotal'],
         'total_uses': total_uses, 'total_sources': sources_total,
         'total_issuance_cost': total_issuance_cost,
@@ -1476,15 +1503,20 @@ def auto_cascade_tifia(model: Dict[str, Any], params: Dict[str, Any]) -> Dict[st
         except Exception as e:
             return {'pct': pct, 'error': f'init build failed: {e}', 'feasible': False}
 
-        # ---- STEP 1: SIZE TIFIA ----
+        # ---- STEP 1: SIZE TIFIA (skip if disabled) ----
+        tifia_enabled = params.get('tifiaEnabled', True)
         eligible_cost = 0
         for cid in (params.get('tifiaEligibleCapexIds') or []):
             eligible_cost += _sum(temp_r['capex_sched']['byItem'].get(cid, []))
-        tifia_amount = round(eligible_cost * pct)
         tifia = next((i for i in w['financing']['instruments'] if i['id'] == params.get('tifiaInstrumentId')), None)
         if not tifia:
             return {'pct': pct, 'error': 'TIFIA not found', 'feasible': False}
-        tifia['amount'] = tifia_amount
+        if tifia_enabled:
+            tifia_amount = round(eligible_cost * pct)
+            tifia['amount'] = tifia_amount
+        else:
+            tifia['amount'] = 0
+            tifia_amount = 0
 
         # Temporarily zero PAB so TIFIA gets first shot at the structure
         pab_inst = next((i for i in w['financing']['instruments']
@@ -1493,29 +1525,31 @@ def auto_cascade_tifia(model: Dict[str, Any], params: Dict[str, Any]) -> Dict[st
             pab_inst['amount'] = 0
 
         pre_r = build_full_model(w)
-        # CFADS available to TIFIA = full CFADS_for_DSCR (after admin fees) since no PAB yet
         cfads_for_tifia = list(pre_r['cfads_for_dscr'])
 
-        # Build TIFIA phases that pass 50% test by construction, sculpted against TIFIA-available CFADS
-        phase_res = build_tifia_cascade_phases(w, params['tifiaInstrumentId'], {
-            'deferYears': params.get('deferYears'),
-            'ioYears': params.get('ioYears'),
-            'testYearsBeforeMaturity': params.get('testYearsBeforeMaturity'),
-            'phase3Mode': params.get('phase3Mode'),
-        }, cfads_for_tifia)
-        if 'error' in phase_res:
-            return {'pct': pct, 'tifiaAmount': tifia_amount, 'error': phase_res['error'], 'feasible': False}
-        tifia['phases'] = phase_res['phases']
-        tifia['repaymentStyle'] = 'Phased (multi-regime)'
+        # Build TIFIA phases only when enabled
+        if tifia_enabled:
+            phase_res = build_tifia_cascade_phases(w, params['tifiaInstrumentId'], {
+                'deferYears': params.get('deferYears'),
+                'ioYears': params.get('ioYears'),
+                'testYearsBeforeMaturity': params.get('testYearsBeforeMaturity'),
+                'phase3Mode': params.get('phase3Mode'),
+            }, cfads_for_tifia)
+            if 'error' in phase_res:
+                return {'pct': pct, 'tifiaAmount': tifia_amount, 'error': phase_res['error'], 'feasible': False}
+            tifia['phases'] = phase_res['phases']
+            tifia['repaymentStyle'] = 'Phased (multi-regime)'
+        else:
+            phase_res = {'diagnosis': 'TIFIA disabled', 'phases': []}
 
         # ---- STEP 2: SIZE PAB ----
-        # PAB only if TIFIA hit statutory ceiling (49%) AND funding gap remains
-        # Constraint: PAB = min(funding gap, max PAB where (CFADS - TIFIA DS)/Sr DS >= Sr DSCR floor)
+        # PABs size when: TIFIA disabled OR TIFIA at statutory ceiling AND gap remains
         pab_amount = 0
         max_tifia_pct = params.get('maxTifiaPct', 0.49)
-        tifia_at_ceiling = pct >= max_tifia_pct - 0.005
+        tifia_at_ceiling = tifia_enabled and (pct >= max_tifia_pct - 0.005)
+        should_size_pab = not tifia_enabled or tifia_at_ceiling
         if pab_inst:
-            if not tifia_at_ceiling:
+            if not should_size_pab:
                 # TIFIA stopped below ceiling — adding PAB hurts Total DSCR. No PAB.
                 pab_inst['amount'] = 0
                 pab_amount = 0
@@ -1676,7 +1710,12 @@ def auto_cascade_tifia(model: Dict[str, Any], params: Dict[str, Any]) -> Dict[st
 
         test_bal = (tifia_sched['balance'][phase_res['test_point']]
                     if phase_res.get('test_point', -1) >= 0 and tifia_sched else None)
-        test_passed = test_bal is not None and test_bal <= 0.5 * tifia_amount + 1000
+        if not tifia_enabled:
+            # TIFIA disabled: 50% test vacuously passes, no TIFIA DSCR floor
+            test_passed = True
+            min_tifia_eff = None
+        else:
+            test_passed = test_bal is not None and test_bal <= 0.5 * tifia_amount + 1000
 
         feasible = (
             (min_total_dscr is None or min_total_dscr >= (params.get('minTotalDSCR', 1.10) - 0.005))
