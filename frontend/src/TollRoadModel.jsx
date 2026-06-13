@@ -833,7 +833,21 @@ function computeIRR(flows, guess=0.1){
 }
 
 // ---------- FULL MODEL ASSEMBLER ----------
-function buildFullModel(model){
+function buildFullModel(rawModel){
+  // Defensive merge: ensure all required top-level keys exist
+  // (guards against stale localStorage states missing fields)
+  const model = {
+    general:    rawModel?.general    || defaultModel.general,
+    capex:      rawModel?.capex      || defaultModel.capex,
+    paygo:      rawModel?.paygo      || defaultModel.paygo,
+    revenue:    rawModel?.revenue    || defaultModel.revenue,
+    opex:       rawModel?.opex       || defaultModel.opex,
+    financing:  rawModel?.financing  || defaultModel.financing,
+    tifia:      rawModel?.tifia      || defaultModel.tifia,
+    controlAccounts: rawModel?.controlAccounts || defaultModel.controlAccounts,
+    optimizer:  rawModel?.optimizer  || defaultModel.optimizer,
+    vfm:        rawModel?.vfm        || defaultModel.vfm,
+  };
   const ppy = model.general.periodsPerYear || 2;
   const capexSched = buildCapexSchedule(model);
   const cm = model.general.constructionMonths;
@@ -4459,10 +4473,17 @@ export default function App(){
       // 3. Fix plug from fg1 → sub1
       const opt = m.optimizer || {}, cas = opt.cascade || {};
       const plugId = (cas.plugInstrumentId === 'fg1' || !cas.plugInstrumentId) ? 'sub1' : cas.plugInstrumentId;
-      return { ...m, tifia,
-        financing:{...m.financing, instruments:insts},
-        optimizer:{...opt, plugInstrumentId:plugId,
-          cascade:{...cas, plugInstrumentId:plugId, tifiaEnabled: cas.tifiaEnabled !== false}}};
+      // Always return a complete model merged over defaultModel so nothing is missing
+      return {
+        ...defaultModel,  // base — ensures every key exists
+        ...m,             // user values override
+        general:    {...defaultModel.general,    ...(m.general||{})},
+        tifia,
+        financing:  {...defaultModel.financing,  ...m.financing, instruments:insts},
+        optimizer:  {...defaultModel.optimizer,  ...opt, plugInstrumentId:plugId,
+          cascade:{...(defaultModel.optimizer.cascade||{}), ...cas, plugInstrumentId:plugId,
+            tifiaEnabled: cas.tifiaEnabled !== false}},
+      };
     };
     return migrateModel(defaultModel);
   });
