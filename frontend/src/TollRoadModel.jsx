@@ -844,7 +844,9 @@ function buildFullModel(model){
   const paygoTotal = paygoSched.total;
   const debtTotal = sum(instruments.filter(i=>!['Grant','Equity','Paygo'].includes(i.seniority)).map(i=>i.amount));
   const sourcesTotal = grantTotal + equityTotal + paygoTotal + debtTotal;
-  const tifiaInst = instruments.find(i=>i.id===model.tifia.instrumentId && i.type==='TIFIA Loan');
+  const tifiaInst = model.tifia?.instrumentId
+    ? instruments.find(i=>i.id===model.tifia.instrumentId && i.type==='TIFIA Loan')
+    : instruments.find(i=>i.type==='TIFIA Loan');  // fallback for old saves without instrumentId
 
   // --- CONSTRUCTION DRAWS: sequential by drawdownPriority (cheapest/lowest number first) ---
   // Grants → RAN → PABs → TIFIA → Equity. Exhausts each source before drawing the next.
@@ -4434,21 +4436,33 @@ const TABS = [
 
 export default function App(){
   const [model, setModel] = useState(()=>{
-    // State migration: patch old saved states missing sub1 instrument or using fg1 as plug
+    // State migration: patch old saved states missing sub1, tifia.instrumentId, etc.
     const migrateModel = (m) => {
-      if(!m || !m.financing) return m;
-      const hasSub1 = m.financing.instruments.some(i => i.id === 'sub1');
+      if(!m || !m.financing || !m.general) return defaultModel;  // corrupt → reset
+      // 1. Patch tifia config — old saves may lack instrumentId or capPeriodMonths
+      const tifia = m.tifia
+        ? { ...defaultModel.tifia, ...m.tifia,
+            instrumentId: m.tifia.instrumentId || 'tifia1',
+            capPeriodMonths: m.tifia.capPeriodMonths || 6 }
+        : { ...defaultModel.tifia };
+      // 2. Add sub1 if missing
+      const hasSub1 = m.financing.instruments?.some(i => i.id === 'sub1');
       const insts = hasSub1 ? m.financing.instruments : [
-        {id:'sub1',type:'Upfront Subsidy',amount:0,rate:0,tenorYears:0,closeDate:m.general?.financialCloseDate||'2026-07-01',
-         seniority:'Grant',repaymentStyle:'Bullet',drawdownPriority:0,targetDSCR:0,ioYears:0,deferralYears:0,
-         dayCount:'30/360',covenants:'Government viability gap funding — sized by Optimizer',issuanceCost:0,issuanceCostEscalation:0},
+        {id:'sub1',type:'Upfront Subsidy',amount:0,rate:0,tenorYears:0,
+         closeDate:m.general.financialCloseDate||'2026-07-01',
+         seniority:'Grant',repaymentStyle:'Bullet',drawdownPriority:0,targetDSCR:0,
+         ioYears:0,deferralYears:0,dayCount:'30/360',
+         covenants:'Government viability gap funding — sized by Optimizer',
+         issuanceCost:0,issuanceCostEscalation:0},
         ...m.financing.instruments
       ];
-      const opt = m.optimizer || {};
-      const cas = opt.cascade || {};
+      // 3. Fix plug from fg1 → sub1
+      const opt = m.optimizer || {}, cas = opt.cascade || {};
       const plugId = (cas.plugInstrumentId === 'fg1' || !cas.plugInstrumentId) ? 'sub1' : cas.plugInstrumentId;
-      return {...m, financing:{...m.financing, instruments:insts},
-        optimizer:{...opt, plugInstrumentId:plugId, cascade:{...cas, plugInstrumentId:plugId}}};
+      return { ...m, tifia,
+        financing:{...m.financing, instruments:insts},
+        optimizer:{...opt, plugInstrumentId:plugId,
+          cascade:{...cas, plugInstrumentId:plugId, tifiaEnabled: cas.tifiaEnabled !== false}}};
     };
     return migrateModel(defaultModel);
   });
@@ -4465,7 +4479,7 @@ export default function App(){
     return keys;
   };
   useEffect(()=>{ try { setSavedScenarios(listScenarios()); } catch(e){} }, []);
-  const results = useMemo(()=>{ try { return buildFullModel(model); } catch(e){ console.error('Model error:', e); return null; } }, [model]);
+  const results = useMemo(()=>{ try { return buildFullModel(model); } catch(e){ console.error("Model build error:", e); return null; } }, [model]);
   const saveScenario = ()=>{
     if(!scenarioName.trim()) return;
     try { localStorage.setItem(`scenario:${scenarioName}`, JSON.stringify(model));
@@ -4493,7 +4507,7 @@ export default function App(){
       }
     } catch(e){ console.error(e); }
   };
-  if(!results) return <div className="min-h-screen bg-stone-950 text-rose-300 p-8 font-mono">Model error — check console.</div>;
+  if(!results) return <div className="min-h-screen bg-stone-950 text-rose-300 p-8 font-mono"><div className="text-lg mb-2">Model error</div><div className="text-sm mb-4">Check browser console (F12) for details. If this persists, click Reset.</div><button onClick={()=>{localStorage.clear();window.location.reload();}} className="px-4 py-2 bg-amber-500 text-stone-900 rounded text-sm">Reset to Defaults</button></div>;
   return (
     <div className="min-h-screen bg-stone-950 text-stone-100" style={{fontFamily:'IBM Plex Sans, system-ui, sans-serif'}}>
       <style>{`
