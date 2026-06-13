@@ -86,7 +86,7 @@ const defaultModel = () => ({
       {id:'sub1',type:'Upfront Subsidy',amount:0,rate:0,tenorYears:0,closeDate:'2026-07-01',seniority:'Grant',repaymentStyle:'Bullet',drawdownPriority:0,targetDSCR:0,ioYears:0,deferralYears:0,dayCount:'30/360',covenants:'Government viability gap funding — sized by Optimizer', issuanceCost:0, issuanceCostEscalation:0},
       {id:'fg1',type:'Federal Grant',amount:60_000_000,rate:0,tenorYears:0,closeDate:'2026-07-01',seniority:'Grant',repaymentStyle:'Bullet',drawdownPriority:1,targetDSCR:0,ioYears:0,deferralYears:0,dayCount:'30/360',covenants:'Federal cost-share requirements', issuanceCost:0, issuanceCostEscalation:0},
       {id:'sg1',type:'State Grant',amount:40_000_000,rate:0,tenorYears:0,closeDate:'2026-07-01',seniority:'Grant',repaymentStyle:'Bullet',drawdownPriority:1,targetDSCR:0,ioYears:0,deferralYears:0,dayCount:'30/360',covenants:'State match requirements', issuanceCost:0, issuanceCostEscalation:0},
-      {id:'pab1',type:'PABs (Private Activity Bonds)',amount:280_000_000,rate:0.0525,tenorYears:30,closeDate:'2026-07-01',seniority:'Senior',repaymentStyle:'Level debt service',drawdownPriority:3,targetDSCR:1.35,ioYears:0,deferralYears:3,dayCount:'30/360',covenants:'Senior DSCR ≥1.20x; reserve fund equal to MADS', issuanceCost:4_500_000, issuanceCostEscalation:0.03},
+      {id:'pab1',type:'PABs (Private Activity Bonds)',amount:280_000_000,rate:0.0525,tenorYears:30,closeDate:'2026-07-01',seniority:'Senior',repaymentStyle:'Level debt service',drawdownPriority:3,targetDSCR:1.35,ioYears:0,deferralYears:3,dayCount:'30/360',covenants:'Senior DSCR ≥1.20x; reserve fund equal to MADS', issuanceCost:4_500_000, issuanceCostEscalation:0.03, escrowRate:0.0425},
       {id:'tifia1',type:'TIFIA Loan',amount:200_000_000,rate:0.0410,tenorYears:35,closeDate:'2026-07-01',seniority:'Subordinate',repaymentStyle:'Phased (multi-regime)',drawdownPriority:4,targetDSCR:1.10,ioYears:0,deferralYears:5,dayCount:'Actual/Actual',covenants:'TIFIA springing lien; sub DSCR ≥1.10x after deferral', issuanceCost:1_750_000, issuanceCostEscalation:0.03,
         phases:[
           {regime:'defer',  endPeriod:10, targetDSCR:null},                                  // CapI 5y
@@ -123,6 +123,7 @@ const defaultModel = () => ({
     plugInstrumentId:'sub1',
     cascade: {
       // TIFIA sizing
+      tifiaEnabled: true,
       tifiaInstrumentId:'tifia1',
       tifiaEligibleCapexIds:['eng','des','arc','mat','lab','uti','mob','oth','spv','row','ure'],
       tifiaPercentage:0.33,
@@ -880,15 +881,50 @@ function buildFullModel(model){
     ? {...buildTIFIAConstructionInterest(tifiaInst, tifiaMonthlyDraws, model.tifia, model), monthlyDraws: tifiaMonthlyDraws}
     : { monthlyInterest: zeros(cm), monthlyBalance: zeros(cm), monthlyDraws: zeros(cm), capitalizations: [], capitalizedInterestTotal: 0, finalBalance: 0 };
 
-  // Non-TIFIA IDC: actual sequential draws (not proportional)
-  const nonTIFIARate = model.financing.blendedIDCRateForNonTIFIA;
-  let ntBal = 0, ntIDC = 0;
+  // ── Per-instrument IDC: escrow model for public bonds, sequential for bank debt ──
+  // Public bonds (escrowRate > 0): issued at FC in full, undrawn proceeds earn escrowRate
+  //   Gross IDC = full_amount × coupon from day 1
+  //   Escrow earnings = undrawn_balance × escrowRate
+  //   Net IDC = Gross − Escrow
+  // Bank debt (escrowRate = 0): IDC = drawn_balance × rate (sequential model)
+  let ntIDC = 0;
   const ntIDCMonthly = zeros(cm);
-  for(let m=0; m<cm; m++){
-    const i = ntBal * (nonTIFIARate/12);
-    ntIDC += i; ntIDCMonthly[m] = i;
-    ntBal += nonTifiaDebtDraws[m];
-  }
+  const idcByInst = {};  // { instId: { gross, escrow, net, monthly } }
+  let ntBal = 0;  // for blended fallback on non-escrow instruments
+
+  instruments.forEach(inst => {
+    if(inst.id === (tifiaInst?.id)) return;  // TIFIA handled separately
+    if(['Grant','Equity','Paygo'].includes(inst.seniority)) return;
+    const escrowRate = inst.escrowRate || 0;
+    const couponRate = inst.rate || 0;
+    const fullAmt = inst.amount || 0;
+    if(escrowRate > 0 && fullAmt > 0){
+      // Escrow model: gross IDC from day 1 on full face, net of escrow earnings on undrawn
+      let cumDrawn = 0, gross = 0, escrow = 0;
+      const monthly = zeros(cm);
+      for(let m=0; m<cm; m++){
+        const g = fullAmt * couponRate / 12;
+        const undrawn = Math.max(0, fullAmt - cumDrawn);
+        const e = undrawn * escrowRate / 12;
+        const net = g - e;
+        monthly[m] = net;
+        gross += g; escrow += e; ntIDC += net; ntIDCMonthly[m] += net;
+        cumDrawn += drawsByInst[inst.id]?.[m] || 0;
+        cumDrawn = Math.min(cumDrawn, fullAmt);
+      }
+      idcByInst[inst.id] = { gross, escrow, net: gross - escrow, monthly };
+    } else if(couponRate > 0){
+      // Sequential model: IDC on drawn balance only
+      let bal = 0, net = 0;
+      const monthly = zeros(cm);
+      for(let m=0; m<cm; m++){
+        const i = bal * (couponRate / 12);
+        monthly[m] = i; net += i; ntIDC += i; ntIDCMonthly[m] += i;
+        bal += drawsByInst[inst.id]?.[m] || 0;
+      }
+      idcByInst[inst.id] = { gross: net, escrow: 0, net, monthly };
+    }
+  });
   const financingFees = debtTotal * model.financing.financingFeesPctOfDebt;
   if(tifiaInst) tifiaInst.principalAfterIDC = tifiaInst.amount + tifiaConstr.capitalizedInterestTotal;
   // Issuance costs per instrument, escalated from base year to FC year
@@ -993,7 +1029,7 @@ function buildFullModel(model){
   const finiteL = llcrSenior.filter(v=>v!=null && isFinite(v));
   return {
     periods, capexSched, paygoSched, tifiaConstr, drawsByInst,
-    nonTIFIAIDC: ntIDC, nonTIFIAIDCMonthly: ntIDCMonthly, financingFees,
+    nonTIFIAIDC: ntIDC, nonTIFIAIDCMonthly: ntIDCMonthly, idcByInst, financingFees,
     capitalizedTIFIAInterest: tifiaConstr.capitalizedInterestTotal,
     totalUses, totalSources: sourcesTotal, grantTotal, equityTotal, paygoTotal, debtTotal,
     totalIssuanceCost, issuanceCostsByID,
@@ -1353,15 +1389,22 @@ function autoCascadeTifia(model, params){
     try { tempR = buildFullModel(w); }
     catch(e){ return { pct, error:'init build failed: '+e.message, feasible:false }; }
 
-    // STEP 1: SIZE TIFIA
+    // STEP 1: SIZE TIFIA (skip if disabled)
+    const tifiaEnabled = params.tifiaEnabled !== false;  // default true
     let eligibleCost = 0;
     for(const id of (params.tifiaEligibleCapexIds || [])){
       eligibleCost += sum(tempR.capexSched.byItem[id] || []);
     }
-    const tifiaAmount = Math.round(eligibleCost * pct);
     const tifia = w.financing.instruments.find(i => i.id === params.tifiaInstrumentId);
-    if(!tifia) return { pct, error:'TIFIA not found', feasible:false };
-    tifia.amount = tifiaAmount;
+    let tifiaAmount = 0;
+    if(!tifia) return { pct, error:'TIFIA instrument not found', feasible:false };
+    if(tifiaEnabled){
+      tifiaAmount = Math.round(eligibleCost * pct);
+      tifia.amount = tifiaAmount;
+    } else {
+      tifia.amount = 0;  // TIFIA off — zero it out regardless of pct
+      tifiaAmount = 0;
+    }
 
     // Zero PAB so TIFIA gets first shot
     const pabInst = params.pabInstrumentId
@@ -1385,14 +1428,14 @@ function autoCascadeTifia(model, params){
     tifia.repaymentStyle = 'Phased (multi-regime)';
 
     // STEP 2: SIZE PAB
-    // PAB only if TIFIA hit statutory ceiling AND funding gap remains.
-    // PAB = min(funding gap, max where (CFADS - TIFIA DS)/Sr DS >= Sr DSCR floor)
+    // PABs size when: TIFIA disabled, OR TIFIA hit statutory ceiling AND gap remains
     let pabAmount = 0;
     const maxTifiaPct = params.maxTifiaPct || 0.49;
-    const tifiaAtCeiling = pct >= maxTifiaPct - 0.005;
+    const tifiaAtCeiling = tifiaEnabled && (pct >= maxTifiaPct - 0.005);
+    const shouldSizePab = !tifiaEnabled || tifiaAtCeiling;
     if(pabInst){
-      if(!tifiaAtCeiling){
-        // TIFIA stopped below ceiling — adding PAB hurts Total DSCR
+      if(!shouldSizePab){
+        // TIFIA stopped below ceiling — adding PAB would hurt Total DSCR
         pabInst.amount = 0;
         pabAmount = 0;
       } else {
@@ -1495,6 +1538,16 @@ function autoCascadeTifia(model, params){
         try { finalR = buildFullModel(w); } catch(e){}
       }
       upfrontSubsidy = plugInst.amount;
+    } else if(params.plugInstrumentId) {
+      // plug instrument missing (old saved state without sub1) — fall back to first grant
+      const fallbackGrant = w.financing.instruments.find(i => i.seniority === 'Grant');
+      if(fallbackGrant){
+        const gap = finalR.totalUses - finalR.totalSources;
+        fallbackGrant.amount = Math.max(0, Math.round((fallbackGrant.amount||0) + gap));
+        upfrontSubsidy = fallbackGrant.amount;
+        plugApplied = gap;
+        try { finalR = buildFullModel(w); } catch(e){}
+      }
     }
 
     // FEASIBILITY (floors measured over TIFIA-active periods; display falls back to all-period min)
@@ -1533,7 +1586,9 @@ function autoCascadeTifia(model, params){
     const srForFeas = isFinite(minSrFeas) ? minSrFeas : 999;
 
     const testBalAtPoint = (phaseRes.testPoint >= 0 && tifiaSchedF) ? tifiaSchedF.balance[phaseRes.testPoint] : null;
-    const testPassed = testBalAtPoint != null && testBalAtPoint <= 0.5 * tifiaAmount + 1000;
+    // When TIFIA disabled: 50% test vacuously passes, no TIFIA eff DSCR floor
+    const testPassed = !tifiaEnabled || (testBalAtPoint != null && testBalAtPoint <= 0.5 * tifiaAmount + 1000);
+    if(!tifiaEnabled) minTifiaEffDSCR = null;
 
     const feasible = (
       (minTotalDSCR == null || minTotalDSCR >= (params.minTotalDSCR || 1.10) - 0.005)
@@ -2093,6 +2148,11 @@ function FinancingTab({model, setModel}){
               <div className="grid grid-cols-2 gap-4 mt-3">
                 <Field label="Issuance Cost ($, base year)" hint={`Base yr: ${f.issuanceCostBaseYear||2024}. Escalated to FC.`}><NumInput value={inst.issuanceCost} onChange={v=>updateInst(inst.id,{issuanceCost:v})} prefix="$"/></Field>
                 <Field label="Issuance Cost Escalation (%/yr)"><NumInput value={inst.issuanceCostEscalation} onChange={v=>updateInst(inst.id,{issuanceCostEscalation:v})} step={0.005} suffix="%"/></Field>
+                {inst.seniority === 'Senior' && (
+                  <Field label="Escrow / Reinvestment Rate" hint="For public bonds issued at FC: undrawn proceeds sit in escrow earning this rate. Net IDC = Gross IDC (coupon on full face) − Escrow earnings. Set 0 for bank debt (no escrow).">
+                    <NumInput value={inst.escrowRate||0} onChange={v=>updateInst(inst.id,{escrowRate:v})} step={0.0025} suffix="%"/>
+                  </Field>
+                )}
               </div>
             )}
           <Field label="Covenants / Notes"><TextInput value={inst.covenants} onChange={v=>updateInst(inst.id,{covenants:v})}/></Field>
@@ -2323,6 +2383,7 @@ function OptimizerTab({model, setModel, results}){
     setRunning(true);
     setTimeout(()=>{
       const params = {
+        tifiaEnabled: c.tifiaEnabled !== false,
         tifiaInstrumentId: c.tifiaInstrumentId,
         tifiaEligibleCapexIds: c.tifiaEligibleCapexIds || [],
         pabInstrumentId: c.pabInstrumentId,
@@ -2374,11 +2435,20 @@ function OptimizerTab({model, setModel, results}){
     </Section>
 
     <Section title="Step 1 · TIFIA Terms + Amortization Profile"
-      subtitle={`Tenor: ${tifiaTenor}y (${tifiaTenor*ppy} periods at ${ppy}/yr). Amount is set by the optimizer — configure rate, fees, and phase profile here.`}>
+      subtitle={`Tenor: ${tifiaTenor}y (${tifiaTenor*ppy} periods at ${ppy}/yr). Amount is set by the optimizer — configure rate, fees, and phase profile here.`}
+      action={
+        <label className="flex items-center gap-2 cursor-pointer">
+          <span className="text-xs text-stone-400">{c.tifiaEnabled !== false ? 'TIFIA ON' : 'TIFIA OFF'}</span>
+          <button onClick={()=>setCascade({tifiaEnabled: c.tifiaEnabled === false})}
+            className={`w-12 h-6 rounded-full transition-colors ${c.tifiaEnabled !== false ? 'bg-amber-500' : 'bg-stone-700'} relative`}>
+            <span className={`absolute top-1 w-4 h-4 rounded-full bg-white transition-transform ${c.tifiaEnabled !== false ? 'translate-x-7' : 'translate-x-1'}`}/>
+          </button>
+        </label>
+      }>
       {/* TIFIA instrument terms — shown here instead of Financing tab */}
       {tifiaInst && (()=>{
         const updateTifia = patch => setModel({...model, financing:{...model.financing, instruments: model.financing.instruments.map(i => i.id === tifiaInst.id ? {...i,...patch} : i)}});
-        return <div className="bg-stone-900/40 border border-amber-500/20 rounded p-3 mb-4">
+        return <div className={`bg-stone-900/40 border border-amber-500/20 rounded p-3 mb-4 ${c.tifiaEnabled === false ? 'opacity-40 pointer-events-none' : ''}`}>
           <div className="text-[10px] uppercase tracking-wider text-amber-400 mb-3">Instrument Terms (optimizer controls amount)</div>
           <div className="grid grid-cols-4 gap-3 mb-3">
             <Field label="Rate (%)" hint="Fixed coupon rate"><NumInput value={tifiaInst.rate} onChange={v=>updateTifia({rate:v})} step={0.0025} suffix="%"/></Field>
@@ -2394,6 +2464,12 @@ function OptimizerTab({model, setModel, results}){
         </div>;
       })()}
       {/* Amortization profile */}
+      {c.tifiaEnabled === false && (
+        <div className="bg-stone-800/60 border border-stone-600 rounded p-3 mb-3 text-sm text-stone-400">
+          ⊘ TIFIA disabled — optimizer will skip Step 1 and size PABs directly to fill the funding gap (Steps 2–4 run normally).
+        </div>
+      )}
+      <div className={`${c.tifiaEnabled === false ? 'opacity-40 pointer-events-none' : ''}`}>
       <div className="text-[10px] uppercase tracking-wider text-stone-400 mb-3">Amortization Profile — Auto-builds 4 phases that pass the 50% test by construction</div>
       <div className="grid grid-cols-4 gap-4">
         <Field label="Phase 1 — CapI (years)" hint="Interest capitalizes into balance"><NumInput value={ap.deferYears} onChange={v=>setAuto({deferYears:v})} step={1} suffix="y"/></Field>
@@ -2422,6 +2498,7 @@ function OptimizerTab({model, setModel, results}){
           ));
         })()}
       </div>
+      </div>{/* end conditional amortization wrapper */}
     </Section>
 
     <Section title="Step 2 · TIFIA-Eligible Capex Items"
@@ -3323,33 +3400,162 @@ function DashboardTab({model, results}){
 // ---------- CASHFLOW ----------
 function CashflowTab({model, results}){
   if(!results) return <div className="p-8 text-center text-stone-500">Loading…</div>;
-  const periods = results.periods;
+  const r = results;
+  const periods = r.periods;
+  const ppy = model.general.periodsPerYear || 2;
+  const instruments = model.financing.instruments;
+
+  // Compute per-period DSRA/MRA movements from controlAccounts
+  const ca = model.controlAccounts || {};
+  const dsraTarget = ca.dsra?.targetAmount || 0;
+  const mraAnnual = ca.mra?.annualContribution || 0;
+  const mraPerPeriod = mraAnnual / ppy;
+
+  // Simple DSRA tracker: funded at FC from proceeds; draws if DSCR triggers lockup
+  const dsraBalance = Array(periods.length).fill(dsraTarget);
+  const dsraDeposit = Array(periods.length).fill(0);
+  const dsraRelease = Array(periods.length).fill(0);
+  const mraBalance = [];
+  const mraDeposit = Array(periods.length).fill(mraPerPeriod);
+  let mraBal = 0;
+  for(let i=0; i<periods.length; i++){
+    // If lockup triggered: equity CF diverted to DSRA instead
+    if((r.lockup||[])[i] && dsraBalance[i] < dsraTarget){
+      const topup = Math.min((r.rawEquityCF||[])[i]||0, dsraTarget - (dsraBalance[i-1]||dsraTarget));
+      dsraDeposit[i] = topup;
+    }
+    mraBal += mraPerPeriod;
+    mraBalance.push(mraBal);
+  }
+
+  // Cumulative equity CF
+  let cumEqCF = 0;
+  const cumEquityCF = (r.rawEquityCF||r.equityCF||[]).map(v => { cumEqCF += (v||0); return cumEqCF; });
+
+  // Waterfall header row builder
+  const SectionRow = ({label, indent=0}) => (
+    <tr className="bg-stone-900/80">
+      <td colSpan={periods.length + 1} className="py-1 px-3">
+        <span className="text-[10px] uppercase tracking-widest text-amber-400 font-medium" style={{paddingLeft:`${indent*12}px`}}>{label}</span>
+      </td>
+    </tr>
+  );
+  const WFRow = ({label, data, positive, negative, bold, sub, ratio, indent=0, separator=false, accent}) => {
+    const fmtV = (v) => {
+      if(v==null || (!isFinite(v))) return <span className="text-stone-700">—</span>;
+      if(ratio) return <span className={bold?'font-medium':''}>{v.toFixed(2)}x</span>;
+      const abs = Math.abs(v);
+      const str = abs >= 1e6 ? `$${(abs/1e6).toFixed(2)}M` : abs >= 1e3 ? `$${(abs/1e3).toFixed(0)}k` : `$${abs.toFixed(0)}`;
+      return <span className={bold?'font-medium':''}>{v < 0 ? `(${str})` : str}</span>;
+    };
+    const color = accent ? `text-${accent}-300` : positive ? 'text-emerald-300' : negative ? 'text-rose-300' : bold ? 'text-stone-100' : 'text-stone-400';
+    return (
+      <tr className={`hover:bg-stone-900/30 ${separator?'border-t border-stone-700/60':''}`}>
+        <td className={`sticky left-0 bg-stone-950 py-[3px] px-3 text-[11px] ${bold?'text-stone-200 font-medium':'text-stone-400'} min-w-[260px]`}
+          style={{paddingLeft:`${8+indent*12}px`}}>
+          {label}{sub && <span className="text-stone-600 text-[9px] ml-1">{sub}</span>}
+        </td>
+        {data.map((v,i) => (
+          <td key={i} className={`text-right py-[3px] px-2 text-[11px] ${color} font-mono`}>{fmtV(v)}</td>
+        ))}
+      </tr>
+    );
+  };
+
+  // Build per-instrument DS rows (for each non-grant, non-equity instrument)
+  const activeInsts = instruments.filter(inst =>
+    !['Grant','Equity','Paygo'].includes(inst.seniority) &&
+    (r.debtSchedules?.[inst.id]?.principal?.some(v=>v>0) || r.debtSchedules?.[inst.id]?.interest?.some(v=>v>0))
+  );
+
+  // Compute running coverage after each seniority tranche
+  const srDSRunning = periods.map((_,i) => {
+    const srDS = (r.seniorInt[i]||0) + (r.seniorPri[i]||0);
+    const cfads = (r.cfadsForDscr||r.cfadsByPeriod||[])[i]||0;
+    return srDS > 0 ? cfads / srDS : null;
+  });
+
   return <div>
-    <Section title={`Operating Cashflow — ${model.general.periodsPerYear===2?'Semi-Annual':'Annual'}`} subtitle={`${periods.length} periods · partial: ${periods.filter(p=>p.isPartial).length}`}>
+    <Section title={`Full Cashflow Waterfall — ${ppy===2?'Semi-Annual':'Annual'}`}
+      subtitle={`${periods.length} periods · All amounts in nominal $ · (brackets) = outflows`}>
       <div className="overflow-x-auto border border-stone-700/60 rounded">
-        <table className="w-full text-xs">
-          <thead className="bg-stone-900/80 sticky top-0"><tr>
-            <TH className="sticky left-0 bg-stone-900 z-10 min-w-[240px]">Line Item ($ nominal)</TH>
-            {periods.map((p,i)=><TH key={i} className="text-right">{p.label}{p.isPartial?'*':''}</TH>)}
+        <table className="w-full text-xs" style={{minWidth:`${periods.length*90+280}px`}}>
+          <thead className="bg-stone-900 sticky top-0 z-10"><tr>
+            <th className="sticky left-0 bg-stone-900 text-left py-2 px-3 text-[10px] text-stone-400 uppercase tracking-wider min-w-[260px] z-20">Line Item</th>
+            {periods.map((p,i)=>(
+              <th key={i} className="text-right py-2 px-2 text-[10px] text-stone-400 font-mono whitespace-nowrap">
+                {p.label}
+              </th>
+            ))}
           </tr></thead>
           <tbody>
-            <CFRow label="Toll Revenue" data={results.revSched.byPeriod} positive/>
-            <CFRow label="Operating Expense" data={results.opexSched.byPeriod.map(v=>-v)} negative/>
-            <CFRow label="CFADS (gross)" data={results.cfadsByPeriod} bold/>
-            <CFRow label="TIFIA Admin+Monitoring" data={(results.tifiaFeesPerPeriod||[]).map(v=>-v)} negative/>
-            <CFRow label="CFADS for DSCR" data={results.cfadsForDscr||results.cfadsByPeriod} bold/>
-            <CFRow label="Senior Interest" data={results.seniorInt.map(v=>-v)} negative/>
-            <CFRow label="Senior Principal" data={results.seniorPri.map(v=>-v)} negative/>
-            <CFRow label="Sub Interest" data={results.subInt.map(v=>-v)} negative/>
-            <CFRow label="Sub Principal" data={results.subPri.map(v=>-v)} negative/>
-            <CFRow label="Short-term DS" data={results.shortDS.map(v=>-v)} negative/>
-            <CFRow label="Equity Cashflow" data={results.equityCF||[]} positive bold/>
-            <CFRow label="Senior DSCR" data={results.seniorDSCR} ratio/>
-            <CFRow label="Total DSCR" data={results.totalDSCR} ratio/>
+            {/* ── REVENUE & OPEX ── */}
+            <SectionRow label="Revenue & Costs"/>
+            <WFRow label="Toll Revenue" data={r.revSched.byPeriod} positive bold/>
+            {(model.opex?.items||[]).map(it => (
+              <WFRow key={it.id} label={`  ${it.label||it.id}`} data={r.opexSched?.byItem?.[it.id]?.map(v=>-v)||Array(periods.length).fill(0)} negative indent={1}/>
+            ))}
+            <WFRow label="CFADS (Gross)" data={r.cfadsByPeriod} bold separator accent="amber"/>
+
+            {/* ── TIFIA FEES ── */}
+            {(r.tifiaFeesPerPeriod||[]).some(v=>v>0) && <>
+              <SectionRow label="TIFIA Fees"/>
+              <WFRow label="Admin Fee" data={(r.tifiaAdminPerPeriod||[]).map(v=>-v)} negative indent={1}/>
+              <WFRow label="Monitoring Fee" data={(r.tifiaMonitoringPerPeriod||[]).map(v=>-v)} negative indent={1}/>
+              <WFRow label="CFADS for DSCR" data={r.cfadsForDscr||r.cfadsByPeriod} bold separator accent="amber"/>
+            </>}
+
+            {/* ── DEBT SERVICE PER INSTRUMENT ── */}
+            <SectionRow label="Debt Service Waterfall"/>
+            {activeInsts.map(inst => {
+              const sched = r.debtSchedules?.[inst.id];
+              if(!sched) return null;
+              const totalDS = periods.map((_,i) => -((sched.interest[i]||0)+(sched.principal[i]||0)));
+              return <React.Fragment key={inst.id}>
+                <tr className="bg-stone-900/30"><td colSpan={periods.length+1} className="sticky left-0 py-1 px-3 text-[10px] text-stone-300 bg-stone-950">{inst.type} ({inst.id}) — {inst.seniority}</td></tr>
+                <WFRow label="Interest" data={sched.interest.map(v=>-v)} negative indent={1}/>
+                <WFRow label="Principal" data={sched.principal.map(v=>-v)} negative indent={1}/>
+                <WFRow label="Total DS" data={totalDS} negative bold indent={1}/>
+                <WFRow label="Outstanding Balance" data={sched.balance} indent={1} sub="(end of period)"/>
+              </React.Fragment>;
+            })}
+
+            {/* ── COVERAGE RATIOS ── */}
+            <SectionRow label="Coverage Ratios"/>
+            <WFRow label="Senior DSCR" data={r.seniorDSCR} ratio bold accent="amber" separator/>
+            <WFRow label="Total DSCR (incl. sub debt)" data={r.totalDSCR} ratio bold accent="amber"/>
+            {r.llcr && <WFRow label="LLCR" data={r.llcr} ratio accent="amber"/>}
+
+            {/* ── RESERVE ACCOUNTS ── */}
+            {(dsraTarget > 0 || mraAnnual > 0) && <>
+              <SectionRow label="Reserve Accounts"/>
+              {dsraTarget > 0 && <>
+                <WFRow label="DSRA Deposit" data={dsraDeposit.map(v=>-v)} negative indent={1} sub="(from cashflow if below target)"/>
+                <WFRow label="DSRA Release" data={dsraRelease} positive indent={1}/>
+                <WFRow label="DSRA Balance" data={dsraBalance} indent={1} bold/>
+              </>}
+              {mraAnnual > 0 && <>
+                <WFRow label="MRA Contribution" data={mraDeposit.map(v=>-v)} negative indent={1}/>
+                <WFRow label="MRA Balance" data={mraBalance} indent={1} bold/>
+              </>}
+            </>}
+
+            {/* ── EQUITY DISTRIBUTION ── */}
+            <SectionRow label="Equity Distribution"/>
+            <WFRow label="Distributable CF (pre-lockup)" data={(r.rawEquityCF||r.equityCF||[])} positive bold separator accent="amber"/>
+            {(r.lockup||[]).some(v=>v) && (
+              <WFRow label="Lockup Amount (escrowed)" data={(r.lockup||[]).map((lk,i)=>lk ? -(((r.rawEquityCF||r.equityCF||[])[i])||0) : 0)} negative indent={1}/>
+            )}
+            <WFRow label="Equity CF (distributed)" data={r.equityCF||r.rawEquityCF||[]} positive bold/>
+            <WFRow label="Cumulative Equity CF" data={cumEquityCF} positive separator sub="(running total)"/>
           </tbody>
         </table>
       </div>
-      <div className="text-[10px] text-stone-500 mt-2">* = partial period (less than full days). Senior DSCR = CFADS_for_DSCR / Sr DS. Total DSCR = CFADS_for_DSCR / (Sr+Sub) DS.</div>
+      <div className="text-[10px] text-stone-500 mt-2">
+        Brackets = outflows. DSRA funded at FC from bond proceeds — initial balance does not appear as periodic deposit.
+        Semi-annual periods; dates shown are period end labels.
+        {(r.idcByInst?.pab1?.escrow||0) > 0 && ` PAB IDC: Gross $${(r.idcByInst.pab1.gross/1e6).toFixed(1)}M − Escrow earnings $${(r.idcByInst.pab1.escrow/1e6).toFixed(1)}M = Net IDC $${(r.idcByInst.pab1.net/1e6).toFixed(1)}M.`}
+      </div>
     </Section>
   </div>;
 }
@@ -4227,7 +4433,25 @@ const TABS = [
 ];
 
 export default function App(){
-  const [model, setModel] = useState(defaultModel);
+  const [model, setModel] = useState(()=>{
+    // State migration: patch old saved states missing sub1 instrument or using fg1 as plug
+    const migrateModel = (m) => {
+      if(!m || !m.financing) return m;
+      const hasSub1 = m.financing.instruments.some(i => i.id === 'sub1');
+      const insts = hasSub1 ? m.financing.instruments : [
+        {id:'sub1',type:'Upfront Subsidy',amount:0,rate:0,tenorYears:0,closeDate:m.general?.financialCloseDate||'2026-07-01',
+         seniority:'Grant',repaymentStyle:'Bullet',drawdownPriority:0,targetDSCR:0,ioYears:0,deferralYears:0,
+         dayCount:'30/360',covenants:'Government viability gap funding — sized by Optimizer',issuanceCost:0,issuanceCostEscalation:0},
+        ...m.financing.instruments
+      ];
+      const opt = m.optimizer || {};
+      const cas = opt.cascade || {};
+      const plugId = (cas.plugInstrumentId === 'fg1' || !cas.plugInstrumentId) ? 'sub1' : cas.plugInstrumentId;
+      return {...m, financing:{...m.financing, instruments:insts},
+        optimizer:{...opt, plugInstrumentId:plugId, cascade:{...cas, plugInstrumentId:plugId}}};
+    };
+    return migrateModel(defaultModel);
+  });
   const [tab, setTab] = useState('dashboard');
   const [scenarioName, setScenarioName] = useState('');
   const [savedScenarios, setSavedScenarios] = useState([]);
@@ -4248,7 +4472,26 @@ export default function App(){
       setSavedScenarios(listScenarios()); setScenarioName(''); } catch(e){ console.error(e); }
   };
   const loadScenario = (key)=>{
-    try { const raw = localStorage.getItem(key); if(raw) setModel(JSON.parse(raw)); } catch(e){ console.error(e); }
+    try {
+      const raw = localStorage.getItem(key);
+      if(raw){
+        const loaded = JSON.parse(raw);
+        // Apply same migration to loaded scenarios
+        const hasSub1 = loaded.financing?.instruments?.some(i=>i.id==='sub1');
+        const insts = hasSub1 ? loaded.financing.instruments : [
+          {id:'sub1',type:'Upfront Subsidy',amount:0,rate:0,tenorYears:0,
+           closeDate:loaded.general?.financialCloseDate||'2026-07-01',seniority:'Grant',
+           repaymentStyle:'Bullet',drawdownPriority:0,targetDSCR:0,ioYears:0,deferralYears:0,
+           dayCount:'30/360',covenants:'Government viability gap funding — sized by Optimizer',
+           issuanceCost:0,issuanceCostEscalation:0},
+          ...loaded.financing.instruments
+        ];
+        const opt = loaded.optimizer||{}, cas = opt.cascade||{};
+        const plugId = (cas.plugInstrumentId==='fg1'||!cas.plugInstrumentId)?'sub1':cas.plugInstrumentId;
+        setModel({...loaded, financing:{...loaded.financing, instruments:insts},
+          optimizer:{...opt, plugInstrumentId:plugId, cascade:{...cas, plugInstrumentId:plugId}}});
+      }
+    } catch(e){ console.error(e); }
   };
   if(!results) return <div className="min-h-screen bg-stone-950 text-rose-300 p-8 font-mono">Model error — check console.</div>;
   return (
