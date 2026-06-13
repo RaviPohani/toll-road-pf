@@ -836,17 +836,18 @@ function computeIRR(flows, guess=0.1){
 function buildFullModel(rawModel){
   // Defensive merge: ensure all required top-level keys exist
   // (guards against stale localStorage states missing fields)
+  const DM = defaultModel();  // defaultModel is a factory function
   const model = {
-    general:    rawModel?.general    || defaultModel.general,
-    capex:      rawModel?.capex      || defaultModel.capex,
-    paygo:      rawModel?.paygo      || defaultModel.paygo,
-    revenue:    rawModel?.revenue    || defaultModel.revenue,
-    opex:       rawModel?.opex       || defaultModel.opex,
-    financing:  rawModel?.financing  || defaultModel.financing,
-    tifia:      rawModel?.tifia      || defaultModel.tifia,
-    controlAccounts: rawModel?.controlAccounts || defaultModel.controlAccounts,
-    optimizer:  rawModel?.optimizer  || defaultModel.optimizer,
-    vfm:        rawModel?.vfm        || defaultModel.vfm,
+    general:    rawModel?.general    || DM.general,
+    capex:      rawModel?.capex      || DM.capex,
+    paygo:      rawModel?.paygo      || DM.paygo,
+    revenue:    rawModel?.revenue    || DM.revenue,
+    opex:       rawModel?.opex       || DM.opex,
+    financing:  rawModel?.financing  || DM.financing,
+    tifia:      rawModel?.tifia      || DM.tifia,
+    controlAccounts: rawModel?.controlAccounts || DM.controlAccounts,
+    optimizer:  rawModel?.optimizer  || DM.optimizer,
+    vfm:        rawModel?.vfm        || DM.vfm,
   };
   const ppy = model.general.periodsPerYear || 2;
   const capexSched = buildCapexSchedule(model);
@@ -4450,15 +4451,16 @@ const TABS = [
 
 export default function App(){
   const [model, setModel] = useState(()=>{
+    const DM = defaultModel();  // factory — call it once
     // State migration: patch old saved states missing sub1, tifia.instrumentId, etc.
     const migrateModel = (m) => {
-      if(!m || !m.financing || !m.general) return defaultModel;  // corrupt → reset
+      if(!m || !m.financing || !m.general) return DM;  // corrupt → reset
       // 1. Patch tifia config — old saves may lack instrumentId or capPeriodMonths
       const tifia = m.tifia
-        ? { ...defaultModel.tifia, ...m.tifia,
+        ? { ...DM.tifia, ...m.tifia,
             instrumentId: m.tifia.instrumentId || 'tifia1',
             capPeriodMonths: m.tifia.capPeriodMonths || 6 }
-        : { ...defaultModel.tifia };
+        : { ...DM.tifia };
       // 2. Add sub1 if missing
       const hasSub1 = m.financing.instruments?.some(i => i.id === 'sub1');
       const insts = hasSub1 ? m.financing.instruments : [
@@ -4473,19 +4475,20 @@ export default function App(){
       // 3. Fix plug from fg1 → sub1
       const opt = m.optimizer || {}, cas = opt.cascade || {};
       const plugId = (cas.plugInstrumentId === 'fg1' || !cas.plugInstrumentId) ? 'sub1' : cas.plugInstrumentId;
-      // Always return a complete model merged over defaultModel so nothing is missing
+      // Always return a complete model merged over defaults so nothing is missing
       return {
-        ...defaultModel,  // base — ensures every key exists
-        ...m,             // user values override
-        general:    {...defaultModel.general,    ...(m.general||{})},
+        ...DM,   // base — ensures every key exists
+        ...m,    // user values override
+        general:    {...DM.general,    ...(m.general||{})},
         tifia,
-        financing:  {...defaultModel.financing,  ...m.financing, instruments:insts},
-        optimizer:  {...defaultModel.optimizer,  ...opt, plugInstrumentId:plugId,
-          cascade:{...(defaultModel.optimizer.cascade||{}), ...cas, plugInstrumentId:plugId,
+        financing:  {...DM.financing,  ...m.financing, instruments:insts},
+        optimizer:  {...DM.optimizer,  ...opt, plugInstrumentId:plugId,
+          cascade:{...(DM.optimizer.cascade||{}), ...cas, plugInstrumentId:plugId,
             tifiaEnabled: cas.tifiaEnabled !== false}},
       };
     };
-    return migrateModel(defaultModel);
+    // Start with fresh default. Saved scenarios are loaded explicitly via the Load button.
+    return DM;
   });
   const [tab, setTab] = useState('dashboard');
   const [scenarioName, setScenarioName] = useState('');
