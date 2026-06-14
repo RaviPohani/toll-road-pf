@@ -230,6 +230,8 @@ def default_model() -> Dict[str, Any]:
         'controlAccounts': {
             'dsraMonthsDS': 6, 'omReserveMonths': 3,
             'rampUpReserveAmount': 15_000_000, 'rampUpReleaseYears': 5,
+            'dsraFundingMode': 'initial', 'omFundingMode': 'deposits', 'mmrFundingMode': 'deposits',
+            'dsraUseMaxAnnualDS': True,
             'mmrTargetSchedule': [
                 {'yearStart': 1,  'annualFunding': 2_500_000},
                 {'yearStart': 10, 'annualFunding': 5_000_000},
@@ -976,6 +978,16 @@ def build_control_accounts(model: Dict[str, Any], periods: List[Dict[str, Any]],
                 nao += opex[i + k] or 0
         dsra[i] = nads * (ca['dsraMonthsDS'] / 12)
         om[i] = nao * (ca['omReserveMonths'] / 12)
+    # DSRA target: optionally max annual DS across tenor
+    if ca.get('dsraUseMaxAnnualDS'):
+        max_annual_ds = 0.0
+        for i in range(0, n, ppy):
+            yr = sum((ds[i + k] or 0) for k in range(ppy) if i + k < n)
+            if yr > max_annual_ds:
+                max_annual_ds = yr
+        for i in range(n):
+            if (ds[i] or 0) > 0 or (i > 0 and dsra[i - 1] > 0):
+                dsra[i] = max_annual_ds
     rb = ca['rampUpReserveAmount']
     rel_per = ca['rampUpReserveAmount'] / max(1, ca['rampUpReleaseYears'] * ppy)
     for i in range(n):
@@ -994,7 +1006,47 @@ def build_control_accounts(model: Dict[str, Any], periods: List[Dict[str, Any]],
                 break
         mb += af * periods[i]['yearFraction']
         mmr[i] = mb
-    return {'dsraTarget': dsra, 'omTarget': om, 'rampUp': ramp, 'mmr': mmr}
+
+    # ── Reserve movements: deposits / releases / balance per funding mode ──
+    def build_movements(target, mode):
+        deposit, release, balance = _zeros(n), _zeros(n), _zeros(n)
+        bal = (target[0] if target and mode == 'initial' else 0.0)
+        if mode == 'initial' and target:
+            bal = max(target) if any(target) else 0.0
+        initial_fund = bal if mode == 'initial' else 0.0
+        for i in range(n):
+            tgt = target[i] or 0
+            if mode == 'deposits':
+                if bal < tgt:
+                    deposit[i] = tgt - bal; bal = tgt
+                elif bal > tgt:
+                    release[i] = bal - tgt; bal = tgt
+            else:
+                if bal > tgt:
+                    release[i] = bal - tgt; bal = tgt
+            balance[i] = bal
+        return {'deposit': deposit, 'release': release, 'balance': balance, 'initialFund': initial_fund}
+
+    dsra_mode = ca.get('dsraFundingMode', 'initial')
+    om_mode = ca.get('omFundingMode', 'deposits')
+    mmr_mode = ca.get('mmrFundingMode', 'deposits')
+    dsra_mov = build_movements(dsra, dsra_mode)
+    om_mov = build_movements(om, om_mode)
+    mmr_mov = build_movements(mmr, mmr_mode)
+    ramp_mov = {'deposit': _zeros(n), 'release': _zeros(n), 'balance': list(ramp), 'initialFund': ca['rampUpReserveAmount']}
+    for i in range(n):
+        prev = ca['rampUpReserveAmount'] if i == 0 else ramp[i - 1]
+        ramp_mov['release'][i] = max(0, prev - ramp[i])
+
+    total_initial = ((dsra_mov['initialFund'] if dsra_mode == 'initial' else 0)
+                     + (om_mov['initialFund'] if om_mode == 'initial' else 0)
+                     + (mmr_mov['initialFund'] if mmr_mode == 'initial' else 0)
+                     + ca['rampUpReserveAmount'])
+
+    return {'dsraTarget': dsra, 'omTarget': om, 'rampUp': ramp, 'mmr': mmr,
+            'dsra': dsra_mov, 'om': om_mov, 'mmrAcct': mmr_mov, 'rampAcct': ramp_mov,
+            'dsraMode': dsra_mode, 'omMode': om_mode, 'mmrMode': mmr_mode,
+            'totalInitialReserveFunding': total_initial}
 
 
 def check_lockup(senior_dscr: List[Optional[float]], llcr: List[Optional[float]],
@@ -1141,7 +1193,8 @@ def build_full_model(model: Dict[str, Any]) -> Dict[str, Any]:
     for inst in instruments:
         base = inst.get('issuanceCost', 0) or 0
         esc = inst.get('issuanceCostEscalation', 0) or 0
-        escalated = base * ((1 + esc) ** years_to_fc) if base > 0 else 0
+        # No issuance cost if the instrument isn't actually issued (amount = 0)
+        escalated = base * ((1 + esc) ** years_to_fc) if (base > 0 and (inst.get('amount', 0) or 0) > 0) else 0
         issuance_costs_by_id[inst['id']] = escalated
         total_issuance_cost += escalated
     total_uses = capex_sched['totalNominal'] + nt_idc + tifia_constr['capitalizedInterestTotal'] + financing_fees + total_issuance_cost
@@ -1184,7 +1237,7 @@ def build_full_model(model: Dict[str, Any]) -> Dict[str, Any]:
     tifia_admin_per_period = _zeros(n)
     tifia_monitoring_per_period = _zeros(n)
     tifia_fees_per_period = _zeros(n)
-    if tifia_inst:
+    if tifia_inst and (tifia_inst.get('amount', 0) or 0) > 0:
         admin_yr = model['tifia'].get('adminFeeAnnual', 0) or 0
         mon_bps = model['tifia'].get('monitoringFeeBps', 0) or 0
         admin_per = admin_yr / ppy
@@ -1210,12 +1263,28 @@ def build_full_model(model: Dict[str, Any]) -> Dict[str, Any]:
     lockup = check_lockup(senior_dscr, llcr_senior, model['tifia'], periods)
     control_accts = build_control_accounts(model, periods, total_ds, opex_sched['byPeriod'])
 
+    # Net reserve movement (deposits outflow, releases inflow); only 'deposits'-mode reserves hit operating cash
+    reserve_net_deposit = _zeros(n)
+    for i in range(n):
+        net = 0.0
+        if control_accts['dsraMode'] == 'deposits':
+            net += (control_accts['dsra']['deposit'][i] or 0) - (control_accts['dsra']['release'][i] or 0)
+        if control_accts['omMode'] == 'deposits':
+            net += (control_accts['om']['deposit'][i] or 0) - (control_accts['om']['release'][i] or 0)
+        if control_accts['mmrMode'] == 'deposits':
+            net += (control_accts['mmrAcct']['deposit'][i] or 0) - (control_accts['mmrAcct']['release'][i] or 0)
+        net -= (control_accts['rampAcct']['release'][i] or 0)
+        reserve_net_deposit[i] = net
+
     raw_equity_cf = _zeros(n)
     for i in range(n):
         if model['waterfall']['mode'] == 'Debt-first (Revenue \u2192 DS \u2192 Opex)':
-            raw_equity_cf[i] = rev_sched['byPeriod'][i] - total_ds[i] - opex_sched['byPeriod'][i] - tifia_fees_per_period[i]
+            base = rev_sched['byPeriod'][i] - total_ds[i] - opex_sched['byPeriod'][i] - tifia_fees_per_period[i]
         else:
-            raw_equity_cf[i] = cfads_for_dscr[i] - total_ds[i]
+            base = cfads_for_dscr[i] - total_ds[i]
+        raw_equity_cf[i] = base - reserve_net_deposit[i]
+
+    initial_reserve_funding = control_accts.get('totalInitialReserveFunding', 0)
 
     lockup_acct = build_lockup_account(raw_equity_cf, lockup, periods)
     equity_cf = lockup_acct['equityCFAfterLockup']
@@ -1265,6 +1334,7 @@ def build_full_model(model: Dict[str, Any]) -> Dict[str, Any]:
         'overall_obligation': overall_obl, 'overall_passes': overall_passes,
         'lockup': lockup, 'lockup_acct': lockup_acct, 'raw_equity_cf': raw_equity_cf,
         'control_accts': control_accts, 'equity_cf': equity_cf,
+        'reserve_net_deposit': reserve_net_deposit, 'initial_reserve_funding': initial_reserve_funding,
         'equity_irr': equity_irr, 'project_irr': project_irr,
         'min_senior_dscr': min(finite_d) if finite_d else None,
         'avg_senior_dscr': sum(finite_d) / len(finite_d) if finite_d else None,
