@@ -111,6 +111,11 @@ const defaultModel = () => ({
   controlAccounts: {
     dsraMonthsDS:6, omReserveMonths:3, rampUpReserveAmount:15_000_000, rampUpReleaseYears:5,
     mmrTargetSchedule:[{yearStart:1,annualFunding:2_500_000},{yearStart:10,annualFunding:5_000_000},{yearStart:20,annualFunding:8_000_000}],
+    // Funding mode per reserve: 'initial' = funded at SC from proceeds (appears as Use);
+    //                           'deposits' = built up from operating cash, reduces distributions
+    dsraFundingMode:'initial', omFundingMode:'deposits', mmrFundingMode:'deposits',
+    // DSRA initial-funded target = max annual DS across tenor (computed); else uses dsraMonthsDS
+    dsraUseMaxAnnualDS:true,
   },
   optimizer: {
     mode:'joint',
@@ -787,6 +792,19 @@ function buildControlAccounts(model, periods, ds, opex){
     dsra[i] = nADS * (ca.dsraMonthsDS/12);
     om[i] = nAO * (ca.omReserveMonths/12);
   }
+  // DSRA target: optionally use max annual DS across tenor (look-forward)
+  let dsraTargetLevel;
+  if(ca.dsraUseMaxAnnualDS){
+    let maxAnnualDS = 0;
+    for(let i=0;i<n;i+=ppy){
+      let yr = 0; for(let k=0;k<ppy && i+k<n;k++) yr += ds[i+k]||0;
+      if(yr > maxAnnualDS) maxAnnualDS = yr;
+    }
+    dsraTargetLevel = maxAnnualDS;
+    for(let i=0;i<n;i++) dsra[i] = ds[i] > 0 || (i>0 && dsra[i-1]>0) ? maxAnnualDS : dsra[i];
+  } else {
+    dsraTargetLevel = Math.max(...dsra, 0);
+  }
   let rb = ca.rampUpReserveAmount;
   const relPer = ca.rampUpReserveAmount / Math.max(1, ca.rampUpReleaseYears * ppy);
   for(let i=0;i<n;i++){ rb = Math.max(0, rb-relPer); ramp[i] = rb; }
@@ -800,7 +818,58 @@ function buildControlAccounts(model, periods, ds, opex){
     mb += af * periods[i].yearFraction;
     mmr[i] = mb;
   }
-  return { dsraTarget: dsra, omTarget: om, rampUp: ramp, mmr };
+
+  // ── Reserve MOVEMENTS: deposits (outflow), releases (inflow), running balance ──
+  // Per-reserve funding mode: 'initial' (funded at SC, sits as a Use) vs 'deposits' (from operating cash)
+  const buildMovements = (target, mode, isFirstActive) => {
+    const deposit = zeros(n), release = zeros(n), balance = zeros(n);
+    let bal = 0;
+    const initialFund = mode === 'initial' ? (target[0] || Math.max(...target, 0)) : 0;
+    if(mode === 'initial'){
+      bal = initialFund;  // funded at SC from proceeds; no operating deposit
+    }
+    for(let i=0;i<n;i++){
+      const tgt = target[i] || 0;
+      if(mode === 'deposits'){
+        if(bal < tgt){ deposit[i] = tgt - bal; bal = tgt; }
+        else if(bal > tgt){ release[i] = bal - tgt; bal = tgt; }
+      } else {
+        // initial mode: balance tracks target via releases only (no operating deposits)
+        if(bal > tgt){ release[i] = bal - tgt; bal = tgt; }
+      }
+      balance[i] = bal;
+    }
+    return { deposit, release, balance, initialFund };
+  };
+
+  const dsraMode = ca.dsraFundingMode || 'initial';
+  const omMode = ca.omFundingMode || 'deposits';
+  const mmrMode = ca.mmrFundingMode || 'deposits';
+
+  const dsraMov = buildMovements(dsra, dsraMode);
+  const omMov = buildMovements(om, omMode);
+  const mmrMov = buildMovements(mmr, mmrMode);
+  // Ramp-up reserve: funded at SC, releases over rampUpReleaseYears
+  const rampMov = { deposit: zeros(n), release: zeros(n), balance: ramp.slice(), initialFund: ca.rampUpReserveAmount };
+  for(let i=0;i<n;i++){
+    const prev = i===0 ? ca.rampUpReserveAmount : ramp[i-1];
+    rampMov.release[i] = Math.max(0, prev - ramp[i]);
+  }
+
+  // Total initial funding (from proceeds at SC) for Sources & Uses
+  const totalInitialReserveFunding =
+    (dsraMode === 'initial' ? dsraMov.initialFund : 0) +
+    (omMode === 'initial' ? omMov.initialFund : 0) +
+    (mmrMode === 'initial' ? mmrMov.initialFund : 0) +
+    ca.rampUpReserveAmount;
+
+  return {
+    dsraTarget: dsra, omTarget: om, rampUp: ramp, mmr,
+    dsraTargetLevel,
+    dsra: dsraMov, om: omMov, mmrAcct: mmrMov, rampAcct: rampMov,
+    dsraMode, omMode, mmrMode,
+    totalInitialReserveFunding,
+  };
 }
 
 // ---------- LOCKUP ----------
@@ -952,7 +1021,8 @@ function buildFullModel(rawModel){
   for(const inst of instruments){
     const base = inst.issuanceCost || 0;
     const esc = inst.issuanceCostEscalation || 0;
-    const escalated = base > 0 ? base * Math.pow(1 + esc, yearsToFC) : 0;
+    // No issuance cost if the instrument isn't actually issued (amount = 0, e.g. TIFIA off)
+    const escalated = (base > 0 && (inst.amount || 0) > 0) ? base * Math.pow(1 + esc, yearsToFC) : 0;
     issuanceCostsByID[inst.id] = escalated;
     totalIssuanceCost += escalated;
   }
@@ -990,7 +1060,7 @@ function buildFullModel(rawModel){
   const totalDS = seniorDS.map((v,i)=>v + subDS[i] + shortDS[i]);
   // TIFIA admin + monitoring fees per period
   const tifiaAdminPerPeriod = zeros(n), tifiaMonitoringPerPeriod = zeros(n), tifiaFeesPerPeriod = zeros(n);
-  if(tifiaInst){
+  if(tifiaInst && (tifiaInst.amount || 0) > 0){  // only charge fees if TIFIA actually drawn
     const adminYr = model.tifia.adminFeeAnnual || 0;
     const monBps = model.tifia.monitoringFeeBps || 0;
     const adminPer = adminYr / ppy;
@@ -1014,15 +1084,32 @@ function buildFullModel(rawModel){
   sortedInst.forEach(inst=>{ walByInstrument[inst.id] = computeWAL(debtSchedules[inst.id].principal, periods, inst.principalAfterIDC ?? inst.amount); });
   const lockup = checkLockup(seniorDSCR, llcrSenior, model.tifia, periods);
   const controlAccts = buildControlAccounts(model, periods, totalDS, opexSched.byPeriod);
-  // Raw equity CF before lockup trapping
+  // Net reserve movement per period (deposits are outflows, releases inflows)
+  // Only reserves in 'deposits' mode affect operating cash; 'initial' mode is funded from proceeds at SC.
+  const reserveNetDeposit = zeros(n);
+  for(let i=0;i<n;i++){
+    let net = 0;
+    if(controlAccts.dsraMode === 'deposits') net += (controlAccts.dsra.deposit[i]||0) - (controlAccts.dsra.release[i]||0);
+    if(controlAccts.omMode === 'deposits') net += (controlAccts.om.deposit[i]||0) - (controlAccts.om.release[i]||0);
+    if(controlAccts.mmrMode === 'deposits') net += (controlAccts.mmrAcct.deposit[i]||0) - (controlAccts.mmrAcct.release[i]||0);
+    // Ramp-up reserve releases always add back to cash
+    net -= (controlAccts.rampAcct.release[i]||0);
+    reserveNetDeposit[i] = net;
+  }
+  // Raw equity CF before lockup trapping (after reserve movements)
   const rawEquityCF = zeros(n);
   for(let i=0;i<n;i++){
+    let base;
     if(model.waterfall.mode === 'Debt-first (Revenue → DS → Opex)'){
-      rawEquityCF[i] = revSched.byPeriod[i] - totalDS[i] - opexSched.byPeriod[i] - tifiaFeesPerPeriod[i];
+      base = revSched.byPeriod[i] - totalDS[i] - opexSched.byPeriod[i] - tifiaFeesPerPeriod[i];
     } else {
-      rawEquityCF[i] = cfadsForDscr[i] - totalDS[i];
+      base = cfadsForDscr[i] - totalDS[i];
     }
+    rawEquityCF[i] = base - reserveNetDeposit[i];  // reserves sit above equity in waterfall
   }
+  // Initial-funded reserves are a Use of funds at SC (drawn from proceeds)
+  const initialReserveFunding = controlAccts.totalInitialReserveFunding || 0;
+  const totalUsesWithReserves = totalUses + initialReserveFunding;
   // Lockup escrow: traps positive equity CF during lockup; releases on cure
   const lockupAcct = buildLockupAccount(rawEquityCF, lockup, periods);
   const equityCF = lockupAcct.equityCFAfterLockup;
@@ -1057,7 +1144,8 @@ function buildFullModel(rawModel){
     seniorBal, subBal, seniorInt, seniorPri, subInt, subPri,
     seniorDSCR, totalDSCR, llcrSenior, llcrTotal, plcrSenior,
     walByInstrument, overallObligation, overallPasses,
-    lockup, lockupAcct, rawEquityCF, controlAccts,
+    lockup, lockupAcct, rawEquityCF, controlAccts, reserveNetDeposit,
+    initialReserveFunding, totalUsesWithReserves,
     equityCF, equityIRR, projectIRR,
     minSeniorDSCR: finiteD.length ? Math.min(...finiteD) : null,
     avgSeniorDSCR: finiteD.length ? avg(finiteD) : null,
@@ -2455,7 +2543,17 @@ function OptimizerTab({model, setModel, results}){
       action={
         <label className="flex items-center gap-2 cursor-pointer">
           <span className="text-xs text-stone-400">{c.tifiaEnabled !== false ? 'TIFIA ON' : 'TIFIA OFF'}</span>
-          <button onClick={()=>setCascade({tifiaEnabled: c.tifiaEnabled === false})}
+          <button onClick={()=>{
+            const turningOff = c.tifiaEnabled !== false;
+            const newInsts = model.financing.instruments.map(i => {
+              if(i.id !== (c.tifiaInstrumentId||'tifia1')) return i;
+              if(turningOff) return {...i, _savedAmount: i.amount, amount: 0};
+              return {...i, amount: i._savedAmount != null ? i._savedAmount : i.amount};
+            });
+            setModel({...model,
+              financing:{...model.financing, instruments:newInsts},
+              optimizer:{...o, cascade:{...(o.cascade||{}), tifiaEnabled: !turningOff}}});
+          }}
             className={`w-12 h-6 rounded-full transition-colors ${c.tifiaEnabled !== false ? 'bg-amber-500' : 'bg-stone-700'} relative`}>
             <span className={`absolute top-1 w-4 h-4 rounded-full bg-white transition-transform ${c.tifiaEnabled !== false ? 'translate-x-7' : 'translate-x-1'}`}/>
           </button>
@@ -3421,28 +3519,13 @@ function CashflowTab({model, results}){
   const ppy = model.general.periodsPerYear || 2;
   const instruments = model.financing.instruments;
 
-  // Compute per-period DSRA/MRA movements from controlAccounts
-  const ca = model.controlAccounts || {};
-  const dsraTarget = ca.dsra?.targetAmount || 0;
-  const mraAnnual = ca.mra?.annualContribution || 0;
-  const mraPerPeriod = mraAnnual / ppy;
-
-  // Simple DSRA tracker: funded at FC from proceeds; draws if DSCR triggers lockup
-  const dsraBalance = Array(periods.length).fill(dsraTarget);
-  const dsraDeposit = Array(periods.length).fill(0);
-  const dsraRelease = Array(periods.length).fill(0);
-  const mraBalance = [];
-  const mraDeposit = Array(periods.length).fill(mraPerPeriod);
-  let mraBal = 0;
-  for(let i=0; i<periods.length; i++){
-    // If lockup triggered: equity CF diverted to DSRA instead
-    if((r.lockup||[])[i] && dsraBalance[i] < dsraTarget){
-      const topup = Math.min((r.rawEquityCF||[])[i]||0, dsraTarget - (dsraBalance[i-1]||dsraTarget));
-      dsraDeposit[i] = topup;
-    }
-    mraBal += mraPerPeriod;
-    mraBalance.push(mraBal);
-  }
+  // Reserve movements come straight from the engine's controlAccts
+  const cacct = r.controlAccts || {};
+  const dsraAcct = cacct.dsra || {deposit:[],release:[],balance:[]};
+  const omAcct = cacct.om || {deposit:[],release:[],balance:[]};
+  const mmrAcct = cacct.mmrAcct || {deposit:[],release:[],balance:[]};
+  const rampAcct = cacct.rampAcct || {deposit:[],release:[],balance:[]};
+  const hasReserves = (dsraAcct.balance||[]).some(v=>v>0) || (mmrAcct.balance||[]).some(v=>v>0) || (rampAcct.balance||[]).some(v=>v>0);
 
   // Cumulative equity CF
   let cumEqCF = 0;
@@ -3543,16 +3626,26 @@ function CashflowTab({model, results}){
             {r.llcr && <WFRow label="LLCR" data={r.llcr} ratio accent="amber"/>}
 
             {/* ── RESERVE ACCOUNTS ── */}
-            {(dsraTarget > 0 || mraAnnual > 0) && <>
+            {hasReserves && <>
               <SectionRow label="Reserve Accounts"/>
-              {dsraTarget > 0 && <>
-                <WFRow label="DSRA Deposit" data={dsraDeposit.map(v=>-v)} negative indent={1} sub="(from cashflow if below target)"/>
-                <WFRow label="DSRA Release" data={dsraRelease} positive indent={1}/>
-                <WFRow label="DSRA Balance" data={dsraBalance} indent={1} bold/>
+              {(dsraAcct.balance||[]).some(v=>v>0) && <>
+                <WFRow label={`DSRA Deposit ${cacct.dsraMode==='initial'?'(initial @ SC)':'(from cash)'}`} data={(dsraAcct.deposit||[]).map(v=>-v)} negative indent={1}/>
+                <WFRow label="DSRA Release ↑ (lifts coverage)" data={dsraAcct.release||[]} positive indent={1} accent="emerald"/>
+                <WFRow label="DSRA Balance" data={dsraAcct.balance||[]} indent={1} bold/>
               </>}
-              {mraAnnual > 0 && <>
-                <WFRow label="MRA Contribution" data={mraDeposit.map(v=>-v)} negative indent={1}/>
-                <WFRow label="MRA Balance" data={mraBalance} indent={1} bold/>
+              {(omAcct.balance||[]).some(v=>v>0) && <>
+                <WFRow label={`O&M Reserve Deposit ${cacct.omMode==='initial'?'(initial)':'(from cash)'}`} data={(omAcct.deposit||[]).map(v=>-v)} negative indent={1}/>
+                <WFRow label="O&M Reserve Release" data={omAcct.release||[]} positive indent={1}/>
+                <WFRow label="O&M Reserve Balance" data={omAcct.balance||[]} indent={1} bold/>
+              </>}
+              {(mmrAcct.balance||[]).some(v=>v>0) && <>
+                <WFRow label={`Major Maint. Reserve Deposit ${cacct.mmrMode==='initial'?'(initial)':'(from cash)'}`} data={(mmrAcct.deposit||[]).map(v=>-v)} negative indent={1}/>
+                <WFRow label="Major Maint. Reserve Release" data={mmrAcct.release||[]} positive indent={1}/>
+                <WFRow label="Major Maint. Reserve Balance" data={mmrAcct.balance||[]} indent={1} bold/>
+              </>}
+              {(rampAcct.balance||[]).some(v=>v>0) && <>
+                <WFRow label="Ramp-up Reserve Release" data={rampAcct.release||[]} positive indent={1} accent="emerald"/>
+                <WFRow label="Ramp-up Reserve Balance" data={rampAcct.balance||[]} indent={1} bold/>
               </>}
             </>}
 
