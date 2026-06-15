@@ -824,20 +824,21 @@ function buildControlAccounts(model, periods, ds, opex){
   const buildMovements = (target, mode, isFirstActive) => {
     const deposit = zeros(n), release = zeros(n), balance = zeros(n);
     let bal = 0;
-    const initialFund = mode === 'initial' ? (target[0] || Math.max(...target, 0)) : 0;
-    if(mode === 'initial'){
-      bal = initialFund;  // funded at SC from proceeds; no operating deposit
-    }
+    const targetLevel = Math.max(...target, 0);
+    const initialFund = mode === 'initial' ? targetLevel : 0;
+    if(mode === 'initial') bal = initialFund;  // funded at SC, held constant
     for(let i=0;i<n;i++){
       const tgt = target[i] || 0;
       if(mode === 'deposits'){
         if(bal < tgt){ deposit[i] = tgt - bal; bal = tgt; }
         else if(bal > tgt){ release[i] = bal - tgt; bal = tgt; }
+        balance[i] = bal;
       } else {
-        // initial mode: balance tracks target via releases only (no operating deposits)
-        if(bal > tgt){ release[i] = bal - tgt; bal = tgt; }
+        // initial mode: balance held at initialFund for the whole operating life;
+        // released only at the very end (last period)
+        balance[i] = (i === n-1) ? 0 : initialFund;
+        if(i === n-1) release[i] = initialFund;
       }
-      balance[i] = bal;
     }
     return { deposit, release, balance, initialFund };
   };
@@ -2425,10 +2426,21 @@ function ControlAccountsTab({model, setModel, results}){
   const updateMMR = (i, patch) => setCA({mmrTargetSchedule: ca.mmrTargetSchedule.map((r,idx)=>idx===i?{...r,...patch}:r)});
   return <div>
     <Section title="DSRA — Debt Service Reserve Account">
-      <div className="grid grid-cols-2 gap-4"><Field label="Months of DS Held"><NumInput value={ca.dsraMonthsDS} onChange={v=>setCA({dsraMonthsDS:v})} suffix="mo"/></Field></div>
+      <div className="grid grid-cols-3 gap-4">
+        <Field label="Funding Mode" hint="Initial = funded at SC from proceeds. Deposits = built from operating cash, reduces distributions.">
+          <Select value={ca.dsraFundingMode||'initial'} onChange={v=>setCA({dsraFundingMode:v})} options={['initial','deposits']}/>
+        </Field>
+        <Field label="Sizing Basis" hint="Max annual DS = look-forward peak. Else uses months-of-DS.">
+          <Select value={ca.dsraUseMaxAnnualDS ? 'Max annual DS' : 'Months of DS'} onChange={v=>setCA({dsraUseMaxAnnualDS: v==='Max annual DS'})} options={['Max annual DS','Months of DS']}/>
+        </Field>
+        <Field label="Months of DS Held" hint="Used when sizing basis = Months of DS"><NumInput value={ca.dsraMonthsDS} onChange={v=>setCA({dsraMonthsDS:v})} suffix="mo"/></Field>
+      </div>
     </Section>
     <Section title="O&M Reserve">
-      <div className="grid grid-cols-2 gap-4"><Field label="Months of Opex Held"><NumInput value={ca.omReserveMonths} onChange={v=>setCA({omReserveMonths:v})} suffix="mo"/></Field></div>
+      <div className="grid grid-cols-2 gap-4">
+        <Field label="Funding Mode"><Select value={ca.omFundingMode||'deposits'} onChange={v=>setCA({omFundingMode:v})} options={['initial','deposits']}/></Field>
+        <Field label="Months of Opex Held"><NumInput value={ca.omReserveMonths} onChange={v=>setCA({omReserveMonths:v})} suffix="mo"/></Field>
+      </div>
     </Section>
     <Section title="Ramp-up Reserve">
       <div className="grid grid-cols-2 gap-4">
@@ -2436,7 +2448,7 @@ function ControlAccountsTab({model, setModel, results}){
         <Field label="Release Over (yrs)"><NumInput value={ca.rampUpReleaseYears} onChange={v=>setCA({rampUpReleaseYears:v})} suffix="yr"/></Field>
       </div>
     </Section>
-    <Section title="MMR — Major Maintenance Reserve" subtitle="Stepped annual funding by op year." action={<button onClick={()=>setCA({mmrTargetSchedule:[...ca.mmrTargetSchedule,{yearStart:1,annualFunding:0}]})} className="text-xs text-amber-300">+ stage</button>}>
+    <Section title="MMR — Major Maintenance Reserve" subtitle="Stepped annual funding by op year." action={<div className="flex items-center gap-3"><Field label=""><Select value={ca.mmrFundingMode||'deposits'} onChange={v=>setCA({mmrFundingMode:v})} options={['initial','deposits']}/></Field><button onClick={()=>setCA({mmrTargetSchedule:[...ca.mmrTargetSchedule,{yearStart:1,annualFunding:0}]})} className="text-xs text-amber-300">+ stage</button></div>}>
       <table className="w-full"><thead><tr><TH>Stage Start (Op. Year)</TH><TH className="text-right">Annual Funding</TH><TH></TH></tr></thead>
         <tbody>{ca.mmrTargetSchedule.map((s,i)=>(<tr key={i}>
           <TD><NumInput value={s.yearStart} onChange={v=>updateMMR(i,{yearStart:v})}/></TD>
