@@ -36,6 +36,10 @@ const defaultModel = () => ({
     projectName:'I-XXX Express Lanes', sponsor:'Concessionaire LLC', state:'Texas',
     financialCloseDate:'2026-07-01', constructionMonths:36, operationsYears:30,
     discountRate:0.07, periodsPerYear:2, useFiscalYear:false, fyStartMonth:7,
+    // Government support: 'subsidy' = upfront viability gap grant; 'ap' = availability payments over time
+    governmentSupportMode:'subsidy',
+    apEscalation:0.025,         // annual escalation of the availability payment
+    targetGearing:0.75,         // AP mode: max total debt as % of total uses
   },
   waterfall: { mode:'Opex-first (CFADS → DS)', overallObligationMin:1.00 },
   capex: {
@@ -73,9 +77,7 @@ const defaultModel = () => ({
     useDirectForecast:false, directForecast:[], inflate:true, inflRate:0.025,
     items: [
       {id:'rom',label:'Roadway O&M',base:4_500_000},
-      {id:'rmm',label:'Roadway Major Maintenance (annualized)',base:6_200_000},
       {id:'tom',label:'Tolling O&M',base:2_800_000},
-      {id:'tmm',label:'Tolling Major Maintenance (annualized)',base:1_400_000},
       {id:'clp',label:'Toll Collection — License Plate ($/txn)',base:0.45,perTxn:true,share:0.35},
       {id:'cvi',label:'Toll Collection — Video/Tag ($/txn)',base:0.08,perTxn:true,share:0.65},
     ],
@@ -110,11 +112,19 @@ const defaultModel = () => ({
   },
   controlAccounts: {
     dsraMonthsDS:6, omReserveMonths:3, rampUpReserveAmount:15_000_000, rampUpReleaseYears:5,
-    mmrTargetSchedule:[{yearStart:1,annualFunding:2_500_000},{yearStart:10,annualFunding:5_000_000},{yearStart:20,annualFunding:8_000_000}],
-    // Funding mode per reserve: 'initial' = funded at SC from proceeds (appears as Use);
-    //                           'deposits' = built up from operating cash, reduces distributions
-    dsraFundingMode:'initial', omFundingMode:'deposits', mmrFundingMode:'deposits',
-    // DSRA initial-funded target = max annual DS across tenor (computed); else uses dsraMonthsDS
+    // Major Maintenance: lumpy events pre-funded by smoothed MMR deposits, paid from reserve when due.
+    mmEventSchedule: [
+      {id:'rmm1', label:'Roadway MM', year:8,  amount:18_000_000},
+      {id:'rmm2', label:'Roadway MM', year:16, amount:22_000_000},
+      {id:'rmm3', label:'Roadway MM', year:24, amount:26_000_000},
+      {id:'tmm1', label:'Tolling MM', year:6,  amount:8_000_000},
+      {id:'tmm2', label:'Tolling MM', year:12, amount:9_000_000},
+      {id:'tmm3', label:'Tolling MM', year:18, amount:10_000_000},
+      {id:'tmm4', label:'Tolling MM', year:24, amount:11_000_000},
+    ],
+    mmInflation: 0.025,  // events escalate at this rate from FC
+    // Funding mode per reserve: 'initial' (funded at SC from proceeds) vs 'deposits' (from operating cash)
+    dsraFundingMode:'initial', omFundingMode:'deposits',
     dsraUseMaxAnnualDS:true,
   },
   optimizer: {
@@ -792,64 +802,101 @@ function buildControlAccounts(model, periods, ds, opex){
     dsra[i] = nADS * (ca.dsraMonthsDS/12);
     om[i] = nAO * (ca.omReserveMonths/12);
   }
-  // DSRA target: optionally use max annual DS across tenor (look-forward)
+  // DSRA target per period
   let dsraTargetLevel;
   if(ca.dsraUseMaxAnnualDS){
+    // MADS basis: constant target = peak annual DS across whole tenor, held flat while debt is live
     let maxAnnualDS = 0;
     for(let i=0;i<n;i+=ppy){
       let yr = 0; for(let k=0;k<ppy && i+k<n;k++) yr += ds[i+k]||0;
       if(yr > maxAnnualDS) maxAnnualDS = yr;
     }
     dsraTargetLevel = maxAnnualDS;
-    for(let i=0;i<n;i++) dsra[i] = ds[i] > 0 || (i>0 && dsra[i-1]>0) ? maxAnnualDS : dsra[i];
+    // Hold constant target while future debt service remains; release in final DS period
+    for(let i=0;i<n;i++){
+      let dsFuture = 0; for(let k=i+1;k<n;k++) dsFuture += ds[k]||0;
+      dsra[i] = dsFuture > 0 ? maxAnnualDS : 0;
+    }
   } else {
+    // Months-of-DS basis: forward-looking target = next dsraMonthsDS of debt service
     dsraTargetLevel = Math.max(...dsra, 0);
   }
   let rb = ca.rampUpReserveAmount;
   const relPer = ca.rampUpReserveAmount / Math.max(1, ca.rampUpReleaseYears * ppy);
   for(let i=0;i<n;i++){ rb = Math.max(0, rb-relPer); ramp[i] = rb; }
-  let mb = 0, cumY = 0;
-  for(let i=0;i<n;i++){
-    cumY += periods[i].yearFraction;
-    const y = Math.floor(cumY);
-    let af = 0;
-    const sched = ca.mmrTargetSchedule;
-    for(let s=sched.length-1;s>=0;s--) if(y+1 >= sched[s].yearStart){ af = sched[s].annualFunding; break; }
-    mb += af * periods[i].yearFraction;
-    mmr[i] = mb;
+
+  // ── MAJOR MAINTENANCE RESERVE: event-based pre-funding ──
+  // Each MM event (escalated to its year) is pre-funded by smoothed deposits from start-of-ops
+  // (or from the prior event) up to the event period. At the event, reserve pays the cost (release).
+  const mmEvents = (ca.mmEventSchedule || []).map(e => {
+    // Period index when the event occurs (year is in operating years, 1-based)
+    const eventPeriod = Math.round((e.year - 1) * ppy);
+    const escalated = e.amount * Math.pow(1 + (ca.mmInflation||0), e.year);  // escalate to event year
+    return { ...e, eventPeriod, escalatedAmount: escalated };
+  }).filter(e => e.eventPeriod >= 0 && e.eventPeriod < n)
+    .sort((a,b) => a.eventPeriod - b.eventPeriod);
+
+  const mmrDeposit = zeros(n), mmrRelease = zeros(n), mmrBalance = zeros(n);
+  const mmEventCost = zeros(n);  // the actual lumpy MM payment, funded by release
+  let mmrBal = 0;
+  let prevEventPeriod = 0;
+  for(const ev of mmEvents){
+    // Smooth deposits from prevEventPeriod up to (but not including) this event period
+    const fundStart = prevEventPeriod;
+    const fundEnd = ev.eventPeriod;
+    const periodsToFund = Math.max(1, fundEnd - fundStart);
+    const need = ev.escalatedAmount;  // build from current balance up to this
+    const perDeposit = (need - mmrBal) / periodsToFund;
+    for(let i=fundStart; i<fundEnd; i++){
+      if(i>=0 && i<n){ mmrDeposit[i] += Math.max(0, perDeposit); mmrBal += Math.max(0, perDeposit); mmrBalance[i] = mmrBal; }
+    }
+    // At the event period: pay the MM cost from reserve
+    if(ev.eventPeriod>=0 && ev.eventPeriod<n){
+      mmEventCost[ev.eventPeriod] += ev.escalatedAmount;
+      mmrRelease[ev.eventPeriod] += Math.min(mmrBal, ev.escalatedAmount);
+      mmrBal = Math.max(0, mmrBal - ev.escalatedAmount);
+      mmrBalance[ev.eventPeriod] = mmrBal;
+    }
+    prevEventPeriod = ev.eventPeriod;
   }
+  // Fill balance forward for periods after last event / between deposits
+  for(let i=1;i<n;i++){ if(mmrBalance[i]===0 && mmrDeposit[i]===0 && mmrRelease[i]===0 && mmEventCost[i]===0) mmrBalance[i] = mmrBalance[i-1]; }
+  // mmr target = balance trace
+  for(let i=0;i<n;i++) mmr[i] = mmrBalance[i];
 
   // ── Reserve MOVEMENTS: deposits (outflow), releases (inflow), running balance ──
-  // Per-reserve funding mode: 'initial' (funded at SC, sits as a Use) vs 'deposits' (from operating cash)
-  const buildMovements = (target, mode, isFirstActive) => {
+  // Both modes track the time-varying target with top-up deposits AND excess releases.
+  // Difference: 'initial' funds the period-0 target from proceeds at SC (not a cash deposit);
+  //             'deposits' funds everything from operating cash.
+  const buildMovements = (target, mode) => {
     const deposit = zeros(n), release = zeros(n), balance = zeros(n);
-    let bal = 0;
-    const targetLevel = Math.max(...target, 0);
-    const initialFund = mode === 'initial' ? targetLevel : 0;
-    if(mode === 'initial') bal = initialFund;  // funded at SC, held constant
+    // First period where the reserve has a positive target = funding start
+    let firstActive = target.findIndex(t => (t||0) > 0);
+    if(firstActive < 0) firstActive = 0;
+    const initialFund = mode === 'initial' ? (target[firstActive] || 0) : 0;
+    let bal = mode === 'initial' ? initialFund : 0;
     for(let i=0;i<n;i++){
       const tgt = target[i] || 0;
-      if(mode === 'deposits'){
-        if(bal < tgt){ deposit[i] = tgt - bal; bal = tgt; }
-        else if(bal > tgt){ release[i] = bal - tgt; bal = tgt; }
+      if(mode === 'initial' && i === firstActive){
+        // balance already pre-funded from proceeds to the initial target; no cash deposit
         balance[i] = bal;
-      } else {
-        // initial mode: balance held at initialFund for the whole operating life;
-        // released only at the very end (last period)
-        balance[i] = (i === n-1) ? 0 : initialFund;
-        if(i === n-1) release[i] = initialFund;
+        continue;
       }
+      // Both modes: top up when target rises, release when it falls
+      if(bal < tgt){ deposit[i] = tgt - bal; bal = tgt; }
+      else if(bal > tgt){ release[i] = bal - tgt; bal = tgt; }
+      balance[i] = bal;
     }
     return { deposit, release, balance, initialFund };
   };
 
   const dsraMode = ca.dsraFundingMode || 'initial';
   const omMode = ca.omFundingMode || 'deposits';
-  const mmrMode = ca.mmrFundingMode || 'deposits';
 
   const dsraMov = buildMovements(dsra, dsraMode);
   const omMov = buildMovements(om, omMode);
-  const mmrMov = buildMovements(mmr, mmrMode);
+  // MMR is always event-pre-funded from cash
+  const mmrMov = { deposit: mmrDeposit, release: mmrRelease, balance: mmrBalance, initialFund: 0, eventCost: mmEventCost };
   // Ramp-up reserve: funded at SC, releases over rampUpReleaseYears
   const rampMov = { deposit: zeros(n), release: zeros(n), balance: ramp.slice(), initialFund: ca.rampUpReserveAmount };
   for(let i=0;i<n;i++){
@@ -861,14 +908,14 @@ function buildControlAccounts(model, periods, ds, opex){
   const totalInitialReserveFunding =
     (dsraMode === 'initial' ? dsraMov.initialFund : 0) +
     (omMode === 'initial' ? omMov.initialFund : 0) +
-    (mmrMode === 'initial' ? mmrMov.initialFund : 0) +
     ca.rampUpReserveAmount;
 
   return {
     dsraTarget: dsra, omTarget: om, rampUp: ramp, mmr,
     dsraTargetLevel,
     dsra: dsraMov, om: omMov, mmrAcct: mmrMov, rampAcct: rampMov,
-    dsraMode, omMode, mmrMode,
+    dsraMode, omMode, mmrMode:'deposits',
+    mmEvents, mmEventCost,
     totalInitialReserveFunding,
   };
 }
@@ -1033,8 +1080,20 @@ function buildFullModel(rawModel){
   const n = periods.length;
   const revSched = buildRevenueSchedule(model, periods);
   const opexSched = buildOpexSchedule(model, periods, revSched);
+  // Availability payment stream (AP mode): government pays a level, escalating amount each period.
+  // apAmount is the per-period base; solved by the cascade (stored on model.financing.apAmount).
+  const apMode = model.general.governmentSupportMode === 'ap';
+  const apEsc = model.general.apEscalation || 0;
+  const apBasePerPeriod = apMode ? (model.financing.apAmount || 0) : 0;
+  const apStream = zeros(n);
+  if(apMode && apBasePerPeriod > 0){
+    for(let i=0;i<n;i++){
+      const yr = Math.floor(i / ppy);
+      apStream[i] = apBasePerPeriod * Math.pow(1 + apEsc, yr);
+    }
+  }
   const cfads = zeros(n);
-  for(let i=0;i<n;i++) cfads[i] = revSched.byPeriod[i] - opexSched.byPeriod[i];
+  for(let i=0;i<n;i++) cfads[i] = revSched.byPeriod[i] + apStream[i] - opexSched.byPeriod[i];
 
   const order = { 'Short-term':0, 'Senior':1, 'Subordinate':2, 'Grant':3, 'Equity':4, 'Paygo':5 };
   const sortedInst = [...instruments].sort((a,b)=>(order[a.seniority]??99)-(order[b.seniority]??99));
@@ -1092,7 +1151,9 @@ function buildFullModel(rawModel){
     let net = 0;
     if(controlAccts.dsraMode === 'deposits') net += (controlAccts.dsra.deposit[i]||0) - (controlAccts.dsra.release[i]||0);
     if(controlAccts.omMode === 'deposits') net += (controlAccts.om.deposit[i]||0) - (controlAccts.om.release[i]||0);
-    if(controlAccts.mmrMode === 'deposits') net += (controlAccts.mmrAcct.deposit[i]||0) - (controlAccts.mmrAcct.release[i]||0);
+    // MMR: deposit (smoothed) + actual MM event cost − release (reserve covers cost).
+    // Net cash = deposit, since eventCost ≈ release. Cost no longer in opex/CFADS.
+    net += (controlAccts.mmrAcct.deposit[i]||0) + (controlAccts.mmEventCost?.[i]||0) - (controlAccts.mmrAcct.release[i]||0);
     // Ramp-up reserve releases always add back to cash
     net -= (controlAccts.rampAcct.release[i]||0);
     reserveNetDeposit[i] = net;
@@ -1139,7 +1200,7 @@ function buildFullModel(rawModel){
     totalIssuanceCost, issuanceCostsByID,
     tifiaAdminPerPeriod, tifiaMonitoringPerPeriod, tifiaFeesPerPeriod, totalTifiaFees,
     cfadsForDscr,
-    revSched, opexSched, cfadsByPeriod: cfads,
+    revSched, opexSched, cfadsByPeriod: cfads, apStream, apMode, apBasePerPeriod,
     instruments: sortedInst, debtSchedules,
     seniorDS, subDS, shortDS, totalDS,
     seniorBal, subBal, seniorInt, seniorPri, subInt, subPri,
@@ -1484,6 +1545,128 @@ function buildTifiaCascadePhases(model, instrumentId, params, cfadsByPeriod){
 //   3. Equity = set externally (NPV @ IRR target)
 //   4. Grant = plug
 // CFADS_net = CFADS - TIFIA admin/monitoring fees.
+// ── AVAILABILITY-PAYMENT CASCADE ──
+// AP mode: contractual payment stream removes the CFADS coverage cap on debt.
+// 1) TIFIA → full 49% of eligible capex
+// 2) PABs → fill until total debt = target gearing × total uses
+// 3) Equity → fill remainder to target IRR
+// 4) AP (level, escalating) solved so equity hits target IRR
+function autoCascadeAP(model, params){
+  const working = JSON.parse(JSON.stringify(model));
+  const trace = [];
+  const tifiaEnabled = params.tifiaEnabled !== false;
+  const maxTifiaPct = params.maxTifiaPct || 0.49;
+  const targetGearing = model.general.targetGearing || 0.75;
+  const targetIRR = params.targetEquityIRR || 0.12;
+
+  // Build with a candidate AP base; size debt by gearing, equity as plug, return equity IRR
+  const evaluate = (apBase) => {
+    const w = JSON.parse(JSON.stringify(working));
+    w.financing.apAmount = apBase;
+    // STEP 1: TIFIA at full 49% of eligible capex
+    let tempR;
+    try { tempR = buildFullModel(w); } catch(e){ return {error:e.message}; }
+    let eligibleCost = 0;
+    for(const id of (params.tifiaEligibleCapexIds||[])) eligibleCost += sum(tempR.capexSched.byItem[id]||[]);
+    const tifia = w.financing.instruments.find(i=>i.id===params.tifiaInstrumentId);
+    if(tifia){
+      tifia.amount = tifiaEnabled ? Math.round(eligibleCost * maxTifiaPct) : 0;
+      if(tifiaEnabled){
+        // Build standard TIFIA phases
+        const phRes = buildTifiaCascadePhases(w, params.tifiaInstrumentId, {
+          deferYears: params.deferYears, ioYears: params.ioYears,
+          testYearsBeforeMaturity: params.testYearsBeforeMaturity, phase3Mode: params.phase3Mode,
+        }, tempR.cfadsForDscr || tempR.cfadsByPeriod);
+        if(!phRes.error){ tifia.phases = phRes.phases; tifia.repaymentStyle = 'Phased (multi-regime)'; }
+      }
+    }
+    // STEP 2: PAB sized so total debt = gearing × total uses
+    let rB;
+    try { rB = buildFullModel(w); } catch(e){ return {error:e.message}; }
+    const totalUses = rB.totalUsesWithReserves || rB.totalUses;
+    const targetDebt = targetGearing * totalUses;
+    const tifiaAmt = tifia ? tifia.amount : 0;
+    const pabInst = w.financing.instruments.find(i=>i.id===params.pabInstrumentId);
+    if(pabInst){
+      pabInst.amount = Math.max(0, Math.round(targetDebt - tifiaAmt));
+    }
+    // STEP 3: Equity as plug to balance; then measure IRR
+    let rC;
+    try { rC = buildFullModel(w); } catch(e){ return {error:e.message}; }
+    const eqInst = w.financing.instruments.find(i=>i.id===params.equityInstrumentId);
+    const gap = rC.totalUsesWithReserves - rC.totalSources;  // remaining funded by equity
+    if(eqInst){ eqInst.amount = Math.max(0, (eqInst.amount||0) + gap); }
+    let rD;
+    try { rD = buildFullModel(w); } catch(e){ return {error:e.message}; }
+    // Min total DSCR over debt-service periods
+    let minDSCR = Infinity;
+    for(let i=0;i<rD.periods.length;i++){
+      const td = (rD.seniorDS[i]||0) + (rD.subDS?.[i]||0);
+      if(td > 1000){
+        const cfi = rD.cfadsForDscr?.[i] ?? rD.cfadsByPeriod[i] ?? 0;
+        const d = cfi / td;
+        if(d < minDSCR) minDSCR = d;
+      }
+    }
+    if(!isFinite(minDSCR)) minDSCR = null;
+    return { w, irr: rD.equityIRR, minDSCR, result: rD, tifiaAmt, pabAmt: pabInst?pabInst.amount:0, eqAmt: eqInst?eqInst.amount:0, totalUses };
+  };
+
+  const minDSCRFloor = params.minTotalDSCR || 1.10;
+
+  // Solve 1: AP that hits target equity IRR
+  const solveFor = (testFn) => {
+    let lo = 0, hi = 300_000_000, found = null;
+    for(let iter=0; iter<44; iter++){
+      const mid = (lo+hi)/2;
+      const ev = evaluate(mid);
+      if(ev.error){ hi = mid; continue; }
+      found = ev;
+      const {ok, raise} = testFn(ev);
+      if(ok) break;
+      if(raise) lo = mid; else hi = mid;
+    }
+    return found;
+  };
+
+  // AP for IRR target
+  const evIRR = solveFor(ev => {
+    const irr = ev.irr || 0;
+    return { ok: Math.abs(irr - targetIRR) < 0.0001, raise: irr < targetIRR };
+  });
+  const apForIRR = evIRR ? evIRR.w.financing.apAmount : 0;
+
+  // AP for DSCR floor
+  const evDSCR = solveFor(ev => {
+    const d = ev.minDSCR ?? 99;
+    return { ok: Math.abs(d - minDSCRFloor) < 0.002, raise: d < minDSCRFloor };
+  });
+  const apForDSCR = evDSCR ? evDSCR.w.financing.apAmount : 0;
+
+  // Final AP = max of the two constraints (whichever binds)
+  const apFinal = Math.max(apForIRR, apForDSCR);
+  const binding = apForDSCR > apForIRR ? 'DSCR floor' : 'Equity IRR';
+  const best = evaluate(apFinal);
+  if(best.error) return { error:'AP cascade failed: '+best.error, converged:false };
+  best.w.financing.apAmount = apFinal;
+  trace.push({apForIRR, apForDSCR, apFinal, binding, irr: best.irr, minDSCR: best.minDSCR,
+    tifia: best.tifiaAmt, pab: best.pabAmt, equity: best.eqAmt});
+
+  return {
+    converged: true, trace,
+    best: {
+      apBasePerPeriod: apFinal,
+      apEscalation: model.general.apEscalation||0,
+      apBinding: binding,
+      tifiaAmount: best.tifiaAmt, pabAmount: best.pabAmt, equityAmount: best.eqAmt,
+      actualEquityIRR: best.irr, minDSCR: best.minDSCR, targetGearing,
+      upfrontSubsidy: 0,
+      workingModel: best.w,
+      pct: best.tifiaAmt && best.totalUses ? best.tifiaAmt / best.totalUses : 0,
+    },
+  };
+}
+
 function autoCascadeTifia(model, params){
   const working = JSON.parse(JSON.stringify(model));
   const trace = [];
@@ -2046,6 +2229,25 @@ function GeneralTab({model, setModel}){
   const setG = (k,v)=>setModel({...model, general:{...g,[k]:v}});
   const setW = (k,v)=>setModel({...model, waterfall:{...w,[k]:v}});
   return <div className="max-w-4xl">
+    <Section title="Government Support Mode" subtitle="How the public sector closes the viability gap.">
+      <div className="grid grid-cols-2 gap-4">
+        <Field label="Support Mechanism" hint="Upfront Subsidy = capital grant at FC, debt capped by CFADS coverage. Availability Payment = contractual annual stream, debt sized by gearing, TIFIA to full 49%.">
+          <Select value={g.governmentSupportMode==='ap'?'Availability Payment':'Upfront Subsidy'}
+            onChange={v=>setG('governmentSupportMode', v==='Availability Payment'?'ap':'subsidy')}
+            options={['Upfront Subsidy','Availability Payment']}/>
+        </Field>
+        {g.governmentSupportMode==='ap' && (
+          <Field label="AP Escalation (%/yr)" hint="Annual escalation of the availability payment stream">
+            <NumInput value={g.apEscalation||0} onChange={v=>setG('apEscalation',v)} step={0.005} suffix="%"/>
+          </Field>
+        )}
+      </div>
+      {g.governmentSupportMode==='ap' && (
+        <div className="mt-3 bg-amber-500/5 border border-amber-500/30 rounded p-3 text-xs text-amber-200">
+          AP mode: the contractual payment stream removes the CFADS coverage cap on debt. TIFIA sizes to its full 49% statutory limit, PABs fill to the target gearing ratio (set in the Financing tab), equity fills the remainder to target IRR, and the optimizer solves the AP amount. No upfront subsidy.
+        </div>
+      )}
+    </Section>
     <Section title="Project Definition" subtitle="Core dates and tenor.">
       <div className="grid grid-cols-2 gap-4">
         <Field label="Project Name"><TextInput value={g.projectName} onChange={v=>setG('projectName',v)}/></Field>
@@ -2062,6 +2264,18 @@ function GeneralTab({model, setModel}){
         <Field label="Periods per year"><Select value={String(g.periodsPerYear)} onChange={v=>setG('periodsPerYear',parseInt(v))} options={['1','2']}/></Field>
         <Field label="Use Fiscal Year?"><Toggle value={g.useFiscalYear} onChange={v=>setG('useFiscalYear',v)} label={g.useFiscalYear?'FY':'CY'}/></Field>
         <Field label="FY Start Month" hint="1=Jan; 7=July"><NumInput value={g.fyStartMonth} onChange={v=>setG('fyStartMonth',v)}/></Field>
+      </div>
+    </Section>
+    <Section title="Government Support Mode" subtitle="Upfront subsidy (capital grant at FC) vs availability payments (contractual stream over operations).">
+      <div className="grid grid-cols-3 gap-4">
+        <Field label="Support Mechanism" hint="AP mode: contractual payments remove the CFADS coverage cap — TIFIA can reach full 49%, PABs fill to target gearing, equity to target IRR.">
+          <Select value={g.governmentSupportMode==='ap'?'Availability Payment':'Upfront Subsidy'}
+            onChange={v=>setG('governmentSupportMode', v==='Availability Payment'?'ap':'subsidy')}
+            options={['Upfront Subsidy','Availability Payment']}/>
+        </Field>
+        {g.governmentSupportMode==='ap' && (
+          <Field label="AP Escalation (%/yr)" hint="Annual escalation of the availability payment stream"><NumInput value={g.apEscalation} onChange={v=>setG('apEscalation',v)} step={0.005} suffix="%"/></Field>
+        )}
       </div>
     </Section>
     <Section title="Waterfall Mode" subtitle="Both modes compute & enforce the 1.0x overall obligation ratio.">
@@ -2175,6 +2389,17 @@ function FinancingTab({model, setModel}){
     setF({instruments:[...f.instruments,{id,type:'Bank Loan',amount:50_000_000,rate:0.05,tenorYears:20,closeDate:model.general.financialCloseDate,seniority:'Senior',repaymentStyle:'Level debt service',drawdownPriority:5,targetDSCR:1.30,ioYears:0,deferralYears:0,dayCount:'30/360',covenants:''}]});
   };
   return <div>
+    {model.general.governmentSupportMode === 'ap' && (
+      <Section title="Availability Payment Structure" subtitle="AP mode active — government support is a contractual payment stream, not an upfront grant. Debt is sized by gearing, not CFADS coverage.">
+        <div className="grid grid-cols-3 gap-4">
+          <Field label="Target Gearing (% of total uses)" hint="Max total debt (TIFIA + PABs) as a share of total uses. PABs fill from TIFIA's 49% up to this level.">
+            <NumInput value={model.general.targetGearing} onChange={v=>setModel({...model, general:{...model.general, targetGearing:v}})} step={0.05} suffix="%"/>
+          </Field>
+          <Field label="AP Escalation (%/yr)"><NumInput value={model.general.apEscalation} onChange={v=>setModel({...model, general:{...model.general, apEscalation:v}})} step={0.005} suffix="%"/></Field>
+        </div>
+        <p className="text-xs text-stone-500 mt-3">The Optimizer sizes TIFIA to full 49%, PABs to hit target gearing, equity to target IRR, and solves the AP stream so equity IRR and the minimum DSCR floor are both met (AP = max of the two binding constraints).</p>
+      </Section>
+    )}
     <Section title="Construction-Period Financing Parameters">
       <div className="grid grid-cols-3 gap-4">
         <Field label="Blended IDC Rate — non-TIFIA debt"><NumInput value={f.blendedIDCRateForNonTIFIA} onChange={v=>setF({blendedIDCRateForNonTIFIA:v})} step={0.005} suffix="%"/></Field>
@@ -2423,7 +2648,7 @@ function TIFIATab({model, setModel, results}){
 function ControlAccountsTab({model, setModel, results}){
   const ca = model.controlAccounts;
   const setCA = patch => setModel({...model, controlAccounts:{...ca, ...patch}});
-  const updateMMR = (i, patch) => setCA({mmrTargetSchedule: ca.mmrTargetSchedule.map((r,idx)=>idx===i?{...r,...patch}:r)});
+  const updateMMEvent = (i, patch) => setCA({mmEventSchedule: (ca.mmEventSchedule||[]).map((r,idx)=>idx===i?{...r,...patch}:r)});
   return <div>
     <Section title="DSRA — Debt Service Reserve Account">
       <div className="grid grid-cols-3 gap-4">
@@ -2448,13 +2673,26 @@ function ControlAccountsTab({model, setModel, results}){
         <Field label="Release Over (yrs)"><NumInput value={ca.rampUpReleaseYears} onChange={v=>setCA({rampUpReleaseYears:v})} suffix="yr"/></Field>
       </div>
     </Section>
-    <Section title="MMR — Major Maintenance Reserve" subtitle="Stepped annual funding by op year." action={<div className="flex items-center gap-3"><Field label=""><Select value={ca.mmrFundingMode||'deposits'} onChange={v=>setCA({mmrFundingMode:v})} options={['initial','deposits']}/></Field><button onClick={()=>setCA({mmrTargetSchedule:[...ca.mmrTargetSchedule,{yearStart:1,annualFunding:0}]})} className="text-xs text-amber-300">+ stage</button></div>}>
-      <table className="w-full"><thead><tr><TH>Stage Start (Op. Year)</TH><TH className="text-right">Annual Funding</TH><TH></TH></tr></thead>
-        <tbody>{ca.mmrTargetSchedule.map((s,i)=>(<tr key={i}>
-          <TD><NumInput value={s.yearStart} onChange={v=>updateMMR(i,{yearStart:v})}/></TD>
-          <TD className="text-right"><NumInput value={s.annualFunding} onChange={v=>updateMMR(i,{annualFunding:v})} prefix="$"/></TD>
-          <TD><button onClick={()=>setCA({mmrTargetSchedule:ca.mmrTargetSchedule.filter((_,idx)=>idx!==i)})} className="text-xs text-rose-400">×</button></TD>
-        </tr>))}</tbody></table>
+    <Section title="Major Maintenance Reserve — Event Schedule"
+      subtitle="Lumpy MM events are pre-funded by smoothed deposits, then paid from the reserve when due. MM cost is NOT in opex — it flows only through the reserve."
+      action={<button onClick={()=>setCA({mmEventSchedule:[...(ca.mmEventSchedule||[]),{id:'mm'+Date.now(),label:'MM',year:10,amount:10_000_000}]})} className="text-xs text-amber-300">+ event</button>}>
+      <div className="grid grid-cols-2 gap-4 mb-3">
+        <Field label="MM Cost Inflation (%/yr)" hint="Events escalate at this rate from FC to their occurrence year">
+          <NumInput value={ca.mmInflation||0} onChange={v=>setCA({mmInflation:v})} step={0.005} suffix="%"/>
+        </Field>
+      </div>
+      <table className="w-full"><thead><tr><TH>Label</TH><TH>Op. Year</TH><TH className="text-right">Base Amount ($)</TH><TH className="text-right">Escalated</TH><TH></TH></tr></thead>
+        <tbody>{(ca.mmEventSchedule||[]).map((s,i)=>{
+          const esc = s.amount * Math.pow(1+(ca.mmInflation||0), s.year);
+          return (<tr key={i}>
+            <TD><TextInput value={s.label} onChange={v=>updateMMEvent(i,{label:v})}/></TD>
+            <TD><NumInput value={s.year} onChange={v=>updateMMEvent(i,{year:v})} suffix="yr"/></TD>
+            <TD className="text-right"><NumInput value={s.amount} onChange={v=>updateMMEvent(i,{amount:v})} prefix="$"/></TD>
+            <TD className="text-right text-stone-400">{fmt$(esc)}</TD>
+            <TD><button onClick={()=>setCA({mmEventSchedule:(ca.mmEventSchedule||[]).filter((_,idx)=>idx!==i)})} className="text-xs text-rose-400">×</button></TD>
+          </tr>);
+        })}</tbody></table>
+      <div className="text-[10px] text-stone-500 mt-2">Reserve deposits smooth toward each event; at the event year the reserve releases to pay the (escalated) cost. Equity sees only the smooth deposit, not the lumpy payment.</div>
     </Section>
     <Section title="Control Account Balances Over Time">
       <div style={{height:280}}>
@@ -2516,9 +2754,11 @@ function OptimizerTab({model, setModel, results}){
         minSrDSCR: ap.minSrDSCR,
         minTifiaDSCR: ap.minTifiaDSCR,
       };
-      const r = autoCascadeTifia(model, params);
+      const r = model.general.governmentSupportMode === 'ap'
+        ? autoCascadeAP(model, params)
+        : autoCascadeTifia(model, params);
       setOutput(r);
-      setO({lastAutoCascadeRun:{bestPct: r.best?.pct, bestTifia: r.best?.tifiaAmount, bestPab: r.best?.pabAmount, bestSubsidy: r.best?.upfrontSubsidy, diagnosis: r.best?.phaseInfo?.diagnosis, converged: r.converged}});
+      setO({lastAutoCascadeRun:{bestPct: r.best?.pct, bestTifia: r.best?.tifiaAmount, bestPab: r.best?.pabAmount, bestSubsidy: r.best?.upfrontSubsidy, bestAP: r.best?.apBasePerPeriod, diagnosis: r.best?.phaseInfo?.diagnosis, converged: r.converged}});
       // AUTO-APPLY: commit optimized stack to model state so Sensitivity, Dashboard, Cashflow all reflect it
       if(r.best && r.best.workingModel){
         setModel(r.best.workingModel);
@@ -2693,11 +2933,22 @@ function OptimizerTab({model, setModel, results}){
               <Metric label="Plug Absorbed" value={fmt$(b.plugApplied||0)} sub="rounding residual"/>
             </div>
             <div className="grid grid-cols-1 gap-3 mb-4">
-              <div className="bg-gradient-to-r from-amber-500/10 to-amber-500/5 border-2 border-amber-500/40 rounded-lg p-4">
-                <div className="text-[10px] uppercase tracking-widest text-amber-400 mb-1">Final Output — Upfront Subsidy Required</div>
-                <div className="text-3xl font-light text-amber-300">{fmt$(b.upfrontSubsidy||0)}</div>
-                <div className="text-xs text-stone-400 mt-1">Government / sponsor cash needed at financial close to make the deal bankable at TIFIA={fmtPct(b.pct,1)}, PAB={fmt$(b.pabAmount)}, Equity@{fmtPct(b.targetEquityIRR||0,1)} IRR. This is the project's headline ask.</div>
-              </div>
+              {model.general.governmentSupportMode === 'ap' ? (
+                <div className="bg-gradient-to-r from-emerald-500/10 to-emerald-500/5 border-2 border-emerald-500/40 rounded-lg p-4">
+                  <div className="text-[10px] uppercase tracking-widest text-emerald-400 mb-1">Final Output — Availability Payment (per period, base)</div>
+                  <div className="text-3xl font-light text-emerald-300">{fmt$(b.apBasePerPeriod||0)}</div>
+                  <div className="text-xs text-stone-400 mt-1">
+                    Level base payment escalating at {fmtPct(b.apEscalation||0,1)}/yr. Sized to meet whichever binds: <span className="text-emerald-300">{b.apBinding}</span>.
+                    Structure: TIFIA={fmtPct(b.pct,1)} (full 49%), PAB={fmt$(b.pabAmount)} (to {fmtPct(b.targetGearing||0,0)} gearing), Equity@{fmtPct(b.targetEquityIRR||0,1)} IRR. No upfront subsidy.
+                  </div>
+                </div>
+              ) : (
+                <div className="bg-gradient-to-r from-amber-500/10 to-amber-500/5 border-2 border-amber-500/40 rounded-lg p-4">
+                  <div className="text-[10px] uppercase tracking-widest text-amber-400 mb-1">Final Output — Upfront Subsidy Required</div>
+                  <div className="text-3xl font-light text-amber-300">{fmt$(b.upfrontSubsidy||0)}</div>
+                  <div className="text-xs text-stone-400 mt-1">Government / sponsor cash needed at financial close to make the deal bankable at TIFIA={fmtPct(b.pct,1)}, PAB={fmt$(b.pabAmount)}, Equity@{fmtPct(b.targetEquityIRR||0,1)} IRR. This is the project's headline ask.</div>
+                </div>
+              )}
             </div>
             <div className="grid grid-cols-4 gap-3 mb-4">
               <Metric label="Min Total DSCR" value={fmtRatio(b.minTotalDSCR)} accent={!b.minTotalDSCR || b.minTotalDSCR >= (ap.minTotalDSCR||1.10) ? 'green' : 'red'} sub={`floor ${(ap.minTotalDSCR||1.10).toFixed(2)}x`}/>
@@ -3603,6 +3854,9 @@ function CashflowTab({model, results}){
             {/* ── REVENUE & OPEX ── */}
             <SectionRow label="Revenue & Costs"/>
             <WFRow label="Toll Revenue" data={r.revSched.byPeriod} positive bold/>
+            {r.apMode && (r.apStream||[]).some(v=>v>0) && (
+              <WFRow label="Availability Payment" data={r.apStream||[]} positive bold accent="emerald"/>
+            )}
             {(model.opex?.items||[]).map(it => (
               <WFRow key={it.id} label={`  ${it.label||it.id}`} data={r.opexSched?.byItem?.[it.id]?.map(v=>-v)||Array(periods.length).fill(0)} negative indent={1}/>
             ))}
@@ -3651,9 +3905,10 @@ function CashflowTab({model, results}){
                 <WFRow label="O&M Reserve Balance" data={omAcct.balance||[]} indent={1} bold/>
               </>}
               {(mmrAcct.balance||[]).some(v=>v>0) && <>
-                <WFRow label={`Major Maint. Reserve Deposit ${cacct.mmrMode==='initial'?'(initial)':'(from cash)'}`} data={(mmrAcct.deposit||[]).map(v=>-v)} negative indent={1}/>
-                <WFRow label="Major Maint. Reserve Release" data={mmrAcct.release||[]} positive indent={1}/>
-                <WFRow label="Major Maint. Reserve Balance" data={mmrAcct.balance||[]} indent={1} bold/>
+                <WFRow label="MMR Deposit (smoothed, from cash)" data={(mmrAcct.deposit||[]).map(v=>-v)} negative indent={1}/>
+                <WFRow label="MM Event Cost (paid from reserve)" data={(cacct.mmEventCost||[]).map(v=>-v)} negative indent={1} accent="rose"/>
+                <WFRow label="MMR Release ↑ (funds event)" data={mmrAcct.release||[]} positive indent={1} accent="emerald"/>
+                <WFRow label="MMR Balance" data={mmrAcct.balance||[]} indent={1} bold/>
               </>}
               {(rampAcct.balance||[]).some(v=>v>0) && <>
                 <WFRow label="Ramp-up Reserve Release" data={rampAcct.release||[]} positive indent={1} accent="emerald"/>
@@ -4565,6 +4820,16 @@ export default function App(){
             instrumentId: m.tifia.instrumentId || 'tifia1',
             capPeriodMonths: m.tifia.capPeriodMonths || 6 }
         : { ...DM.tifia };
+      // Migrate Major Maintenance: remove old annualized rmm/tmm opex + old mmrTargetSchedule
+      let mOpex = m.opex;
+      if(mOpex?.items?.some(it => it.id==='rmm' || it.id==='tmm')){
+        mOpex = {...mOpex, items: mOpex.items.filter(it => it.id!=='rmm' && it.id!=='tmm')};
+      }
+      let mCA = m.controlAccounts || {};
+      if(!mCA.mmEventSchedule){
+        mCA = {...DM.controlAccounts, ...mCA, mmEventSchedule: DM.controlAccounts.mmEventSchedule, mmInflation: DM.controlAccounts.mmInflation};
+        delete mCA.mmrTargetSchedule;
+      }
       // 2. Add sub1 if missing
       const hasSub1 = m.financing.instruments?.some(i => i.id === 'sub1');
       const insts = hasSub1 ? m.financing.instruments : [
@@ -4583,8 +4848,13 @@ export default function App(){
       return {
         ...DM,   // base — ensures every key exists
         ...m,    // user values override
-        general:    {...DM.general,    ...(m.general||{})},
+        general:    {...DM.general,    ...(m.general||{}),
+          governmentSupportMode: (m.general||{}).governmentSupportMode || 'subsidy',
+          apEscalation: (m.general||{}).apEscalation ?? 0.025,
+          targetGearing: (m.general||{}).targetGearing ?? 0.75},
         tifia,
+        opex: mOpex || DM.opex,
+        controlAccounts: mCA,
         financing:  {...DM.financing,  ...m.financing, instruments:insts},
         optimizer:  {...DM.optimizer,  ...opt, plugInstrumentId:plugId,
           cascade:{...(DM.optimizer.cascade||{}), ...cas, plugInstrumentId:plugId,
