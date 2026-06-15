@@ -161,9 +161,7 @@ def default_model() -> Dict[str, Any]:
             'useDirectForecast': False, 'directForecast': [], 'inflate': True, 'inflRate': 0.025,
             'items': [
                 {'id': 'rom', 'label': 'Roadway O&M',                 'base': 4_500_000},
-                {'id': 'rmm', 'label': 'Roadway Major Maintenance',   'base': 6_200_000},
                 {'id': 'tom', 'label': 'Tolling O&M',                 'base': 2_800_000},
-                {'id': 'tmm', 'label': 'Tolling Major Maintenance',   'base': 1_400_000},
                 {'id': 'clp', 'label': 'Toll Collection \u2014 LPR',  'base': 0.45, 'perTxn': True, 'share': 0.35},
                 {'id': 'cvi', 'label': 'Toll Collection \u2014 Video','base': 0.08, 'perTxn': True, 'share': 0.65},
             ],
@@ -230,13 +228,18 @@ def default_model() -> Dict[str, Any]:
         'controlAccounts': {
             'dsraMonthsDS': 6, 'omReserveMonths': 3,
             'rampUpReserveAmount': 15_000_000, 'rampUpReleaseYears': 5,
-            'dsraFundingMode': 'initial', 'omFundingMode': 'deposits', 'mmrFundingMode': 'deposits',
+            'dsraFundingMode': 'initial', 'omFundingMode': 'deposits',
             'dsraUseMaxAnnualDS': True,
-            'mmrTargetSchedule': [
-                {'yearStart': 1,  'annualFunding': 2_500_000},
-                {'yearStart': 10, 'annualFunding': 5_000_000},
-                {'yearStart': 20, 'annualFunding': 8_000_000},
+            'mmEventSchedule': [
+                {'id': 'rmm1', 'label': 'Roadway MM', 'year': 8,  'amount': 18_000_000},
+                {'id': 'rmm2', 'label': 'Roadway MM', 'year': 16, 'amount': 22_000_000},
+                {'id': 'rmm3', 'label': 'Roadway MM', 'year': 24, 'amount': 26_000_000},
+                {'id': 'tmm1', 'label': 'Tolling MM', 'year': 6,  'amount': 8_000_000},
+                {'id': 'tmm2', 'label': 'Tolling MM', 'year': 12, 'amount': 9_000_000},
+                {'id': 'tmm3', 'label': 'Tolling MM', 'year': 18, 'amount': 10_000_000},
+                {'id': 'tmm4', 'label': 'Tolling MM', 'year': 24, 'amount': 11_000_000},
             ],
+            'mmInflation': 0.025,
         },
         'vfm': {
             'pscDiscountRate': 0.045,
@@ -978,62 +981,80 @@ def build_control_accounts(model: Dict[str, Any], periods: List[Dict[str, Any]],
                 nao += opex[i + k] or 0
         dsra[i] = nads * (ca['dsraMonthsDS'] / 12)
         om[i] = nao * (ca['omReserveMonths'] / 12)
-    # DSRA target: optionally max annual DS across tenor
+    # DSRA target per period
     if ca.get('dsraUseMaxAnnualDS'):
+        # MADS basis: constant peak annual DS, held flat while any debt service remains
         max_annual_ds = 0.0
         for i in range(0, n, ppy):
             yr = sum((ds[i + k] or 0) for k in range(ppy) if i + k < n)
             if yr > max_annual_ds:
                 max_annual_ds = yr
         for i in range(n):
-            if (ds[i] or 0) > 0 or (i > 0 and dsra[i - 1] > 0):
-                dsra[i] = max_annual_ds
+            ds_future = sum((ds[k] or 0) for k in range(i + 1, n))
+            dsra[i] = max_annual_ds if ds_future > 0 else 0
     rb = ca['rampUpReserveAmount']
     rel_per = ca['rampUpReserveAmount'] / max(1, ca['rampUpReleaseYears'] * ppy)
     for i in range(n):
         rb = max(0, rb - rel_per)
         ramp[i] = rb
-    mb = 0.0
-    cum_y = 0.0
-    for i in range(n):
-        cum_y += periods[i]['yearFraction']
-        y = int(cum_y)
-        af = 0.0
-        sched = ca['mmrTargetSchedule']
-        for s in reversed(sched):
-            if y + 1 >= s['yearStart']:
-                af = s['annualFunding']
-                break
-        mb += af * periods[i]['yearFraction']
-        mmr[i] = mb
 
-    # ── Reserve movements: deposits / releases / balance per funding mode ──
+    # ── Major Maintenance Reserve: event-based pre-funding ──
+    mm_events = []
+    for e in (ca.get('mmEventSchedule') or []):
+        ep = round((e['year'] - 1) * ppy)
+        escalated = e['amount'] * ((1 + ca.get('mmInflation', 0)) ** e['year'])
+        if 0 <= ep < n:
+            mm_events.append({**e, 'eventPeriod': ep, 'escalatedAmount': escalated})
+    mm_events.sort(key=lambda x: x['eventPeriod'])
+
+    mmr_deposit, mmr_release, mmr_balance = _zeros(n), _zeros(n), _zeros(n)
+    mm_event_cost = _zeros(n)
+    mmr_bal = 0.0
+    prev_ep = 0
+    for ev in mm_events:
+        fund_start, fund_end = prev_ep, ev['eventPeriod']
+        periods_to_fund = max(1, fund_end - fund_start)
+        per_dep = (ev['escalatedAmount'] - mmr_bal) / periods_to_fund
+        for i in range(fund_start, fund_end):
+            if 0 <= i < n:
+                mmr_deposit[i] += max(0, per_dep); mmr_bal += max(0, per_dep); mmr_balance[i] = mmr_bal
+        if 0 <= ev['eventPeriod'] < n:
+            mm_event_cost[ev['eventPeriod']] += ev['escalatedAmount']
+            mmr_release[ev['eventPeriod']] += min(mmr_bal, ev['escalatedAmount'])
+            mmr_bal = max(0, mmr_bal - ev['escalatedAmount'])
+            mmr_balance[ev['eventPeriod']] = mmr_bal
+        prev_ep = ev['eventPeriod']
+    for i in range(1, n):
+        if mmr_balance[i] == 0 and mmr_deposit[i] == 0 and mmr_release[i] == 0 and mm_event_cost[i] == 0:
+            mmr_balance[i] = mmr_balance[i - 1]
+    for i in range(n):
+        mmr[i] = mmr_balance[i]
+
+    # ── Reserve movements: both modes track time-varying target with top-ups AND releases ──
+    # 'initial' funds period-0 target from proceeds; 'deposits' funds from operating cash.
     def build_movements(target, mode):
         deposit, release, balance = _zeros(n), _zeros(n), _zeros(n)
-        target_level = max(target) if any(target) else 0.0
-        initial_fund = target_level if mode == 'initial' else 0.0
-        bal = initial_fund
+        first_active = next((i for i, t in enumerate(target) if (t or 0) > 0), 0)
+        initial_fund = (target[first_active] or 0) if mode == 'initial' else 0.0
+        bal = initial_fund if mode == 'initial' else 0.0
         for i in range(n):
             tgt = target[i] or 0
-            if mode == 'deposits':
-                if bal < tgt:
-                    deposit[i] = tgt - bal; bal = tgt
-                elif bal > tgt:
-                    release[i] = bal - tgt; bal = tgt
-                balance[i] = bal
-            else:
-                # initial mode: held at initial_fund, released at final period
-                balance[i] = 0.0 if i == n - 1 else initial_fund
-                if i == n - 1:
-                    release[i] = initial_fund
+            if mode == 'initial' and i == first_active:
+                balance[i] = bal  # pre-funded from proceeds, no cash deposit
+                continue
+            if bal < tgt:
+                deposit[i] = tgt - bal; bal = tgt
+            elif bal > tgt:
+                release[i] = bal - tgt; bal = tgt
+            balance[i] = bal
         return {'deposit': deposit, 'release': release, 'balance': balance, 'initialFund': initial_fund}
 
     dsra_mode = ca.get('dsraFundingMode', 'initial')
     om_mode = ca.get('omFundingMode', 'deposits')
-    mmr_mode = ca.get('mmrFundingMode', 'deposits')
     dsra_mov = build_movements(dsra, dsra_mode)
     om_mov = build_movements(om, om_mode)
-    mmr_mov = build_movements(mmr, mmr_mode)
+    mmr_mov = {'deposit': mmr_deposit, 'release': mmr_release, 'balance': mmr_balance,
+               'initialFund': 0.0, 'eventCost': mm_event_cost}
     ramp_mov = {'deposit': _zeros(n), 'release': _zeros(n), 'balance': list(ramp), 'initialFund': ca['rampUpReserveAmount']}
     for i in range(n):
         prev = ca['rampUpReserveAmount'] if i == 0 else ramp[i - 1]
@@ -1041,12 +1062,14 @@ def build_control_accounts(model: Dict[str, Any], periods: List[Dict[str, Any]],
 
     total_initial = ((dsra_mov['initialFund'] if dsra_mode == 'initial' else 0)
                      + (om_mov['initialFund'] if om_mode == 'initial' else 0)
-                     + (mmr_mov['initialFund'] if mmr_mode == 'initial' else 0)
                      + ca['rampUpReserveAmount'])
 
+    dsra_target_level = max(dsra) if any(dsra) else 0.0
     return {'dsraTarget': dsra, 'omTarget': om, 'rampUp': ramp, 'mmr': mmr,
+            'dsraTargetLevel': dsra_target_level,
             'dsra': dsra_mov, 'om': om_mov, 'mmrAcct': mmr_mov, 'rampAcct': ramp_mov,
-            'dsraMode': dsra_mode, 'omMode': om_mode, 'mmrMode': mmr_mode,
+            'dsraMode': dsra_mode, 'omMode': om_mode, 'mmrMode': 'deposits',
+            'mmEvents': mm_events, 'mmEventCost': mm_event_cost,
             'totalInitialReserveFunding': total_initial}
 
 
@@ -1204,7 +1227,16 @@ def build_full_model(model: Dict[str, Any]) -> Dict[str, Any]:
     n = len(periods)
     rev_sched = build_revenue_schedule(model, periods)
     opex_sched = build_opex_schedule(model, periods, rev_sched)
-    cfads = [rev_sched['byPeriod'][i] - opex_sched['byPeriod'][i] for i in range(n)]
+    # Availability payment stream (AP mode)
+    ap_mode = model['general'].get('governmentSupportMode') == 'ap'
+    ap_esc = model['general'].get('apEscalation', 0)
+    ap_base = (model['financing'].get('apAmount', 0) or 0) if ap_mode else 0
+    ap_stream = _zeros(n)
+    if ap_mode and ap_base > 0:
+        for i in range(n):
+            yr = i // ppy
+            ap_stream[i] = ap_base * ((1 + ap_esc) ** yr)
+    cfads = [rev_sched['byPeriod'][i] + ap_stream[i] - opex_sched['byPeriod'][i] for i in range(n)]
 
     senority_order = {'Short-term': 0, 'Senior': 1, 'Subordinate': 2, 'Grant': 3, 'Equity': 4, 'Paygo': 5}
     sorted_inst = sorted(instruments, key=lambda i: senority_order.get(i['seniority'], 99))
@@ -1272,8 +1304,10 @@ def build_full_model(model: Dict[str, Any]) -> Dict[str, Any]:
             net += (control_accts['dsra']['deposit'][i] or 0) - (control_accts['dsra']['release'][i] or 0)
         if control_accts['omMode'] == 'deposits':
             net += (control_accts['om']['deposit'][i] or 0) - (control_accts['om']['release'][i] or 0)
-        if control_accts['mmrMode'] == 'deposits':
-            net += (control_accts['mmrAcct']['deposit'][i] or 0) - (control_accts['mmrAcct']['release'][i] or 0)
+        # MMR: deposit (smoothed) + event cost − release (reserve covers cost); net = deposit
+        net += ((control_accts['mmrAcct']['deposit'][i] or 0)
+                + (control_accts['mmEventCost'][i] if i < len(control_accts.get('mmEventCost', [])) else 0)
+                - (control_accts['mmrAcct']['release'][i] or 0))
         net -= (control_accts['rampAcct']['release'][i] or 0)
         reserve_net_deposit[i] = net
 
@@ -1325,6 +1359,7 @@ def build_full_model(model: Dict[str, Any]) -> Dict[str, Any]:
         'cfads_for_dscr': cfads_for_dscr,
         'grant_total': grant_total, 'equity_total': equity_total, 'paygo_total': paygo_total, 'debt_total': debt_total,
         'rev_sched': rev_sched, 'opex_sched': opex_sched, 'cfads_by_period': cfads,
+        'ap_stream': ap_stream, 'ap_mode': ap_mode,
         'instruments': sorted_inst, 'debt_schedules': debt_schedules,
         'senior_ds': senior_ds, 'sub_ds': sub_ds, 'short_ds': short_ds, 'total_ds': total_ds,
         'senior_bal': senior_bal, 'sub_bal': sub_bal,
