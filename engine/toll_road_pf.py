@@ -1010,10 +1010,9 @@ def build_control_accounts(model: Dict[str, Any], periods: List[Dict[str, Any]],
     # ── Reserve movements: deposits / releases / balance per funding mode ──
     def build_movements(target, mode):
         deposit, release, balance = _zeros(n), _zeros(n), _zeros(n)
-        bal = (target[0] if target and mode == 'initial' else 0.0)
-        if mode == 'initial' and target:
-            bal = max(target) if any(target) else 0.0
-        initial_fund = bal if mode == 'initial' else 0.0
+        target_level = max(target) if any(target) else 0.0
+        initial_fund = target_level if mode == 'initial' else 0.0
+        bal = initial_fund
         for i in range(n):
             tgt = target[i] or 0
             if mode == 'deposits':
@@ -1021,10 +1020,12 @@ def build_control_accounts(model: Dict[str, Any], periods: List[Dict[str, Any]],
                     deposit[i] = tgt - bal; bal = tgt
                 elif bal > tgt:
                     release[i] = bal - tgt; bal = tgt
+                balance[i] = bal
             else:
-                if bal > tgt:
-                    release[i] = bal - tgt; bal = tgt
-            balance[i] = bal
+                # initial mode: held at initial_fund, released at final period
+                balance[i] = 0.0 if i == n - 1 else initial_fund
+                if i == n - 1:
+                    release[i] = initial_fund
         return {'deposit': deposit, 'release': release, 'balance': balance, 'initialFund': initial_fund}
 
     dsra_mode = ca.get('dsraFundingMode', 'initial')
