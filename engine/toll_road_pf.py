@@ -968,7 +968,8 @@ def compute_wal(principal_by_period: List[float], periods: List[Dict[str, Any]],
 # CONTROL ACCOUNTS, LOCKUP, IRR
 # ============================================================
 def build_control_accounts(model: Dict[str, Any], periods: List[Dict[str, Any]],
-                           ds: List[float], opex: List[float]) -> Dict[str, List[float]]:
+                           ds: List[float], opex: List[float],
+                           debt_schedules: Dict = None, instruments: List = None) -> Dict[str, List[float]]:
     ca = model['controlAccounts']
     n = len(periods)
     ppy = model['general']['periodsPerYear']
@@ -981,6 +982,23 @@ def build_control_accounts(model: Dict[str, Any], periods: List[Dict[str, Any]],
                 nao += opex[i + k] or 0
         dsra[i] = nads * (ca['dsraMonthsDS'] / 12)
         om[i] = nao * (ca['omReserveMonths'] / 12)
+
+    def build_dsra_target(ds_arr):
+        tgt = _zeros(n)
+        if ca.get('dsraUseMaxAnnualDS'):
+            max_ann = 0.0
+            for i in range(0, n, ppy):
+                yr = sum((ds_arr[i + k] or 0) for k in range(ppy) if i + k < n)
+                if yr > max_ann:
+                    max_ann = yr
+            for i in range(n):
+                fut = sum((ds_arr[k] or 0) for k in range(i + 1, n))
+                tgt[i] = max_ann if fut > 0 else 0
+        else:
+            for i in range(n):
+                s = sum((ds_arr[i + k] or 0) for k in range(ppy) if i + k < n)
+                tgt[i] = s * (ca['dsraMonthsDS'] / 12)
+        return tgt
     # DSRA target per period
     if ca.get('dsraUseMaxAnnualDS'):
         # MADS basis: constant peak annual DS, held flat while any debt service remains
@@ -1051,7 +1069,37 @@ def build_control_accounts(model: Dict[str, Any], periods: List[Dict[str, Any]],
 
     dsra_mode = ca.get('dsraFundingMode', 'initial')
     om_mode = ca.get('omFundingMode', 'deposits')
-    dsra_mov = build_movements(dsra, dsra_mode)
+
+    # ── Per-instrument DSRAs ──
+    dsra_by_inst = {}
+    dsra_agg_dep, dsra_agg_rel, dsra_agg_bal = _zeros(n), _zeros(n), _zeros(n)
+    dsra_total_initial = 0.0
+    if debt_schedules and instruments:
+        for inst in instruments:
+            if inst.get('seniority') in ('Grant', 'Equity', 'Paygo', 'Short-term'):
+                continue
+            sched = debt_schedules.get(inst['id'])
+            if not sched:
+                continue
+            inst_ds = _zeros(n)
+            has_ds = False
+            for i in range(n):
+                inst_ds[i] = (sched['interest'][i] or 0) + (sched['principal'][i] or 0)
+                if inst_ds[i] > 0:
+                    has_ds = True
+            if not has_ds:
+                continue
+            tgt = build_dsra_target(inst_ds)
+            mov = build_movements(tgt, dsra_mode)
+            dsra_by_inst[inst['id']] = {'label': inst['type'], 'target': tgt, **mov}
+            for i in range(n):
+                dsra_agg_dep[i] += mov['deposit'][i] or 0
+                dsra_agg_rel[i] += mov['release'][i] or 0
+                dsra_agg_bal[i] += mov['balance'][i] or 0
+            if dsra_mode == 'initial':
+                dsra_total_initial += mov['initialFund']
+    dsra_mov = {'deposit': dsra_agg_dep, 'release': dsra_agg_rel, 'balance': dsra_agg_bal, 'initialFund': dsra_total_initial}
+
     om_mov = build_movements(om, om_mode)
     mmr_mov = {'deposit': mmr_deposit, 'release': mmr_release, 'balance': mmr_balance,
                'initialFund': 0.0, 'eventCost': mm_event_cost}
@@ -1060,14 +1108,14 @@ def build_control_accounts(model: Dict[str, Any], periods: List[Dict[str, Any]],
         prev = ca['rampUpReserveAmount'] if i == 0 else ramp[i - 1]
         ramp_mov['release'][i] = max(0, prev - ramp[i])
 
-    total_initial = ((dsra_mov['initialFund'] if dsra_mode == 'initial' else 0)
+    total_initial = ((dsra_total_initial if dsra_mode == 'initial' else 0)
                      + (om_mov['initialFund'] if om_mode == 'initial' else 0)
                      + ca['rampUpReserveAmount'])
 
     dsra_target_level = max(dsra) if any(dsra) else 0.0
     return {'dsraTarget': dsra, 'omTarget': om, 'rampUp': ramp, 'mmr': mmr,
             'dsraTargetLevel': dsra_target_level,
-            'dsra': dsra_mov, 'om': om_mov, 'mmrAcct': mmr_mov, 'rampAcct': ramp_mov,
+            'dsra': dsra_mov, 'dsraByInst': dsra_by_inst, 'om': om_mov, 'mmrAcct': mmr_mov, 'rampAcct': ramp_mov,
             'dsraMode': dsra_mode, 'omMode': om_mode, 'mmrMode': 'deposits',
             'mmEvents': mm_events, 'mmEventCost': mm_event_cost,
             'totalInitialReserveFunding': total_initial}
@@ -1294,7 +1342,7 @@ def build_full_model(model: Dict[str, Any]) -> Dict[str, Any]:
                          for inst in sorted_inst}
 
     lockup = check_lockup(senior_dscr, llcr_senior, model['tifia'], periods)
-    control_accts = build_control_accounts(model, periods, total_ds, opex_sched['byPeriod'])
+    control_accts = build_control_accounts(model, periods, total_ds, opex_sched['byPeriod'], debt_schedules, instruments)
 
     # Net reserve movement (deposits outflow, releases inflow); only 'deposits'-mode reserves hit operating cash
     reserve_net_deposit = _zeros(n)
@@ -2043,15 +2091,24 @@ def build_vfm_analysis(model: Dict[str, Any],
     p3_public_constr_risk_npv = public_constr_ev / (1 + rate) ** (const_yrs / 2)
     p3_public_ops_risk_npv = npv_annuity(annual_public_ops_ev, ops_yrs, rate, const_yrs)
 
-    if v.get('isAvailabilityBased'):
-        availability_npv = sum(
-            v['availabilityPaymentAnnual'] * (1 + v['availabilityEscalation']) ** y
-            / (1 + rate) ** (v.get('availabilityStartYear', 0) + y + 0.5)
-            for y in range(v['availabilityYears'])
-        )
-        p3_net_cost = (availability_npv + p3_public_constr_risk_npv + p3_public_ops_risk_npv
+    # ── Government support from the actual optimizer result (fully integrated) ──
+    last_run = (model.get('optimizer') or {}).get('lastAutoCascadeRun') or {}
+    optimizer_run = bool(last_run.get('converged'))
+    ap_mode_active = model['general'].get('governmentSupportMode') == 'ap'
+    solved_subsidy = last_run.get('bestSubsidy', 0) or 0
+    solved_ap_base = last_run.get('bestAP', 0) or 0
+    ap_esc_rate = model['general'].get('apEscalation', 0)
+    ppy_sched = model['general'].get('periodsPerYear', 2)
+
+    if ap_mode_active:
+        ap_base_annual = solved_ap_base * ppy_sched
+        ap_npv = sum(ap_base_annual * (1 + ap_esc_rate) ** y / (1 + rate) ** (const_yrs + y + 0.5)
+                     for y in range(ops_yrs))
+        p3_gov_support_npv = ap_npv
+        p3_support_label = 'Solved Availability Payments (NPV)'
+        p3_net_cost = (ap_npv + p3_public_constr_risk_npv + p3_public_ops_risk_npv
                        + public_constr_mit_npv + public_ops_mit_npv)
-        p3_components = {'availabilityNPV': availability_npv,
+        p3_components = {'govSupportNPV': ap_npv, 'supportLabel': p3_support_label,
                          'p3PublicConstrRiskNPV': p3_public_constr_risk_npv,
                          'p3PublicOpsRiskNPV': p3_public_ops_risk_npv,
                          'publicConstrMitNPV': public_constr_mit_npv,
@@ -2063,10 +2120,14 @@ def build_vfm_analysis(model: Dict[str, Any],
                                 * (1 - rev_share)
                                 / (1 + rate) ** (const_yrs + y + 0.5)
                                 for y in range(ops_yrs))
-        p3_net_cost = (foregone_rev_npv + p3_public_constr_risk_npv
+        subsidy_npv = solved_subsidy / (1 + rate) ** const_yrs
+        p3_gov_support_npv = subsidy_npv
+        p3_support_label = 'Solved Upfront Subsidy (NPV)'
+        p3_net_cost = (subsidy_npv + foregone_rev_npv + p3_public_constr_risk_npv
                        + p3_public_ops_risk_npv + public_constr_mit_npv
                        + public_ops_mit_npv - upfront_fee)
-        p3_components = {'foregoneRevNPV': foregone_rev_npv, 'upfrontFee': upfront_fee,
+        p3_components = {'govSupportNPV': subsidy_npv, 'supportLabel': p3_support_label,
+                         'foregoneRevNPV': foregone_rev_npv, 'upfrontFee': upfront_fee,
                          'revShare': rev_share,
                          'p3PublicConstrRiskNPV': p3_public_constr_risk_npv,
                          'p3PublicOpsRiskNPV': p3_public_ops_risk_npv,
@@ -2084,7 +2145,10 @@ def build_vfm_analysis(model: Dict[str, Any],
         'psc_mit_constr_npv': total_constr_mit_npv, 'psc_mit_ops_npv': total_ops_mit_npv,
         'psc_net_cost': psc_net_cost,
         'p3_net_cost': p3_net_cost, 'p3_components': p3_components,
-        'is_availability_based': v.get('isAvailabilityBased', False),
+        'is_availability_based': ap_mode_active,
+        'optimizer_run': optimizer_run, 'ap_mode_active': ap_mode_active,
+        'solved_subsidy': solved_subsidy, 'solved_ap_base': solved_ap_base,
+        'p3_gov_support_npv': p3_gov_support_npv, 'p3_support_label': p3_support_label,
         'vfm': vfm_abs, 'vfm_pct': vfm_pct,
         'mitigation': {
             'construction': {'total_one_time': total_constr_mit_cost,
