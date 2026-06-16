@@ -1987,7 +1987,7 @@ function npvAnnuity(annual, years, rate, startDelayYears = 0){
 }
 
 function buildVfMAnalysis(model, results){
-  const v = model.vfm;
+  const v = model.vfm || defaultModel().vfm;
   const rate = v.pscDiscountRate || 0.045;
   const constYrs = Math.ceil(model.general.constructionMonths / 12);
   const opsYrs = model.general.operationsYears;
@@ -4553,7 +4553,11 @@ function renderMarkdown(text){
 function VfMTab({model, setModel, results}){
   const v = model.vfm;
   const setV = patch => setModel({...model, vfm:{...v, ...patch}});
-  const vfm = useMemo(()=>buildVfMAnalysis(model, results), [model, results]);
+  const vfm = useMemo(()=>{
+    try { return buildVfMAnalysis(model, results); }
+    catch(e){ console.error('VfM analysis error:', e); return null; }
+  }, [model, results]);
+  if(!vfm) return <div className="p-8 text-stone-400">VfM analysis unavailable — check that the model has run. <button onClick={()=>{localStorage.clear();window.location.reload();}} className="ml-2 px-3 py-1 bg-amber-500 text-stone-900 rounded text-sm">Reset</button></div>;
   const [aiReport, setAiReport] = useState('');
   const [reportLoading, setReportLoading] = useState(false);
   const [reportError, setReportError] = useState(null);
