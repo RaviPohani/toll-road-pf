@@ -2115,20 +2115,14 @@ def build_vfm_analysis(model: Dict[str, Any],
                          'publicOpsMitNPV': public_ops_mit_npv}
     else:
         upfront_fee = v.get('upfrontConcessionFee', 0)
-        rev_share = v.get('revenueSharePct', 0)
-        foregone_rev_npv = sum(((annual_revenue[y] if y < len(annual_revenue) else 0) or 0)
-                                * (1 - rev_share)
-                                / (1 + rate) ** (const_yrs + y + 0.5)
-                                for y in range(ops_yrs))
         subsidy_npv = solved_subsidy / (1 + rate) ** const_yrs
         p3_gov_support_npv = subsidy_npv
         p3_support_label = 'Solved Upfront Subsidy (NPV)'
-        p3_net_cost = (subsidy_npv + foregone_rev_npv + p3_public_constr_risk_npv
+        p3_net_cost = (subsidy_npv + p3_public_constr_risk_npv
                        + p3_public_ops_risk_npv + public_constr_mit_npv
                        + public_ops_mit_npv - upfront_fee)
         p3_components = {'govSupportNPV': subsidy_npv, 'supportLabel': p3_support_label,
-                         'foregoneRevNPV': foregone_rev_npv, 'upfrontFee': upfront_fee,
-                         'revShare': rev_share,
+                         'upfrontFee': upfront_fee,
                          'p3PublicConstrRiskNPV': p3_public_constr_risk_npv,
                          'p3PublicOpsRiskNPV': p3_public_ops_risk_npv,
                          'publicConstrMitNPV': public_constr_mit_npv,
