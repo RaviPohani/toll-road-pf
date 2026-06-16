@@ -2113,21 +2113,16 @@ function buildVfMAnalysis(model, results){
     p3Components = { govSupportNPV: apNPV, supportLabel: p3SupportLabel,
                      p3PublicConstrRiskNPV, p3PublicOpsRiskNPV, publicConstrMitNPV, publicOpsMitNPV };
   } else {
-    // Toll concession: government's cost = solved upfront subsidy + foregone toll revenue (net of rev share) − upfront fee
+    // Toll concession: government's cost = solved upfront subsidy − upfront concession fee
     const upfrontFee = v.upfrontConcessionFee || 0;
-    const revShare = v.revenueSharePct || 0;
-    let foregoneRevNPV = 0;
-    for(let y = 0; y < opsYrs; y++){
-      foregoneRevNPV += ((annualRevenue[y] || 0) * (1 - revShare)) / Math.pow(1 + rate, constYrs + y + 0.5);
-    }
     // Subsidy is paid at financial close (end of construction); discount to t0
     const subsidyNPV = solvedSubsidy / Math.pow(1 + rate, constYrs);
     p3GovSupportNPV = subsidyNPV;
     p3SupportLabel = 'Solved Upfront Subsidy (NPV)';
-    p3NetCost = subsidyNPV + foregoneRevNPV + p3PublicConstrRiskNPV + p3PublicOpsRiskNPV
+    p3NetCost = subsidyNPV + p3PublicConstrRiskNPV + p3PublicOpsRiskNPV
                 + publicConstrMitNPV + publicOpsMitNPV - upfrontFee;
     p3Components = { govSupportNPV: subsidyNPV, supportLabel: p3SupportLabel,
-                     foregoneRevNPV, upfrontFee, revShare,
+                     upfrontFee,
                      p3PublicConstrRiskNPV, p3PublicOpsRiskNPV, publicConstrMitNPV, publicOpsMitNPV };
   }
 
@@ -2150,18 +2145,16 @@ function buildVfMAnalysis(model, results){
         + publicConstrMitCost / Math.pow(1 + dr, constYrs/2)
         + npvAnnuity(publicOpsMitCost, opsYrs, dr, constYrs);
       let p3 = p3Public;
-      if(v.isAvailabilityBased){
+      if(apModeActive){
         let apNPV = 0;
-        for(let y = 0; y < v.availabilityYears; y++){
-          apNPV += (v.availabilityPaymentAnnual * Math.pow(1 + v.availabilityEscalation, y)) / Math.pow(1 + dr, (v.availabilityStartYear||0) + y + 0.5);
+        const apBaseAnnual = solvedAPBase * ppySched;
+        for(let y = 0; y < opsYrs; y++){
+          apNPV += (apBaseAnnual * Math.pow(1 + apEscRate, y)) / Math.pow(1 + dr, constYrs + y + 0.5);
         }
         p3 += apNPV;
       } else {
-        let fr = 0;
-        for(let y = 0; y < opsYrs; y++){
-          fr += ((annualRevenue[y] || 0) * (1 - (v.revenueSharePct || 0))) / Math.pow(1 + dr, constYrs + y + 0.5);
-        }
-        p3 += fr - (v.upfrontConcessionFee || 0);
+        // Solved subsidy − concession fee (no foregone revenue)
+        p3 += (solvedSubsidy / Math.pow(1 + dr, constYrs)) - (v.upfrontConcessionFee || 0);
       }
       row.cells.push({ riskMult, psc, p3, vfm: psc - p3 });
     }
@@ -4719,13 +4712,12 @@ ${JSON.stringify(summary, null, 2)}`;
       {!vfm.apModeActive && (
         <div className="grid grid-cols-2 gap-4 mt-3">
           <Field label="Upfront Concession Fee (paid to public)"><NumInput value={v.upfrontConcessionFee} onChange={x=>setV({upfrontConcessionFee:x})} prefix="$" step={1000000}/></Field>
-          <Field label="Revenue Share to Public"><NumInput value={v.revenueSharePct} onChange={x=>setV({revenueSharePct:x})} step={0.01} suffix="%"/></Field>
         </div>
       )}
       <p className="text-[10px] text-stone-500 mt-3">
         {vfm.apModeActive
           ? 'P3 cost = NPV of the optimizer-solved availability-payment stream (escalating) + public-share residual risk + public mitigation.'
-          : 'P3 cost = NPV of the solved upfront subsidy + foregone toll revenue (net of public revenue share) + public-share residual risk + public mitigation − concession fee.'}
+          : 'P3 cost = NPV of the solved upfront subsidy + public-share residual risk + public mitigation − concession fee.'}
       </p>
     </Section>
 
@@ -4767,7 +4759,6 @@ ${JSON.stringify(summary, null, 2)}`;
           <table className="w-full text-xs"><tbody>
             <tr><TD mono={false} className="text-stone-300">{vfm.p3Components.supportLabel || 'Gov Support NPV'}</TD><TD className="text-right text-rose-300">{fmt$(vfm.p3Components.govSupportNPV||0)}</TD></tr>
             {!vfm.apModeActive && <>
-              <tr><TD mono={false} className="text-stone-300">Foregone Revenue NPV</TD><TD className="text-right text-rose-300">{fmt$(vfm.p3Components.foregoneRevNPV||0)}</TD></tr>
               <tr><TD mono={false} className="text-stone-300">(−) Upfront Concession Fee</TD><TD className="text-right text-emerald-300">({fmt$(vfm.p3Components.upfrontFee||0)})</TD></tr>
             </>}
             <tr><TD mono={false} className="text-stone-300">Retained Constr. Risk NPV</TD><TD className="text-right text-rose-300">{fmt$(vfm.p3Components.p3PublicConstrRiskNPV)}</TD></tr>
