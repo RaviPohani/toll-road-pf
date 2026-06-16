@@ -791,11 +791,25 @@ function computeWAL(principalByPeriod, periods, originalPrincipal){
 }
 
 // ---------- CONTROL ACCOUNTS ----------
-function buildControlAccounts(model, periods, ds, opex){
+function buildControlAccounts(model, periods, ds, opex, debtSchedules, instruments){
   const ca = model.controlAccounts;
   const n = periods.length;
   const ppy = model.general.periodsPerYear;
   const dsra = zeros(n), om = zeros(n), ramp = zeros(n), mmr = zeros(n);
+
+  // ── Per-instrument DSRA: each debt instrument carries its own reserve on its own DS ──
+  // Skip short-term notes and grants/equity/paygo; one DSRA per long-term debt instrument.
+  const buildDsraTarget = (dsArr) => {
+    const tgt = zeros(n);
+    if(ca.dsraUseMaxAnnualDS){
+      let maxAnn = 0;
+      for(let i=0;i<n;i+=ppy){ let yr=0; for(let k=0;k<ppy && i+k<n;k++) yr += dsArr[i+k]||0; if(yr>maxAnn) maxAnn=yr; }
+      for(let i=0;i<n;i++){ let fut=0; for(let k=i+1;k<n;k++) fut += dsArr[k]||0; tgt[i] = fut>0 ? maxAnn : 0; }
+    } else {
+      for(let i=0;i<n;i++){ let s=0; for(let k=0;k<ppy && i+k<n;k++) s += dsArr[i+k]||0; tgt[i] = s*(ca.dsraMonthsDS/12); }
+    }
+    return tgt;
+  };
   for(let i=0;i<n;i++){
     let nADS = 0, nAO = 0;
     for(let k=0;k<ppy && i+k<n;k++){ nADS += ds[i+k]||0; nAO += opex[i+k]||0; }
@@ -893,7 +907,33 @@ function buildControlAccounts(model, periods, ds, opex){
   const dsraMode = ca.dsraFundingMode || 'initial';
   const omMode = ca.omFundingMode || 'deposits';
 
-  const dsraMov = buildMovements(dsra, dsraMode);
+  // ── Per-instrument DSRAs ──
+  const dsraByInst = {};
+  const dsraAggDeposit = zeros(n), dsraAggRelease = zeros(n), dsraAggBalance = zeros(n);
+  let dsraTotalInitial = 0;
+  if(debtSchedules && instruments){
+    for(const inst of instruments){
+      if(['Grant','Equity','Paygo','Short-term'].includes(inst.seniority)) continue;
+      const sched = debtSchedules[inst.id];
+      if(!sched) continue;
+      const instDS = zeros(n);
+      let hasDS = false;
+      for(let i=0;i<n;i++){ instDS[i] = (sched.interest[i]||0) + (sched.principal[i]||0); if(instDS[i]>0) hasDS = true; }
+      if(!hasDS) continue;
+      const tgt = buildDsraTarget(instDS);
+      const mov = buildMovements(tgt, dsraMode);
+      dsraByInst[inst.id] = { label: inst.type, target: tgt, ...mov };
+      for(let i=0;i<n;i++){
+        dsraAggDeposit[i] += mov.deposit[i]||0;
+        dsraAggRelease[i] += mov.release[i]||0;
+        dsraAggBalance[i] += mov.balance[i]||0;
+      }
+      if(dsraMode === 'initial') dsraTotalInitial += mov.initialFund;
+    }
+  }
+  // Aggregate DSRA used in waterfall/equity-CF
+  const dsraMov = { deposit: dsraAggDeposit, release: dsraAggRelease, balance: dsraAggBalance, initialFund: dsraTotalInitial };
+
   const omMov = buildMovements(om, omMode);
   // MMR is always event-pre-funded from cash
   const mmrMov = { deposit: mmrDeposit, release: mmrRelease, balance: mmrBalance, initialFund: 0, eventCost: mmEventCost };
@@ -906,14 +946,14 @@ function buildControlAccounts(model, periods, ds, opex){
 
   // Total initial funding (from proceeds at SC) for Sources & Uses
   const totalInitialReserveFunding =
-    (dsraMode === 'initial' ? dsraMov.initialFund : 0) +
+    (dsraMode === 'initial' ? dsraTotalInitial : 0) +
     (omMode === 'initial' ? omMov.initialFund : 0) +
     ca.rampUpReserveAmount;
 
   return {
     dsraTarget: dsra, omTarget: om, rampUp: ramp, mmr,
     dsraTargetLevel,
-    dsra: dsraMov, om: omMov, mmrAcct: mmrMov, rampAcct: rampMov,
+    dsra: dsraMov, dsraByInst, om: omMov, mmrAcct: mmrMov, rampAcct: rampMov,
     dsraMode, omMode, mmrMode:'deposits',
     mmEvents, mmEventCost,
     totalInitialReserveFunding,
@@ -1143,7 +1183,7 @@ function buildFullModel(rawModel){
   const walByInstrument = {};
   sortedInst.forEach(inst=>{ walByInstrument[inst.id] = computeWAL(debtSchedules[inst.id].principal, periods, inst.principalAfterIDC ?? inst.amount); });
   const lockup = checkLockup(seniorDSCR, llcrSenior, model.tifia, periods);
-  const controlAccts = buildControlAccounts(model, periods, totalDS, opexSched.byPeriod);
+  const controlAccts = buildControlAccounts(model, periods, totalDS, opexSched.byPeriod, debtSchedules, instruments);
   // Net reserve movement per period (deposits are outflows, releases inflows)
   // Only reserves in 'deposits' mode affect operating cash; 'initial' mode is funded from proceeds at SC.
   const reserveNetDeposit = zeros(n);
@@ -2047,29 +2087,48 @@ function buildVfMAnalysis(model, results){
   // P3 from public perspective: public-share residual risk + public-share mitigation cost
   const p3PublicConstrRiskNPV = publicConstrEV / Math.pow(1 + rate, constYrs / 2);
   const p3PublicOpsRiskNPV    = npvAnnuity(annualPublicOpsEV, opsYrs, rate, constYrs);
-  let p3NetCost, p3Components;
-  if(v.isAvailabilityBased){
-    let availabilityNPV = 0;
-    for(let y = 0; y < v.availabilityYears; y++){
-      const ap = v.availabilityPaymentAnnual * Math.pow(1 + v.availabilityEscalation, y);
-      availabilityNPV += ap / Math.pow(1 + rate, (v.availabilityStartYear || 0) + y + 0.5);
+
+  // ── Government support from the actual optimizer result (fully integrated) ──
+  const lastRun = model.optimizer?.lastAutoCascadeRun;
+  const optimizerRun = !!(lastRun && lastRun.converged);
+  const apModeActive = model.general.governmentSupportMode === 'ap';
+  const solvedSubsidy = lastRun?.bestSubsidy || 0;         // upfront subsidy (already a value at FC)
+  const solvedAPBase  = lastRun?.bestAP || 0;              // solved AP base per period
+  const apEscRate     = model.general.apEscalation || 0;
+  const ppySched      = model.general.periodsPerYear || 2;
+
+  let p3NetCost, p3Components, p3GovSupportNPV = 0, p3SupportLabel = '';
+
+  if(apModeActive){
+    // P3 cost = NPV of the SOLVED availability-payment stream (escalating), from start of ops
+    let apNPV = 0;
+    const apBaseAnnual = solvedAPBase * ppySched;  // per-period × periods/yr = annual
+    for(let y = 0; y < opsYrs; y++){
+      const ap = apBaseAnnual * Math.pow(1 + apEscRate, y);
+      apNPV += ap / Math.pow(1 + rate, constYrs + y + 0.5);
     }
-    p3NetCost = availabilityNPV + p3PublicConstrRiskNPV + p3PublicOpsRiskNPV
-                + publicConstrMitNPV + publicOpsMitNPV;
-    p3Components = { availabilityNPV, p3PublicConstrRiskNPV, p3PublicOpsRiskNPV,
-                     publicConstrMitNPV, publicOpsMitNPV };
+    p3GovSupportNPV = apNPV;
+    p3SupportLabel = 'Solved Availability Payments (NPV)';
+    p3NetCost = apNPV + p3PublicConstrRiskNPV + p3PublicOpsRiskNPV + publicConstrMitNPV + publicOpsMitNPV;
+    p3Components = { govSupportNPV: apNPV, supportLabel: p3SupportLabel,
+                     p3PublicConstrRiskNPV, p3PublicOpsRiskNPV, publicConstrMitNPV, publicOpsMitNPV };
   } else {
+    // Toll concession: government's cost = solved upfront subsidy + foregone toll revenue (net of rev share) − upfront fee
     const upfrontFee = v.upfrontConcessionFee || 0;
     const revShare = v.revenueSharePct || 0;
     let foregoneRevNPV = 0;
     for(let y = 0; y < opsYrs; y++){
       foregoneRevNPV += ((annualRevenue[y] || 0) * (1 - revShare)) / Math.pow(1 + rate, constYrs + y + 0.5);
     }
-    p3NetCost = foregoneRevNPV + p3PublicConstrRiskNPV + p3PublicOpsRiskNPV
+    // Subsidy is paid at financial close (end of construction); discount to t0
+    const subsidyNPV = solvedSubsidy / Math.pow(1 + rate, constYrs);
+    p3GovSupportNPV = subsidyNPV;
+    p3SupportLabel = 'Solved Upfront Subsidy (NPV)';
+    p3NetCost = subsidyNPV + foregoneRevNPV + p3PublicConstrRiskNPV + p3PublicOpsRiskNPV
                 + publicConstrMitNPV + publicOpsMitNPV - upfrontFee;
-    p3Components = { foregoneRevNPV, upfrontFee, revShare,
-                     p3PublicConstrRiskNPV, p3PublicOpsRiskNPV,
-                     publicConstrMitNPV, publicOpsMitNPV };
+    p3Components = { govSupportNPV: subsidyNPV, supportLabel: p3SupportLabel,
+                     foregoneRevNPV, upfrontFee, revShare,
+                     p3PublicConstrRiskNPV, p3PublicOpsRiskNPV, publicConstrMitNPV, publicOpsMitNPV };
   }
 
   const vfmAbs = pscNetCost - p3NetCost;
@@ -2114,7 +2173,8 @@ function buildVfMAnalysis(model, results){
     pscCapexNPV, pscOpexNPV, pscConstrRiskNPV, pscOpsRiskNPV,
     pscRevenueNPV, compNeutralityAdj, pscNetCost,
     pscMitConstrNPV: totalConstrMitNPV, pscMitOpsNPV: totalOpsMitNPV,
-    p3NetCost, p3Components, isAvailabilityBased: v.isAvailabilityBased,
+    p3NetCost, p3Components, isAvailabilityBased: apModeActive,
+    optimizerRun, apModeActive, solvedSubsidy, solvedAPBase, p3GovSupportNPV, p3SupportLabel,
     vfm: vfmAbs, vfmPct,
     mitigation: {
       construction: { totalAnnualOrOneTime: totalConstrMitCost, public: publicConstrMitCost,
@@ -3894,11 +3954,24 @@ function CashflowTab({model, results}){
             {/* ── RESERVE ACCOUNTS ── */}
             {hasReserves && <>
               <SectionRow label="Reserve Accounts"/>
-              {(dsraAcct.balance||[]).some(v=>v>0) && <>
-                <WFRow label={`DSRA Deposit ${cacct.dsraMode==='initial'?'(initial @ SC)':'(from cash)'}`} data={(dsraAcct.deposit||[]).map(v=>-v)} negative indent={1}/>
-                <WFRow label="DSRA Release ↑ (lifts coverage)" data={dsraAcct.release||[]} positive indent={1} accent="emerald"/>
-                <WFRow label="DSRA Balance" data={dsraAcct.balance||[]} indent={1} bold/>
-              </>}
+              {cacct.dsraByInst && Object.keys(cacct.dsraByInst).length > 0
+                ? Object.entries(cacct.dsraByInst).map(([id, acct]) => (
+                  <React.Fragment key={id}>
+                    <tr className="bg-stone-900/20"><td colSpan={periods.length+1} className="sticky left-0 py-1 px-3 text-[10px] text-stone-400 bg-stone-950" style={{paddingLeft:'20px'}}>DSRA — {acct.label} ({id})</td></tr>
+                    <WFRow label={`Deposit ${cacct.dsraMode==='initial'?'(initial @ SC)':'(from cash)'}`} data={(acct.deposit||[]).map(v=>-v)} negative indent={2}/>
+                    <WFRow label="Release ↑ (lifts coverage)" data={acct.release||[]} positive indent={2} accent="emerald"/>
+                    <WFRow label="Balance" data={acct.balance||[]} indent={2} bold/>
+                  </React.Fragment>
+                ))
+                : ((dsraAcct.balance||[]).some(v=>v>0) && <>
+                    <WFRow label={`DSRA Deposit ${cacct.dsraMode==='initial'?'(initial @ SC)':'(from cash)'}`} data={(dsraAcct.deposit||[]).map(v=>-v)} negative indent={1}/>
+                    <WFRow label="DSRA Release ↑ (lifts coverage)" data={dsraAcct.release||[]} positive indent={1} accent="emerald"/>
+                    <WFRow label="DSRA Balance" data={dsraAcct.balance||[]} indent={1} bold/>
+                  </>)
+              }
+              {(dsraAcct.balance||[]).some(v=>v>0) && Object.keys(cacct.dsraByInst||{}).length > 1 && (
+                <WFRow label="DSRA Total Balance (all debts)" data={dsraAcct.balance||[]} indent={1} bold accent="amber"/>
+              )}
               {(omAcct.balance||[]).some(v=>v>0) && <>
                 <WFRow label={`O&M Reserve Deposit ${cacct.omMode==='initial'?'(initial)':'(from cash)'}`} data={(omAcct.deposit||[]).map(v=>-v)} negative indent={1}/>
                 <WFRow label="O&M Reserve Release" data={omAcct.release||[]} positive indent={1}/>
@@ -4616,24 +4689,39 @@ ${JSON.stringify(summary, null, 2)}`;
       </div>
     </Section>
 
-    <Section title="P3 Delivery Mode" subtitle="Toll concession: private retains revenue, pays concession fee. Availability: public makes periodic availability payments.">
-      <div className="flex items-center gap-3 mb-4">
-        <Toggle value={!v.isAvailabilityBased} onChange={x=>setV({isAvailabilityBased:!x})} label="Toll Concession"/>
-        <Toggle value={v.isAvailabilityBased} onChange={x=>setV({isAvailabilityBased:x})} label="Availability Payments"/>
+    {!vfm.optimizerRun && (
+      <div className="bg-amber-500/10 border-2 border-amber-500/50 rounded-lg p-4 mb-4">
+        <div className="text-sm font-medium text-amber-300 mb-1">⚠ Run the Optimizer first</div>
+        <div className="text-xs text-stone-400">The P3 government cost is driven by the optimizer's solved government support (upfront subsidy or availability payment). Go to the <span className="text-amber-300">Optimizer</span> tab and click <span className="text-amber-300">Run Cascade &amp; Apply</span>. Until then, the P3 side uses $0 support and the VfM comparison is incomplete.</div>
       </div>
-      {v.isAvailabilityBased ? (
-        <div className="grid grid-cols-4 gap-4">
-          <Field label="Annual AP (base)"><NumInput value={v.availabilityPaymentAnnual} onChange={x=>setV({availabilityPaymentAnnual:x})} prefix="$" step={1000000}/></Field>
-          <Field label="AP Escalation"><NumInput value={v.availabilityEscalation} onChange={x=>setV({availabilityEscalation:x})} step={0.005} suffix="%"/></Field>
-          <Field label="AP Start Year"><NumInput value={v.availabilityStartYear} onChange={x=>setV({availabilityStartYear:x})} suffix="yr"/></Field>
-          <Field label="AP Tenor"><NumInput value={v.availabilityYears} onChange={x=>setV({availabilityYears:x})} suffix="yr"/></Field>
+    )}
+
+    <Section title="P3 Delivery Mode" subtitle="Government support is taken directly from the optimizer result — no separate input. Switch mode in the General tab (Upfront Subsidy vs Availability Payment).">
+      <div className="grid grid-cols-3 gap-4">
+        <div className="bg-stone-900/40 border border-stone-700/60 rounded p-3">
+          <div className="text-[10px] uppercase tracking-wider text-stone-500 mb-1">Active Mode (from General tab)</div>
+          <div className="text-lg font-medium text-stone-100">{vfm.apModeActive ? 'Availability Payment' : 'Toll Concession + Upfront Subsidy'}</div>
         </div>
-      ) : (
-        <div className="grid grid-cols-3 gap-4">
-          <Field label="Upfront Concession Fee"><NumInput value={v.upfrontConcessionFee} onChange={x=>setV({upfrontConcessionFee:x})} prefix="$" step={1000000}/></Field>
+        <div className="bg-stone-900/40 border border-stone-700/60 rounded p-3">
+          <div className="text-[10px] uppercase tracking-wider text-stone-500 mb-1">{vfm.apModeActive ? 'Solved AP (base/period)' : 'Solved Upfront Subsidy'}</div>
+          <div className="text-lg font-medium text-emerald-300">{vfm.apModeActive ? fmt$(vfm.solvedAPBase) : fmt$(vfm.solvedSubsidy)}</div>
+        </div>
+        <div className="bg-stone-900/40 border border-stone-700/60 rounded p-3">
+          <div className="text-[10px] uppercase tracking-wider text-stone-500 mb-1">{vfm.p3SupportLabel}</div>
+          <div className="text-lg font-medium text-stone-100">{fmt$(vfm.p3GovSupportNPV)}</div>
+        </div>
+      </div>
+      {!vfm.apModeActive && (
+        <div className="grid grid-cols-2 gap-4 mt-3">
+          <Field label="Upfront Concession Fee (paid to public)"><NumInput value={v.upfrontConcessionFee} onChange={x=>setV({upfrontConcessionFee:x})} prefix="$" step={1000000}/></Field>
           <Field label="Revenue Share to Public"><NumInput value={v.revenueSharePct} onChange={x=>setV({revenueSharePct:x})} step={0.01} suffix="%"/></Field>
         </div>
       )}
+      <p className="text-[10px] text-stone-500 mt-3">
+        {vfm.apModeActive
+          ? 'P3 cost = NPV of the optimizer-solved availability-payment stream (escalating) + public-share residual risk + public mitigation.'
+          : 'P3 cost = NPV of the solved upfront subsidy + foregone toll revenue (net of public revenue share) + public-share residual risk + public mitigation − concession fee.'}
+      </p>
     </Section>
 
     <Section title="Risk Register — Construction" subtitle={`${constrRisks.length} risks · Pre-Mit EV: ${fmt$(vfm.risks.construction.totalPre)} · Post-Mit EV: ${fmt$(vfm.risks.construction.total)} · Mit Cost: ${fmt$(vfm.mitigation.construction.totalAnnualOrOneTime)} (one-time)`}
