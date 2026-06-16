@@ -2817,19 +2817,24 @@ function OptimizerTab({model, setModel, results}){
       const r = model.general.governmentSupportMode === 'ap'
         ? autoCascadeAP(model, params)
         : autoCascadeTifia(model, params);
+      const runSummary = {bestPct: r.best?.pct, bestTifia: r.best?.tifiaAmount, bestPab: r.best?.pabAmount, bestSubsidy: r.best?.upfrontSubsidy, bestAP: r.best?.apBasePerPeriod, diagnosis: r.best?.phaseInfo?.diagnosis, converged: r.converged};
       setOutput(r);
-      setO({lastAutoCascadeRun:{bestPct: r.best?.pct, bestTifia: r.best?.tifiaAmount, bestPab: r.best?.pabAmount, bestSubsidy: r.best?.upfrontSubsidy, bestAP: r.best?.apBasePerPeriod, diagnosis: r.best?.phaseInfo?.diagnosis, converged: r.converged}});
-      // AUTO-APPLY: commit optimized stack to model state so Sensitivity, Dashboard, Cashflow all reflect it
+      // AUTO-APPLY: commit optimized stack to model AND persist the run summary in the same update
+      // (workingModel is a pre-run clone, so we must merge lastAutoCascadeRun into it or VfM/others lose it)
       if(r.best && r.best.workingModel){
-        setModel(r.best.workingModel);
+        setModel({...r.best.workingModel,
+          optimizer: {...r.best.workingModel.optimizer, ...o, cascade: o.cascade, lastAutoCascadeRun: runSummary}});
+      } else {
+        setO({lastAutoCascadeRun: runSummary});
       }
       setRunning(false);
     }, 50);
   };
   const applyOpt = () => {
-    // Re-apply (useful if user manually edited something and wants to revert to last optimizer output)
     if(!output || !output.best || !output.best.workingModel) return;
-    setModel(output.best.workingModel);
+    const runSummary = {bestPct: output.best?.pct, bestTifia: output.best?.tifiaAmount, bestPab: output.best?.pabAmount, bestSubsidy: output.best?.upfrontSubsidy, bestAP: output.best?.apBasePerPeriod, converged: output.converged};
+    setModel({...output.best.workingModel,
+      optimizer: {...output.best.workingModel.optimizer, ...o, cascade: o.cascade, lastAutoCascadeRun: runSummary}});
   };
 
   const eligibleIds = c.tifiaEligibleCapexIds || [];
@@ -4676,8 +4681,8 @@ ${JSON.stringify(summary, null, 2)}`;
 
   // Risk allocation chart data
   const riskChartData = [
-    { phase:'Construction', Public: vfm.risks.construction.public/1e6, Private: vfm.risks.construction.private/1e6 },
-    { phase:'Operations (Annual)', Public: vfm.risks.operations.annualPublic/1e6, Private: vfm.risks.operations.annualPrivate/1e6 },
+    { owner:'Public',  Construction: vfm.risks.construction.public/1e6,  Operations: vfm.risks.operations.annualPublic/1e6 },
+    { owner:'Private', Construction: vfm.risks.construction.private/1e6, Operations: vfm.risks.operations.annualPrivate/1e6 },
   ];
 
   return <div>
@@ -4760,11 +4765,10 @@ ${JSON.stringify(summary, null, 2)}`;
         <div className="bg-stone-900/40 border border-stone-700/60 rounded p-3">
           <div className="text-[11px] uppercase tracking-wider text-stone-400 mb-2">P3 Build-up (Public Perspective)</div>
           <table className="w-full text-xs"><tbody>
-            {vfm.isAvailabilityBased ? <>
-              <tr><TD mono={false} className="text-stone-300">Availability Payments NPV</TD><TD className="text-right text-rose-300">{fmt$(vfm.p3Components.availabilityNPV)}</TD></tr>
-            </> : <>
-              <tr><TD mono={false} className="text-stone-300">Foregone Revenue NPV</TD><TD className="text-right text-rose-300">{fmt$(vfm.p3Components.foregoneRevNPV)}</TD></tr>
-              <tr><TD mono={false} className="text-stone-300">(−) Upfront Concession Fee</TD><TD className="text-right text-emerald-300">({fmt$(vfm.p3Components.upfrontFee)})</TD></tr>
+            <tr><TD mono={false} className="text-stone-300">{vfm.p3Components.supportLabel || 'Gov Support NPV'}</TD><TD className="text-right text-rose-300">{fmt$(vfm.p3Components.govSupportNPV||0)}</TD></tr>
+            {!vfm.apModeActive && <>
+              <tr><TD mono={false} className="text-stone-300">Foregone Revenue NPV</TD><TD className="text-right text-rose-300">{fmt$(vfm.p3Components.foregoneRevNPV||0)}</TD></tr>
+              <tr><TD mono={false} className="text-stone-300">(−) Upfront Concession Fee</TD><TD className="text-right text-emerald-300">({fmt$(vfm.p3Components.upfrontFee||0)})</TD></tr>
             </>}
             <tr><TD mono={false} className="text-stone-300">Retained Constr. Risk NPV</TD><TD className="text-right text-rose-300">{fmt$(vfm.p3Components.p3PublicConstrRiskNPV)}</TD></tr>
             <tr><TD mono={false} className="text-stone-300">Retained Ops Risk NPV</TD><TD className="text-right text-rose-300">{fmt$(vfm.p3Components.p3PublicOpsRiskNPV)}</TD></tr>
@@ -4778,12 +4782,12 @@ ${JSON.stringify(summary, null, 2)}`;
         <ResponsiveContainer>
           <BarChart data={riskChartData}>
             <CartesianGrid stroke="#44403c" strokeDasharray="2 4"/>
-            <XAxis dataKey="phase" stroke="#a8a29e" tick={{fontSize:11}}/>
+            <XAxis dataKey="owner" stroke="#a8a29e" tick={{fontSize:11}}/>
             <YAxis stroke="#a8a29e" tick={{fontSize:11}} label={{value:'$M (EV)',angle:-90,position:'insideLeft',fill:'#a8a29e',fontSize:11}}/>
             <Tooltip contentStyle={{background:'#1c1917',border:'1px solid #44403c',fontSize:12}} formatter={v=>`$${(v).toFixed(2)}M`}/>
             <Legend wrapperStyle={{fontSize:11}}/>
-            <Bar dataKey="Public" stackId="r" fill="#fb923c"/>
-            <Bar dataKey="Private" stackId="r" fill="#a78bfa"/>
+            <Bar dataKey="Construction" stackId="r" fill="#fb923c"/>
+            <Bar dataKey="Operations" stackId="r" fill="#a78bfa"/>
           </BarChart>
         </ResponsiveContainer>
       </div>
