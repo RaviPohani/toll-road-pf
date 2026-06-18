@@ -172,6 +172,7 @@ const defaultModel = () => ({
   vfm: {
     pscDiscountRate: 0.045,
     pscCostPremium: 0.08,          // PSC delivery typically 5-15% more expensive (no private efficiency)
+    pscUseLeverage: true,          // leveraged PSC: debt-financed to capacity, public funds the gap
     competitiveNeutralityPct: 0.03, // adjustment for PSC's tax/regulatory advantage
     isAvailabilityBased: false,     // false = toll concession; true = availability payments
     upfrontConcessionFee: 50_000_000,
@@ -2080,7 +2081,37 @@ function buildVfMAnalysis(model, results){
     pscRevenueNPV += (annualRevenue[y] || 0) / Math.pow(1 + rate, constYrs + y + 0.5);
   }
   const compNeutralityAdj = (pscCapexNPV + pscOpexNPV) * (v.competitiveNeutralityPct || 0);
-  const pscNetCost = pscCapexNPV + pscOpexNPV + pscConstrRiskNPV + pscOpsRiskNPV
+
+  // ── LEVERAGED PSC ──
+  // Public delivery is also debt-financed to the project's capacity (same CFADS supports same debt).
+  // Public funds only the residual gap (capex − debt raised) at FC; services debt over time from toll revenue.
+  // PSC cost = capex + opex + risk + mitigation + comp-neutrality − revenue, where capex is split into
+  //            (debt-funded, repaid via debt service) + (gap-funded by public upfront).
+  // Since debt service ≈ the financed capex grossed up by interest, the leverage effect on a public-sector
+  // discount-rate basis is: replace the lump-sum financed capex with its debt-service NPV (interest cost on public books).
+  const totalDebtRaised = (results.debtTotal || 0);  // TIFIA + PABs + other debt the optimizer sized
+  const nominalCapex = (results.capexSched?.totalNominal || 0);
+  // Fraction of capex covered by debt (capped at 100%)
+  const debtCoverFrac = nominalCapex > 0 ? Math.min(1, totalDebtRaised / nominalCapex) : 0;
+  // Debt service NPV (public services the debt from revenue) — use the model's actual debt schedules
+  let pscDebtServiceNPV = 0;
+  if(results.periods && results.seniorInt){
+    for(let i = 0; i < results.periods.length; i++){
+      const ds = (results.seniorInt[i]||0) + (results.seniorPri[i]||0) + (results.subInt?.[i]||0) + (results.subPri?.[i]||0);
+      // discount at PSC rate from financial close
+      const t = constYrs + (i / (model.general.periodsPerYear||2));
+      pscDebtServiceNPV += ds / Math.pow(1 + rate, t);
+    }
+  }
+  // Public upfront gap = capex premium-adjusted NPV that debt does NOT cover
+  const pscCapexGapNPV = pscCapexNPV * (1 - debtCoverFrac);
+  // Leveraged capex cost on public books = upfront gap + NPV of debt service
+  const pscLeveragedCapexNPV = pscCapexGapNPV + pscDebtServiceNPV;
+
+  const pscUseLeverage = v.pscUseLeverage !== false;  // default ON
+  const pscCapexComponent = pscUseLeverage ? pscLeveragedCapexNPV : pscCapexNPV;
+
+  const pscNetCost = pscCapexComponent + pscOpexNPV + pscConstrRiskNPV + pscOpsRiskNPV
                      + totalConstrMitNPV + totalOpsMitNPV
                      + compNeutralityAdj - pscRevenueNPV;
 
@@ -2134,7 +2165,7 @@ function buildVfMAnalysis(model, results){
   for(const dr of [0.030, 0.040, 0.045, 0.050, 0.060, 0.070]){
     const row = { discountRate: dr, cells: [] };
     for(const riskMult of [0.5, 0.75, 1.0, 1.25, 1.5]){
-      const psc = (pscCapexNPV + pscOpexNPV) * (rate / dr)
+      const psc = (pscCapexComponent + pscOpexNPV) * (rate / dr)
         + totalConstrEV * riskMult / Math.pow(1 + dr, constYrs/2)
         + npvAnnuity(annualOpsEV * riskMult, opsYrs, dr, constYrs)
         + totalConstrMitCost / Math.pow(1 + dr, constYrs/2)
@@ -2164,6 +2195,8 @@ function buildVfMAnalysis(model, results){
   return {
     pscDiscountRate: rate,
     pscCapexNPV, pscOpexNPV, pscConstrRiskNPV, pscOpsRiskNPV,
+    pscUseLeverage, pscDebtServiceNPV, pscCapexGapNPV, pscLeveragedCapexNPV,
+    pscCapexComponent, totalDebtRaised, debtCoverFrac,
     pscRevenueNPV, compNeutralityAdj, pscNetCost,
     pscMitConstrNPV: totalConstrMitNPV, pscMitOpsNPV: totalOpsMitNPV,
     p3NetCost, p3Components, isAvailabilityBased: apModeActive,
@@ -2747,26 +2780,70 @@ function ControlAccountsTab({model, setModel, results}){
         })}</tbody></table>
       <div className="text-[10px] text-stone-500 mt-2">Reserve deposits smooth toward each event; at the event year the reserve releases to pay the (escalated) cost. Equity sees only the smooth deposit, not the lumpy payment.</div>
     </Section>
-    <Section title="Control Account Balances Over Time">
-      <div style={{height:280}}>
-        <ResponsiveContainer>
-          <LineChart data={results.periods.map((p,i)=>({period:p.label,
-            DSRA:Math.round(results.controlAccts.dsraTarget[i]/1e6),
-            OMReserve:Math.round(results.controlAccts.omTarget[i]/1e6),
-            RampUp:Math.round(results.controlAccts.rampUp[i]/1e6),
-            MMR:Math.round(results.controlAccts.mmr[i]/1e6)}))}>
-            <CartesianGrid stroke="#44403c" strokeDasharray="2 4"/>
-            <XAxis dataKey="period" stroke="#a8a29e" tick={{fontSize:9}} interval={Math.max(0,Math.floor(results.periods.length/12))}/>
-            <YAxis stroke="#a8a29e" tick={{fontSize:11}} label={{value:'$M',angle:-90,position:'insideLeft',fill:'#a8a29e',fontSize:11}}/>
-            <Tooltip contentStyle={{background:'#1c1917',border:'1px solid #44403c',fontSize:12}}/>
-            <Legend wrapperStyle={{fontSize:11}}/>
-            <Line type="monotone" dataKey="DSRA" stroke="#fbbf24" strokeWidth={2} dot={false}/>
-            <Line type="monotone" dataKey="OMReserve" stroke="#34d399" strokeWidth={2} dot={false}/>
-            <Line type="monotone" dataKey="RampUp" stroke="#a78bfa" strokeWidth={2} dot={false}/>
-            <Line type="monotone" dataKey="MMR" stroke="#fb923c" strokeWidth={2} dot={false}/>
-          </LineChart>
-        </ResponsiveContainer>
-      </div>
+    <Section title="Reserve Account Charts" subtitle="Each reserve shown separately for clarity — balance over time, deposits and releases.">
+      {(()=>{
+        const ca2 = results.controlAccts || {};
+        const labels = results.periods.map(p=>p.label);
+        const tick = Math.max(0, Math.floor(results.periods.length/10));
+        const mkData = (acct, keys) => results.periods.map((p,i)=>{
+          const row = {period:p.label};
+          keys.forEach(k => { row[k.name] = Math.round((k.arr[i]||0)/1e5)/10; });
+          return row;
+        });
+        const ChartBox = ({title, children, note}) => (
+          <div className="bg-stone-900/30 border border-stone-700/50 rounded-lg p-3 mb-4">
+            <div className="text-sm font-medium text-stone-200 mb-1">{title}</div>
+            {note && <div className="text-[10px] text-stone-500 mb-2">{note}</div>}
+            <div style={{height:200}}><ResponsiveContainer>{children}</ResponsiveContainer></div>
+          </div>
+        );
+        const axisProps = { stroke:"#a8a29e", tick:{fontSize:9} };
+        const grid = <CartesianGrid stroke="#44403c" strokeDasharray="2 4"/>;
+        const tip = <Tooltip contentStyle={{background:'#1c1917',border:'1px solid #44403c',fontSize:11}} formatter={v=>`$${v}M`}/>;
+
+        // DSRA — per instrument balances
+        const dsraInst = ca2.dsraByInst || {};
+        const dsraKeys = Object.keys(dsraInst);
+        const dsraColors = ['#fbbf24','#fb923c','#f472b6','#60a5fa'];
+        const dsraData = results.periods.map((p,i)=>{
+          const row = {period:p.label};
+          dsraKeys.forEach(id => { row[dsraInst[id].label] = Math.round((dsraInst[id].balance[i]||0)/1e5)/10; });
+          return row;
+        });
+
+        return <>
+          {dsraKeys.length > 0 && (
+            <ChartBox title="DSRA — Debt Service Reserve (balance by instrument)" note={`${ca2.dsraMode==='initial'?'Initial-funded at SC':'Funded from operating cash'} · released as each debt matures`}>
+              <LineChart data={dsraData}>
+                {grid}<XAxis dataKey="period" {...axisProps} interval={tick}/><YAxis {...axisProps} label={{value:'$M',angle:-90,position:'insideLeft',fill:'#a8a29e',fontSize:10}}/>{tip}<Legend wrapperStyle={{fontSize:10}}/>
+                {dsraKeys.map((id,idx)=><Line key={id} type="stepAfter" dataKey={dsraInst[id].label} stroke={dsraColors[idx%4]} strokeWidth={2} dot={false}/>)}
+              </LineChart>
+            </ChartBox>
+          )}
+          <ChartBox title="Major Maintenance Reserve (deposits build, releases fund events)" note="Sawtooth: balance accumulates via smoothed deposits, drops when an MM event is paid from the reserve.">
+            <ComposedChart data={mkData(null,[{name:'Deposit',arr:ca2.mmrAcct?.deposit||[]},{name:'Event Cost',arr:(ca2.mmEventCost||[])},{name:'Balance',arr:ca2.mmrAcct?.balance||[]}])}>
+              {grid}<XAxis dataKey="period" {...axisProps} interval={tick}/><YAxis {...axisProps} label={{value:'$M',angle:-90,position:'insideLeft',fill:'#a8a29e',fontSize:10}}/>{tip}<Legend wrapperStyle={{fontSize:10}}/>
+              <Bar dataKey="Deposit" fill="#34d399"/>
+              <Bar dataKey="Event Cost" fill="#f87171"/>
+              <Line type="stepAfter" dataKey="Balance" stroke="#fb923c" strokeWidth={2} dot={false}/>
+            </ComposedChart>
+          </ChartBox>
+          <ChartBox title="O&M Reserve" note={`${ca2.omMode==='initial'?'Initial-funded':'Funded from operating cash'} · target tracks forward opex`}>
+            <ComposedChart data={mkData(null,[{name:'Deposit',arr:ca2.om?.deposit||[]},{name:'Balance',arr:ca2.om?.balance||[]}])}>
+              {grid}<XAxis dataKey="period" {...axisProps} interval={tick}/><YAxis {...axisProps} label={{value:'$M',angle:-90,position:'insideLeft',fill:'#a8a29e',fontSize:10}}/>{tip}<Legend wrapperStyle={{fontSize:10}}/>
+              <Bar dataKey="Deposit" fill="#34d399"/>
+              <Line type="stepAfter" dataKey="Balance" stroke="#60a5fa" strokeWidth={2} dot={false}/>
+            </ComposedChart>
+          </ChartBox>
+          <ChartBox title="Ramp-up Reserve" note="Funded at SC; releases over the ramp-up period to support early-year coverage.">
+            <ComposedChart data={mkData(null,[{name:'Release',arr:ca2.rampAcct?.release||[]},{name:'Balance',arr:ca2.rampAcct?.balance||[]}])}>
+              {grid}<XAxis dataKey="period" {...axisProps} interval={tick}/><YAxis {...axisProps} label={{value:'$M',angle:-90,position:'insideLeft',fill:'#a8a29e',fontSize:10}}/>{tip}<Legend wrapperStyle={{fontSize:10}}/>
+              <Bar dataKey="Release" fill="#a78bfa"/>
+              <Line type="stepAfter" dataKey="Balance" stroke="#c4b5fd" strokeWidth={2} dot={false}/>
+            </ComposedChart>
+          </ChartBox>
+        </>;
+      })()}
     </Section>
   </div>;
 }
@@ -4689,6 +4766,20 @@ ${JSON.stringify(summary, null, 2)}`;
         <Field label="PSC Cost Premium" hint="Private-sector efficiency gap PSC misses"><NumInput value={v.pscCostPremium} onChange={x=>setV({pscCostPremium:x})} step={0.01} suffix="%"/></Field>
         <Field label="Competitive Neutrality %" hint="PSC tax/regulatory advantage adjustment"><NumInput value={v.competitiveNeutralityPct} onChange={x=>setV({competitiveNeutralityPct:x})} step={0.005} suffix="%"/></Field>
       </div>
+      <div className="flex items-center gap-3 bg-stone-900/40 border border-stone-700/60 rounded p-3">
+        <button onClick={()=>setV({pscUseLeverage: v.pscUseLeverage === false})}
+          className={`w-12 h-6 rounded-full transition-colors ${v.pscUseLeverage !== false ? 'bg-amber-500' : 'bg-stone-700'} relative`}>
+          <span className={`absolute top-1 w-4 h-4 rounded-full bg-white transition-transform ${v.pscUseLeverage !== false ? 'translate-x-7' : 'translate-x-1'}`}/>
+        </button>
+        <div>
+          <div className="text-sm text-stone-200">{v.pscUseLeverage !== false ? 'Leveraged PSC (debt-financed)' : 'Unleveraged PSC (100% public cash)'}</div>
+          <div className="text-[10px] text-stone-500">
+            {v.pscUseLeverage !== false
+              ? `Public delivery raises the same debt the project supports (${fmt$(vfm.totalDebtRaised)}, ${fmtPct(vfm.debtCoverFrac,0)} of capex); public funds only the residual gap upfront and services debt from toll revenue.`
+              : 'Public funds 100% of capex from cash at financial close — no leverage.'}
+          </div>
+        </div>
+      </div>
     </Section>
 
     {!vfm.optimizerRun && (
@@ -4747,7 +4838,12 @@ ${JSON.stringify(summary, null, 2)}`;
         <div className="bg-stone-900/40 border border-stone-700/60 rounded p-3">
           <div className="text-[11px] uppercase tracking-wider text-stone-400 mb-2">PSC Build-up</div>
           <table className="w-full text-xs"><tbody>
-            <tr><TD mono={false} className="text-stone-300">Capex NPV</TD><TD className="text-right text-stone-200">{fmt$(vfm.pscCapexNPV)}</TD></tr>
+            {vfm.pscUseLeverage ? <>
+              <tr><TD mono={false} className="text-stone-300">Capex — public gap (upfront)</TD><TD className="text-right text-stone-200">{fmt$(vfm.pscCapexGapNPV)}</TD></tr>
+              <tr><TD mono={false} className="text-stone-300">Capex — debt service NPV <span className="text-stone-500">({fmtPct(vfm.debtCoverFrac,0)} debt-funded)</span></TD><TD className="text-right text-stone-200">{fmt$(vfm.pscDebtServiceNPV)}</TD></tr>
+            </> : (
+              <tr><TD mono={false} className="text-stone-300">Capex NPV (100% public cash)</TD><TD className="text-right text-stone-200">{fmt$(vfm.pscCapexNPV)}</TD></tr>
+            )}
             <tr><TD mono={false} className="text-stone-300">Opex NPV</TD><TD className="text-right text-stone-200">{fmt$(vfm.pscOpexNPV)}</TD></tr>
             <tr><TD mono={false} className="text-stone-300">Construction Risk NPV (post-mit)</TD><TD className="text-right text-rose-300">{fmt$(vfm.pscConstrRiskNPV)}</TD></tr>
             <tr><TD mono={false} className="text-stone-300">Operations Risk NPV (post-mit)</TD><TD className="text-right text-rose-300">{fmt$(vfm.pscOpsRiskNPV)}</TD></tr>
