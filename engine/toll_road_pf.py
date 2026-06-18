@@ -244,6 +244,7 @@ def default_model() -> Dict[str, Any]:
         'vfm': {
             'pscDiscountRate': 0.045,
             'pscCostPremium': 0.08,
+            'pscUseLeverage': True,
             'competitiveNeutralityPct': 0.03,
             'isAvailabilityBased': False,
             'upfrontConcessionFee': 50_000_000,
@@ -2083,7 +2084,27 @@ def build_vfm_analysis(model: Dict[str, Any],
                           / (1 + rate) ** (const_yrs + y + 0.5)
                           for y in range(ops_yrs))
     comp_neutrality_adj = (psc_capex_npv + psc_opex_npv) * v.get('competitiveNeutralityPct', 0)
-    psc_net_cost = (psc_capex_npv + psc_opex_npv + psc_constr_risk_npv
+
+    # ── Leveraged PSC: debt-financed to capacity; public funds gap + services debt ──
+    total_debt_raised = results.get('debt_total', 0) or 0
+    nominal_capex = (results.get('capex_sched', {}) or {}).get('totalNominal', 0) or 0
+    debt_cover_frac = min(1, total_debt_raised / nominal_capex) if nominal_capex > 0 else 0
+    psc_debt_service_npv = 0.0
+    periods_l = results.get('periods', [])
+    if periods_l and results.get('senior_int'):
+        ppy_l = model['general'].get('periodsPerYear', 2)
+        for i in range(len(periods_l)):
+            ds = ((results['senior_int'][i] or 0) + (results['senior_pri'][i] or 0)
+                  + (results.get('sub_int', [0]*len(periods_l))[i] or 0)
+                  + (results.get('sub_pri', [0]*len(periods_l))[i] or 0))
+            t = const_yrs + (i / ppy_l)
+            psc_debt_service_npv += ds / (1 + rate) ** t
+    psc_capex_gap_npv = psc_capex_npv * (1 - debt_cover_frac)
+    psc_leveraged_capex_npv = psc_capex_gap_npv + psc_debt_service_npv
+    psc_use_leverage = v.get('pscUseLeverage', True)
+    psc_capex_component = psc_leveraged_capex_npv if psc_use_leverage else psc_capex_npv
+
+    psc_net_cost = (psc_capex_component + psc_opex_npv + psc_constr_risk_npv
                     + psc_ops_risk_npv + total_constr_mit_npv + total_ops_mit_npv
                     + comp_neutrality_adj - psc_revenue_npv)
 
@@ -2134,6 +2155,9 @@ def build_vfm_analysis(model: Dict[str, Any],
     return {
         'psc_discount_rate': rate,
         'psc_capex_npv': psc_capex_npv, 'psc_opex_npv': psc_opex_npv,
+        'psc_use_leverage': psc_use_leverage, 'psc_debt_service_npv': psc_debt_service_npv,
+        'psc_capex_gap_npv': psc_capex_gap_npv, 'psc_capex_component': psc_capex_component,
+        'total_debt_raised': total_debt_raised, 'debt_cover_frac': debt_cover_frac,
         'psc_constr_risk_npv': psc_constr_risk_npv, 'psc_ops_risk_npv': psc_ops_risk_npv,
         'psc_revenue_npv': psc_revenue_npv, 'comp_neutrality_adj': comp_neutrality_adj,
         'psc_mit_constr_npv': total_constr_mit_npv, 'psc_mit_ops_npv': total_ops_mit_npv,
