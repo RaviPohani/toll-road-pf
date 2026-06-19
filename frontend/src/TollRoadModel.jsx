@@ -1987,6 +1987,142 @@ function npvAnnuity(annual, years, rate, startDelayYears = 0){
   return pv / Math.pow(1 + rate, startDelayYears);
 }
 
+// ── AUDIT CHECKS ──
+// Hard checks (pass/fail, green/red) + warnings (pass/caution, green/yellow).
+function buildAuditChecks(model, results){
+  if(!results) return { checks: [], warnings: [] };
+  const r = results;
+  const TOL = Math.max(1000, (r.totalUses||0) * 0.0005);  // tolerance: $1k or 0.05% of uses
+  const checks = [];
+  const warnings = [];
+  const ppy = model.general.periodsPerYear || 2;
+  const instruments = model.financing.instruments || [];
+  const debtInstruments = instruments.filter(i => !['Grant','Equity','Paygo'].includes(i.seniority));
+
+  // ── CHECK 1a: Sources = Uses — Construction ──
+  const constrGap = (r.totalSources||0) - (r.totalUses||0);
+  checks.push({
+    id: 'sources_uses_construction',
+    category: 'Sources = Uses',
+    label: 'Construction: Total Sources = Total Uses',
+    pass: Math.abs(constrGap) <= TOL,
+    detail: `Sources ${fmt$(r.totalSources)} vs Uses ${fmt$(r.totalUses)} — gap ${fmt$(constrGap)}`,
+  });
+
+  // ── CHECK 1b: Sources = Uses — Operations (waterfall balances every period) ──
+  // Each period: Revenue + AP − Opex − TIFIA fees − Total DS − reserve net deposit − equity CF ≈ 0
+  let opsMaxGap = 0, opsBadPeriod = -1;
+  for(let i=0;i<(r.periods||[]).length;i++){
+    const inflow = (r.revSched?.byPeriod[i]||0) + (r.apStream?.[i]||0);
+    const outflow = (r.opexSched?.byPeriod[i]||0) + (r.tifiaFeesPerPeriod?.[i]||0) + (r.totalDS?.[i]||0)
+                   + (r.reserveNetDeposit?.[i]||0) + (r.equityCF?.[i] ?? r.rawEquityCF?.[i] ?? 0);
+    const gap = inflow - outflow;
+    if(Math.abs(gap) > Math.abs(opsMaxGap)){ opsMaxGap = gap; opsBadPeriod = i; }
+  }
+  checks.push({
+    id: 'sources_uses_operations',
+    category: 'Sources = Uses',
+    label: 'Operations: Cashflow waterfall balances every period',
+    pass: Math.abs(opsMaxGap) <= TOL,
+    detail: Math.abs(opsMaxGap) <= TOL
+      ? 'All operating periods balance to within tolerance'
+      : `Largest imbalance ${fmt$(opsMaxGap)} in period ${r.periods?.[opsBadPeriod]?.label || opsBadPeriod}`,
+  });
+
+  // ── CHECK 2: All debt issued gets paid (per instrument) ──
+  debtInstruments.forEach(inst => {
+    const sched = r.debtSchedules?.[inst.id];
+    if(!sched || !(inst.amount > 0)) return;
+    const finalBal = sched.balance[sched.balance.length-1] || 0;
+    const pass = Math.abs(finalBal) <= Math.max(1000, inst.amount * 0.001);
+    checks.push({
+      id: `debt_repaid_${inst.id}`,
+      category: 'Debt Fully Repaid',
+      label: `${inst.type} (${inst.id})`,
+      pass,
+      detail: pass ? `Balance retired to ${fmt$(finalBal)} by maturity` : `Residual balance ${fmt$(finalBal)} remains unpaid at end of schedule`,
+    });
+  });
+
+  // ── CHECK 3: DSCR ≥ minimum target (per instrument) ──
+  debtInstruments.forEach(inst => {
+    if(!(inst.targetDSCR > 0) || !(inst.amount > 0)) return;
+    const sched = r.debtSchedules?.[inst.id];
+    if(!sched) return;
+    // Coverage measure depends on seniority: Senior uses seniorDSCR, Subordinate/TIFIA uses totalDSCR (or its own effective DSCR if phased)
+    let minDSCR = Infinity, minIdx = -1;
+    for(let i=0;i<(r.periods||[]).length;i++){
+      const ds = (sched.interest[i]||0) + (sched.principal[i]||0);
+      if(ds <= 1){ continue; }  // skip periods with no debt service for this instrument
+      const cfi = r.cfadsForDscr?.[i] ?? r.cfadsByPeriod?.[i] ?? 0;
+      const d = cfi / ds;
+      if(d < minDSCR){ minDSCR = d; minIdx = i; }
+    }
+    if(!isFinite(minDSCR)) return;  // instrument never has live debt service (e.g. fully deferred/capitalised)
+    const pass = minDSCR >= inst.targetDSCR - 0.005;
+    checks.push({
+      id: `dscr_${inst.id}`,
+      category: 'DSCR ≥ Minimum',
+      label: `${inst.type} (${inst.id}) — floor ${fmtRatio(inst.targetDSCR)}`,
+      pass,
+      detail: `Min DSCR ${fmtRatio(minDSCR)} in ${r.periods?.[minIdx]?.label || minIdx} vs floor ${fmtRatio(inst.targetDSCR)}`,
+    });
+  });
+
+  // ── CHECK 4: Equity IRR ≥ target ──
+  const targetIRR = model.optimizer?.cascade?.targetEquityIRR ?? 0.12;
+  const actualIRR = r.equityIRR;
+  checks.push({
+    id: 'equity_irr',
+    category: 'Equity IRR ≥ Target',
+    label: `Equity IRR vs target ${fmtPct(targetIRR,2)}`,
+    pass: actualIRR != null && actualIRR >= targetIRR - 0.0005,
+    detail: actualIRR != null ? `Actual ${fmtPct(actualIRR,2)} vs target ${fmtPct(targetIRR,2)}` : 'Equity IRR could not be computed (no equity cashflow)',
+  });
+
+  // ── WARNING 1: TIFIA below 49% of eligible cost ──
+  const tifiaInst = instruments.find(i => i.type === 'TIFIA Loan');
+  if(tifiaInst){
+    const eligibleIds = model.optimizer?.cascade?.tifiaEligibleCapexIds || [];
+    let eligibleCost = 0;
+    eligibleIds.forEach(id => { eligibleCost += sum(r.capexSched?.byItem?.[id] || []); });
+    const maxPct = model.optimizer?.cascade?.autoTifiaParams?.maxTifiaPct ?? 0.49;
+    const tifiaPct = eligibleCost > 0 ? (tifiaInst.amount||0) / eligibleCost : 0;
+    const atCeiling = tifiaPct >= maxPct - 0.005;
+    warnings.push({
+      id: 'tifia_below_49',
+      category: 'TIFIA Sizing',
+      label: `TIFIA % of eligible cost (statute cap ${fmtPct(maxPct,0)})`,
+      pass: atCeiling,
+      detail: `TIFIA sized to ${fmtPct(tifiaPct,1)} of ${fmt$(eligibleCost)} eligible cost${atCeiling?' — at statutory ceiling':' — headroom remains; consider increasing TIFIA share'}`,
+    });
+  }
+
+  // ── WARNING 2: Early repayment (per instrument) ──
+  debtInstruments.forEach(inst => {
+    const sched = r.debtSchedules?.[inst.id];
+    if(!sched || !(inst.amount > 0)) return;
+    const n = sched.balance.length;
+    const statedTenorPeriods = Math.round((inst.tenorYears||0) * ppy);
+    // Find first period where balance hits (near) zero
+    let payoffIdx = -1;
+    for(let i=0;i<n;i++){ if(sched.balance[i] <= Math.max(1000, inst.amount*0.001)){ payoffIdx = i; break; } }
+    if(payoffIdx < 0) return;  // never fully paid within schedule — covered by Check 2
+    const early = statedTenorPeriods > 0 && payoffIdx < statedTenorPeriods - 1;
+    warnings.push({
+      id: `early_repay_${inst.id}`,
+      category: 'Early Repayment',
+      label: `${inst.type} (${inst.id})`,
+      pass: !early,
+      detail: early
+        ? `Paid off in ${r.periods?.[payoffIdx]?.label || payoffIdx} — ${(statedTenorPeriods-payoffIdx)} periods (${(((statedTenorPeriods-payoffIdx)/ppy)).toFixed(1)}y) before stated ${inst.tenorYears}y tenor`
+        : `Retired at or after stated ${inst.tenorYears}y tenor`,
+    });
+  });
+
+  return { checks, warnings, tolerance: TOL };
+}
+
 function buildVfMAnalysis(model, results){
   const v = model.vfm || defaultModel().vfm;
   const rate = v.pscDiscountRate || 0.045;
@@ -4223,6 +4359,118 @@ function SourcesUsesTab({model, results}){
 }
 
 // ---------- TIFIA SCHEDULE ----------
+function AuditTab({model, results}){
+  const audit = useMemo(()=>{
+    try { return buildAuditChecks(model, results); }
+    catch(e){ console.error('Audit error:', e); return { checks:[], warnings:[], error:e.message }; }
+  }, [model, results]);
+
+  if(!results) return <div className="p-8 text-center text-stone-500">Loading…</div>;
+
+  const { checks, warnings, error } = audit;
+  const passCount = checks.filter(c=>c.pass).length;
+  const failCount = checks.length - passCount;
+  const warnPassCount = warnings.filter(w=>w.pass).length;
+  const warnFailCount = warnings.length - warnPassCount;
+
+  const Indicator = ({pass, warning}) => (
+    <span className={`inline-block w-3 h-3 rounded-full shrink-0 ${pass ? 'bg-emerald-500' : warning ? 'bg-amber-400' : 'bg-rose-500'}`}
+      style={{boxShadow: pass ? '0 0 8px rgba(16,185,129,0.6)' : warning ? '0 0 8px rgba(251,191,36,0.6)' : '0 0 8px rgba(244,63,94,0.6)'}}/>
+  );
+
+  const Row = ({item, warning}) => (
+    <tr className="hover:bg-stone-900/30 border-b border-stone-800/60">
+      <td className="py-2.5 px-3 w-8"><Indicator pass={item.pass} warning={warning}/></td>
+      <td className="py-2.5 px-3 text-xs text-stone-500 whitespace-nowrap">{item.category}</td>
+      <td className="py-2.5 px-3 text-sm text-stone-200">{item.label}</td>
+      <td className="py-2.5 px-3 text-xs text-stone-400">{item.detail}</td>
+    </tr>
+  );
+
+  // Group checks by category for cleaner display
+  const groupBy = (arr) => {
+    const g = {};
+    arr.forEach(item => { (g[item.category] = g[item.category]||[]).push(item); });
+    return g;
+  };
+  const checkGroups = groupBy(checks);
+  const warnGroups = groupBy(warnings);
+
+  return <div>
+    {error && <div className="p-3 mb-4 bg-rose-900/20 border border-rose-700/50 rounded text-rose-300 text-sm">Audit error: {error}</div>}
+
+    <Section title="Model Audit" subtitle="Hard checks must pass for the structure to be considered bankable. Warnings flag items worth reviewing but don't invalidate the model.">
+      <div className="grid grid-cols-4 gap-3 mb-6">
+        <div className="bg-stone-900/40 border border-stone-700/60 rounded p-4">
+          <div className="text-[10px] uppercase tracking-wider text-stone-500 mb-1">Checks Passed</div>
+          <div className="text-2xl font-light text-emerald-300">{passCount} / {checks.length}</div>
+        </div>
+        <div className={`border rounded p-4 ${failCount>0 ? 'bg-rose-900/20 border-rose-700/50' : 'bg-stone-900/40 border-stone-700/60'}`}>
+          <div className="text-[10px] uppercase tracking-wider text-stone-500 mb-1">Checks Failed</div>
+          <div className={`text-2xl font-light ${failCount>0?'text-rose-300':'text-stone-500'}`}>{failCount}</div>
+        </div>
+        <div className="bg-stone-900/40 border border-stone-700/60 rounded p-4">
+          <div className="text-[10px] uppercase tracking-wider text-stone-500 mb-1">Warnings Clear</div>
+          <div className="text-2xl font-light text-emerald-300">{warnPassCount} / {warnings.length}</div>
+        </div>
+        <div className={`border rounded p-4 ${warnFailCount>0 ? 'bg-amber-900/20 border-amber-700/50' : 'bg-stone-900/40 border-stone-700/60'}`}>
+          <div className="text-[10px] uppercase tracking-wider text-stone-500 mb-1">Flagged Warnings</div>
+          <div className={`text-2xl font-light ${warnFailCount>0?'text-amber-300':'text-stone-500'}`}>{warnFailCount}</div>
+        </div>
+      </div>
+
+      {failCount === 0 ? (
+        <div className="flex items-center gap-2 mb-5 px-4 py-3 bg-emerald-900/20 border border-emerald-700/40 rounded text-emerald-300 text-sm">
+          <Indicator pass={true}/> All hard checks pass — structure is internally consistent.
+        </div>
+      ) : (
+        <div className="flex items-center gap-2 mb-5 px-4 py-3 bg-rose-900/20 border border-rose-700/40 rounded text-rose-300 text-sm">
+          <Indicator pass={false}/> {failCount} hard check{failCount>1?'s':''} failing — review below before treating this structure as final.
+        </div>
+      )}
+    </Section>
+
+    <Section title="Checks" subtitle="Green = pass · Red = fail">
+      <div className="overflow-x-auto border border-stone-700/60 rounded">
+        <table className="w-full">
+          <thead className="bg-stone-900"><tr>
+            <th className="py-2 px-3 w-8"></th>
+            <th className="py-2 px-3 text-left text-[10px] uppercase tracking-wider text-stone-400">Category</th>
+            <th className="py-2 px-3 text-left text-[10px] uppercase tracking-wider text-stone-400">Check</th>
+            <th className="py-2 px-3 text-left text-[10px] uppercase tracking-wider text-stone-400">Detail</th>
+          </tr></thead>
+          <tbody>
+            {Object.entries(checkGroups).map(([cat, items]) => items.map((item,i)=>(
+              <Row key={item.id} item={item}/>
+            )))}
+            {checks.length === 0 && <tr><td colSpan={4} className="py-6 text-center text-stone-500 text-sm">No checks available — run the model first.</td></tr>}
+          </tbody>
+        </table>
+      </div>
+    </Section>
+
+    <Section title="Warnings" subtitle="Green = clear · Yellow = flagged for review">
+      <div className="overflow-x-auto border border-stone-700/60 rounded">
+        <table className="w-full">
+          <thead className="bg-stone-900"><tr>
+            <th className="py-2 px-3 w-8"></th>
+            <th className="py-2 px-3 text-left text-[10px] uppercase tracking-wider text-stone-400">Category</th>
+            <th className="py-2 px-3 text-left text-[10px] uppercase tracking-wider text-stone-400">Item</th>
+            <th className="py-2 px-3 text-left text-[10px] uppercase tracking-wider text-stone-400">Detail</th>
+          </tr></thead>
+          <tbody>
+            {Object.entries(warnGroups).map(([cat, items]) => items.map((item)=>(
+              <Row key={item.id} item={item} warning/>
+            )))}
+            {warnings.length === 0 && <tr><td colSpan={4} className="py-6 text-center text-stone-500 text-sm">No warnings available — run the model first.</td></tr>}
+          </tbody>
+        </table>
+      </div>
+      <div className="text-[10px] text-stone-500 mt-2">Tolerance for balance checks: {fmt$(audit.tolerance||0)}.</div>
+    </Section>
+  </div>;
+}
+
 function TifiaScheduleTab({model, results}){
   if(!results) return <div className="p-8 text-center text-stone-500">Loading…</div>;
   const r = results;
@@ -4241,7 +4489,7 @@ function TifiaScheduleTab({model, results}){
   const phases = tifiaInst.phases || [];
 
   // Date helpers
-  const addMonths = (dateStr, n) => {
+  const addMonthsLabel = (dateStr, n) => {
     const d = new Date(dateStr);
     d.setMonth(d.getMonth() + Math.round(n));
     return d.toLocaleDateString('en-US',{month:'short',year:'numeric'});
@@ -4263,8 +4511,8 @@ function TifiaScheduleTab({model, results}){
   for(let pi = 0; pi < numConstrPeriods; pi++){
     const mStart = Math.round(pi * monthsPerPeriod);
     const mEnd = Math.min(cm, Math.round((pi+1) * monthsPerPeriod));
-    const dateStart = addMonths(fc, mStart);
-    const dateEnd = addMonths(fc, mEnd);
+    const dateStart = addMonthsLabel(fc, mStart);
+    const dateEnd = addMonthsLabel(fc, mEnd);
     const openBal = mStart === 0 ? 0 : (constr.monthlyBalance[mStart-1] || 0);
     let draws = 0, intDue = 0;
     for(let m = mStart; m < mEnd; m++){
@@ -4283,8 +4531,8 @@ function TifiaScheduleTab({model, results}){
   // OPERATIONS PHASE
   const scd = model.general.serviceCommencementDate || addMonths(fc, cm);
   for(let i = 0; i < sched.interest.length; i++){
-    const tStart = addMonths(scd, i * monthsPerPeriod);
-    const tEnd = addMonths(scd, (i+1) * monthsPerPeriod);
+    const tStart = addMonthsLabel(scd, i * monthsPerPeriod);
+    const tEnd = addMonthsLabel(scd, (i+1) * monthsPerPeriod);
     const regime = getRegime(i);
     const openBal = i === 0 ? constr.finalBalance : sched.balance[i-1];
     const intDue = regime === 'defer' ? openBal * tifiaInst.rate / ppy : sched.interest[i];
@@ -4988,6 +5236,7 @@ const TABS = [
   {id:'tifia',label:'TIFIA'},{id:'controls',label:'Control Accts'},{id:'optimizer',label:'Optimizer'},
   {id:'sensitivity',label:'Sensitivity'},{id:'vfm',label:'VfM'},
   {id:'cashflow',label:'Cashflow'},{id:'su',label:'S&U'},{id:'tifiaSchedule',label:'TIFIA Schedule'},
+  {id:'audit',label:'Audit'},
   {id:'dashboard',label:'Dashboard'},{id:'chat',label:'Assistant'},
 ];
 
@@ -5148,6 +5397,7 @@ export default function App(){
         {tab==='cashflow' && <CashflowTab model={model} results={results}/>}
         {tab==='su' && <SourcesUsesTab model={model} results={results}/>}
         {tab==='tifiaSchedule' && <TifiaScheduleTab model={model} results={results}/>}
+        {tab==='audit' && <AuditTab model={model} results={results}/>}
         {tab==='dashboard' && <DashboardTab model={model} results={results}/>}
         {tab==='chat' && <ChatTab model={model} setModel={setModel} results={results}/>}
       </main>
