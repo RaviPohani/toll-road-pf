@@ -2857,7 +2857,7 @@ function OptimizerTab({model, setModel, results}){
   const ap = c.autoTifiaParams || {};
   const setAuto = patch => setCascade({autoTifiaParams: {...ap, ...patch}});
   const [running, setRunning] = useState(false);
-  const [output, setOutput] = useState(o.lastAutoCascadeRun);
+  const [output, setOutput] = useState(null);  // full cascade result (has .best/.trace); summary lives on model.optimizer.lastAutoCascadeRun
   const ppy = model.general.periodsPerYear || 2;
   const tifiaInst = model.financing.instruments.find(i => i.id === c.tifiaInstrumentId) || model.financing.instruments.find(i => i.type === 'TIFIA Loan');
   const tifiaTenor = tifiaInst ? tifiaInst.tenorYears : 35;
@@ -2941,8 +2941,8 @@ function OptimizerTab({model, setModel, results}){
               financing:{...model.financing, instruments:newInsts},
               optimizer:{...o, cascade:{...(o.cascade||{}), tifiaEnabled: !turningOff}}});
           }}
-            className={`w-12 h-6 rounded-full transition-colors ${c.tifiaEnabled !== false ? 'bg-amber-500' : 'bg-stone-700'} relative`}>
-            <span className={`absolute top-1 w-4 h-4 rounded-full bg-white transition-transform ${c.tifiaEnabled !== false ? 'translate-x-7' : 'translate-x-1'}`}/>
+            className={`shrink-0 w-11 h-6 rounded-full transition-colors relative ${c.tifiaEnabled !== false ? 'bg-amber-500' : 'bg-stone-700'}`}>
+            <span className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white transition-transform ${c.tifiaEnabled !== false ? 'translate-x-5' : 'translate-x-0'}`}/>
           </button>
         </label>
       }>
@@ -3049,7 +3049,7 @@ function OptimizerTab({model, setModel, results}){
     </Section>
 
     {output && (
-      <Section title="Result" subtitle={output.converged ? `Converged in ${output.trace.length} iterations` : 'Did not converge'}>
+      <Section title="Result" subtitle={output.converged ? `Converged in ${(output.trace||[]).length} iterations` : 'Did not converge'}>
         {output.error && <div className="p-3 bg-rose-900/20 border border-rose-700/50 rounded text-rose-300 text-sm mb-3">Error: {output.error}</div>}
         {output.best && (()=>{
           const b = output.best;
@@ -3117,7 +3117,7 @@ function OptimizerTab({model, setModel, results}){
                   <TH className="text-right">Min Total</TH><TH className="text-right">Min Sr</TH><TH className="text-right">TIFIA Eff</TH>
                   <TH className="text-right">Test Bal</TH><TH>Feasible</TH>
                 </tr></thead>
-                <tbody>{output.trace.map((t,i)=>(
+                <tbody>{(output.trace||[]).map((t,i)=>(
                   <tr key={i} className={`hover:bg-stone-900/40 ${t.feasible?'':'opacity-60'}`}>
                     <TD>{t.iter}</TD>
                     <TD className="text-right text-amber-300">{fmtPct(t.pct,2)}</TD>
@@ -4766,16 +4766,16 @@ ${JSON.stringify(summary, null, 2)}`;
         <Field label="PSC Cost Premium" hint="Private-sector efficiency gap PSC misses"><NumInput value={v.pscCostPremium} onChange={x=>setV({pscCostPremium:x})} step={0.01} suffix="%"/></Field>
         <Field label="Competitive Neutrality %" hint="PSC tax/regulatory advantage adjustment"><NumInput value={v.competitiveNeutralityPct} onChange={x=>setV({competitiveNeutralityPct:x})} step={0.005} suffix="%"/></Field>
       </div>
-      <div className="flex items-center gap-3 bg-stone-900/40 border border-stone-700/60 rounded p-3">
+      <div className="flex items-start gap-3 bg-stone-900/40 border border-stone-700/60 rounded p-3">
         <button onClick={()=>setV({pscUseLeverage: v.pscUseLeverage === false})}
-          className={`w-12 h-6 rounded-full transition-colors ${v.pscUseLeverage !== false ? 'bg-amber-500' : 'bg-stone-700'} relative`}>
-          <span className={`absolute top-1 w-4 h-4 rounded-full bg-white transition-transform ${v.pscUseLeverage !== false ? 'translate-x-7' : 'translate-x-1'}`}/>
+          className={`shrink-0 w-11 h-6 rounded-full transition-colors mt-0.5 relative ${v.pscUseLeverage !== false ? 'bg-amber-500' : 'bg-stone-700'}`}>
+          <span className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white transition-transform ${v.pscUseLeverage !== false ? 'translate-x-5' : 'translate-x-0'}`}/>
         </button>
-        <div>
-          <div className="text-sm text-stone-200">{v.pscUseLeverage !== false ? 'Leveraged PSC (debt-financed)' : 'Unleveraged PSC (100% public cash)'}</div>
-          <div className="text-[10px] text-stone-500">
+        <div className="flex-1 min-w-0">
+          <div className="text-sm font-medium text-stone-200">{v.pscUseLeverage !== false ? 'Leveraged PSC (debt-financed)' : 'Unleveraged PSC (100% public cash)'}</div>
+          <div className="text-[11px] text-stone-500 mt-0.5 leading-snug">
             {v.pscUseLeverage !== false
-              ? `Public delivery raises the same debt the project supports (${fmt$(vfm.totalDebtRaised)}, ${fmtPct(vfm.debtCoverFrac,0)} of capex); public funds only the residual gap upfront and services debt from toll revenue.`
+              ? `Public delivery raises the same debt the project supports (${fmt$(vfm.totalDebtRaised)}, ${fmtPct(vfm.debtCoverFrac,0)} of capex). Public funds only the residual gap upfront and services the debt from toll revenue.`
               : 'Public funds 100% of capex from cash at financial close — no leverage.'}
           </div>
         </div>
