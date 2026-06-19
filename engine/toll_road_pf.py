@@ -448,13 +448,18 @@ def tifia_all_in_rate(tenor: float, cfg: Dict[str, Any]) -> float:
 # ============================================================
 def build_revenue_schedule(model: Dict[str, Any], periods: List[Dict[str, Any]]) -> Dict[str, Any]:
     n = len(periods)
-    out = {'byPeriod': _zeros(n), 'byClass': {}, 'aadtByPeriod': _zeros(n)}
+    out = {'byPeriod': _zeros(n), 'byClass': {}, 'aadtByPeriod': _zeros(n), 'txnByPeriod': _zeros(n)}
     if model['revenue'].get('useDirectForecast') and model['revenue'].get('directForecast'):
         by_year = {row['year'] - 1: row.get('total', 0) for row in model['revenue']['directForecast']}
+        txn_by_year = {row['year'] - 1: row['transactions'] for row in model['revenue']['directForecast']
+                       if row.get('transactions') is not None}
         cum_y = 0.0
         for i, p in enumerate(periods):
             y = int(cum_y)
             out['byPeriod'][i] = by_year.get(y, 0) * p['yearFraction']
+            annual_txn = txn_by_year.get(y, 0)
+            out['txnByPeriod'][i] = annual_txn * p['yearFraction']
+            out['aadtByPeriod'][i] = annual_txn / 365 if annual_txn > 0 else 0
             cum_y += p['yearFraction']
         return out
     r = model['revenue']
@@ -499,8 +504,12 @@ def build_opex_schedule(model: Dict[str, Any], periods: List[Dict[str, Any]],
         period_total = 0.0
         for it in model['opex']['items']:
             if it.get('perTxn'):
-                aadt = rev_sched['aadtByPeriod'][i] or 0
-                txns = aadt * 365 * (it.get('share', 0))
+                uploaded_txn = rev_sched.get('txnByPeriod', [0]*n)[i] or 0
+                if uploaded_txn > 0:
+                    txns = (uploaded_txn / p['yearFraction']) * (it.get('share', 0))
+                else:
+                    aadt = rev_sched['aadtByPeriod'][i] or 0
+                    txns = aadt * 365 * (it.get('share', 0))
                 cpt = it['base'] * ((1 + rate) ** y) if model['opex']['inflate'] else it['base']
                 ann = txns * cpt
             else:
