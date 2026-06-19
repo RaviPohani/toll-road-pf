@@ -205,6 +205,21 @@ const fmt$ = n => { if(n==null||isNaN(n)||!isFinite(n)) return '—'; const a=Ma
 const fmtPct = (n,d=2) => (n==null||isNaN(n)||!isFinite(n))?'—':`${(n*100).toFixed(d)}%`;
 const fmtRatio = (n,d=2) => (n==null||isNaN(n)||!isFinite(n))?'—':`${n.toFixed(d)}x`;
 const sum = a => a.reduce((x,y)=>x+(y||0),0);
+
+// Shared ExcelJS loader (CDN) — used by Dashboard export AND the manual-input template feature.
+let _exceljsPromise = null;
+const loadExcelJSGlobal = () => {
+  if(_exceljsPromise) return _exceljsPromise;
+  _exceljsPromise = new Promise((resolve, reject) => {
+    if(window.ExcelJS){ resolve(window.ExcelJS); return; }
+    const s = document.createElement('script');
+    s.src = 'https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js';
+    s.onload  = () => resolve(window.ExcelJS);
+    s.onerror = () => { _exceljsPromise = null; reject(new Error('ExcelJS CDN load failed')); };
+    document.head.appendChild(s);
+  });
+  return _exceljsPromise;
+};
 const zeros = n => Array.from({length:n},()=>0);
 const avg = a => a.length?sum(a)/a.length:0;
 
@@ -330,14 +345,23 @@ function tifiaAllInRate(tenor, cfg){ return (cfg.treasuryRate||0) + tifiaSpreadB
 
 // ---------- REVENUE (period framework) ----------
 function buildRevenueSchedule(model, periods){
-  const out = { byPeriod: zeros(periods.length), byClass: {}, aadtByPeriod: zeros(periods.length) };
+  const out = { byPeriod: zeros(periods.length), byClass: {}, aadtByPeriod: zeros(periods.length), txnByPeriod: zeros(periods.length) };
   if(model.revenue.useDirectForecast && model.revenue.directForecast.length){
-    const byYear = {};
-    model.revenue.directForecast.forEach(row=>{ byYear[row.year-1] = row.total||0; });
+    const byYear = {}, txnByYear = {};
+    model.revenue.directForecast.forEach(row=>{
+      byYear[row.year-1] = row.total||0;
+      if(row.transactions != null) txnByYear[row.year-1] = row.transactions;
+    });
     let cumY = 0;
     periods.forEach((p,i)=>{
       const y = Math.floor(cumY);
       out.byPeriod[i] = (byYear[y]||0) * p.yearFraction;
+      // Use uploaded transaction count for this period (pro-rated); fall back to 0 if not provided
+      // so per-transaction opex costs use real uploaded volume instead of silently defaulting to zero AADT.
+      const annualTxn = txnByYear[y] || 0;
+      const periodTxn = annualTxn * p.yearFraction;
+      out.txnByPeriod[i] = periodTxn;
+      out.aadtByPeriod[i] = annualTxn > 0 ? annualTxn / 365 : 0;  // effective AADT implied by uploaded transactions
       cumY += p.yearFraction;
     });
     return out;
@@ -387,8 +411,9 @@ function buildOpexSchedule(model, periods, revSched){
     model.opex.items.forEach(it=>{
       let ann;
       if(it.perTxn){
-        const aadt = revSched.aadtByPeriod[i] || 0;
-        const tx = aadt * 365 * (it.share||0);
+        // Prefer directly-uploaded transaction counts (precise); fall back to AADT-derived estimate.
+        const uploadedTxn = revSched.txnByPeriod ? revSched.txnByPeriod[i] : 0;
+        const tx = (uploadedTxn > 0 ? (uploadedTxn / p.yearFraction) : ((revSched.aadtByPeriod[i] || 0) * 365)) * (it.share||0);
         const cpt = model.opex.inflate ? it.base * Math.pow(1+rate, y) : it.base;
         ann = tx * cpt;
       } else {
@@ -2417,19 +2442,143 @@ function Metric({label, value, sub, accent='amber'}){
     {sub && <div className="text-xs text-stone-500 mt-1">{sub}</div>}
   </div>;
 }
-function DirectForecastTable({rows, onChange, keyName, unitLabel, total}){
-  const addRow = ()=>onChange([...rows, {[keyName]:rows.length+1, total:0}]);
+function DirectForecastTable({rows, onChange, keyName, unitLabel, total, model, sheetTitle, paramLabel,
+  extraField, extraLabel, extraTotal}){
+  const addRow = ()=>onChange([...rows, {[keyName]:rows.length+1, total:0, ...(extraField?{[extraField]:0}:{})}]);
   const updateRow = (i, patch)=>onChange(rows.map((r,idx)=>idx===i?{...r,...patch}:r));
   const removeRow = (i)=>onChange(rows.filter((_,idx)=>idx!==i));
+  const [busy, setBusy] = useState(false);
+  const fileRef = useRef(null);
+
+  // Build the list of periods this template should cover, with real calendar labels.
+  const buildPeriodRows = () => {
+    const fc = model?.general?.financialCloseDate || '2026-07-01';
+    if(keyName === 'month'){
+      // Capex: monthly, spanning construction period
+      const n = model?.general?.constructionMonths || 36;
+      return Array.from({length:n}, (_,i) => {
+        const d = addMonths(fc, i);
+        return { key: i+1, label: d.toLocaleDateString('en-US',{month:'short',year:'numeric'}) };
+      });
+    } else {
+      // Revenue/Opex: by operating year, starting at service commencement (FC + construction)
+      const cm = model?.general?.constructionMonths || 36;
+      const n = model?.general?.operationsYears || 30;
+      const scd = addMonths(fc, cm);
+      return Array.from({length:n}, (_,i) => {
+        const yStart = addMonths(scd, i*12);
+        const yEnd = addMonths(scd, (i+1)*12 - 1);
+        return { key: i+1, label: `Op. Yr ${i+1} (${yStart.toLocaleDateString('en-US',{month:'short',year:'numeric'})}–${yEnd.toLocaleDateString('en-US',{month:'short',year:'numeric'})})` };
+      });
+    }
+  };
+
+  const downloadTemplate = async () => {
+    setBusy(true);
+    try {
+      const EJS = await loadExcelJSGlobal();
+      const wb = new EJS.Workbook();
+      const ws = wb.addWorksheet(sheetTitle || 'Template');
+      const hasExtra = !!extraField;
+      ws.columns = hasExtra ? [{width:10},{width:32},{width:18},{width:20}] : [{width:10},{width:32},{width:18}];
+      const hdr = ws.getRow(1);
+      hdr.getCell(1).value = unitLabel; hdr.getCell(2).value = 'Period'; hdr.getCell(3).value = paramLabel || 'Amount ($)';
+      if(hasExtra) hdr.getCell(4).value = extraLabel;
+      hdr.eachCell(c => { c.font = {bold:true, color:{argb:'FFFFFFFF'}}; c.fill = {type:'pattern',pattern:'solid',fgColor:{argb:'FF1C1917'}}; });
+      const periodRows = buildPeriodRows();
+      // Pre-fill with existing values if present, matching by key
+      const existing = {}, existingExtra = {};
+      rows.forEach(r => { existing[r[keyName]] = r.total; if(hasExtra) existingExtra[r[keyName]] = r[extraField]; });
+      periodRows.forEach((p, i) => {
+        const row = ws.getRow(i+2);
+        row.getCell(1).value = p.key;
+        row.getCell(2).value = p.label;
+        row.getCell(3).value = existing[p.key] ?? null;
+        row.getCell(3).numFmt = '#,##0';
+        row.getCell(3).fill = {type:'pattern', pattern:'solid', fgColor:{argb: existing[p.key]!=null ? 'FFEAF1F8' : 'FFFFF8E1'}};
+        if(hasExtra){
+          row.getCell(4).value = existingExtra[p.key] ?? null;
+          row.getCell(4).numFmt = '#,##0';
+          row.getCell(4).fill = {type:'pattern', pattern:'solid', fgColor:{argb: existingExtra[p.key]!=null ? 'FFEAF1F8' : 'FFFFF8E1'}};
+        }
+        row.eachCell(c => { c.border = {top:{style:'thin',color:{argb:'FFD6D3D1'}},bottom:{style:'thin',color:{argb:'FFD6D3D1'}},left:{style:'thin',color:{argb:'FFD6D3D1'}},right:{style:'thin',color:{argb:'FFD6D3D1'}}}; });
+      });
+      ws.getColumn(3).alignment = { horizontal:'right' };
+      if(hasExtra) ws.getColumn(4).alignment = { horizontal:'right' };
+      const buffer = await wb.xlsx.writeBuffer();
+      const blob = new Blob([buffer], {type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = `${(sheetTitle||'template').replace(/[^a-z0-9]/gi,'_')}_template.xlsx`;
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch(e){ alert('Template download failed: ' + e.message); }
+    setBusy(false);
+  };
+
+  const handleUpload = async (e) => {
+    const file = e.target.files?.[0];
+    if(!file) return;
+    setBusy(true);
+    try {
+      const EJS = await loadExcelJSGlobal();
+      const wb = new EJS.Workbook();
+      const buf = await file.arrayBuffer();
+      await wb.xlsx.load(buf);
+      const ws = wb.worksheets[0];
+      const hasExtra = !!extraField;
+      const newRows = [];
+      ws.eachRow((row, rowNum) => {
+        if(rowNum === 1) return;  // skip header
+        const key = row.getCell(1).value;
+        const amt = row.getCell(3).value;
+        if(key == null) return;
+        const total = (typeof amt === 'object' && amt !== null) ? (amt.result ?? 0) : (amt ?? 0);
+        let extraVal = null;
+        if(hasExtra){
+          const ev = row.getCell(4).value;
+          extraVal = (typeof ev === 'object' && ev !== null) ? (ev.result ?? null) : ev;
+        }
+        const hasAmount = total !== 0 && total != null;
+        const hasExtraVal = hasExtra && extraVal != null && extraVal !== 0;
+        if(!hasAmount && !hasExtraVal) return;  // skip fully blank rows
+        const rowObj = { [keyName]: Number(key), total: hasAmount ? Number(total) : 0 };
+        if(hasExtra) rowObj[extraField] = hasExtraVal ? Number(extraVal) : 0;
+        newRows.push(rowObj);
+      });
+      if(newRows.length === 0){ alert('No filled-in values found in the uploaded file.'); setBusy(false); return; }
+      onChange(newRows);
+    } catch(e){ alert('Upload failed: ' + e.message + ' — make sure you uploaded the unmodified template with values filled in.'); }
+    setBusy(false);
+    if(fileRef.current) fileRef.current.value = '';
+  };
+
   return <div>
-    <table className="w-full mb-2"><thead><tr><TH>{unitLabel}</TH><TH className="text-right">Amount</TH><TH></TH></tr></thead>
+    <div className="flex items-center gap-2 mb-3 flex-wrap">
+      <button onClick={downloadTemplate} disabled={busy}
+        className="text-xs px-3 py-1.5 bg-stone-800 border border-stone-600 text-stone-200 rounded hover:bg-stone-700 disabled:opacity-50">
+        ⬇ Download Excel Template
+      </button>
+      <button onClick={()=>fileRef.current?.click()} disabled={busy}
+        className="text-xs px-3 py-1.5 bg-amber-500/10 border border-amber-500/50 text-amber-300 rounded hover:bg-amber-500/20 disabled:opacity-50">
+        ⬆ Upload Filled Template
+      </button>
+      <input ref={fileRef} type="file" accept=".xlsx" onChange={handleUpload} className="hidden"/>
+      {busy && <span className="text-xs text-stone-500">Working…</span>}
+      <span className="text-[10px] text-stone-500 ml-1">Template dates are calculated from General tab (FC, construction months, ops years) — re-download if those change.{extraField && ' Template includes a second column for periodic transaction counts — fill in either or both columns.'}</span>
+    </div>
+    <table className="w-full mb-2"><thead><tr><TH>{unitLabel}</TH><TH className="text-right">Amount</TH>{extraField && <TH className="text-right">{extraLabel}</TH>}<TH></TH></tr></thead>
     <tbody>{rows.map((r,i)=>(
       <tr key={i}><TD><NumInput value={r[keyName]} onChange={v=>updateRow(i,{[keyName]:v})}/></TD>
         <TD className="text-right"><NumInput value={r.total} onChange={v=>updateRow(i,{total:v})} prefix="$"/></TD>
+        {extraField && <TD className="text-right"><NumInput value={r[extraField]||0} onChange={v=>updateRow(i,{[extraField]:v})}/></TD>}
         <TD><button onClick={()=>removeRow(i)} className="text-xs text-rose-400 hover:text-rose-300">remove</button></TD></tr>))}</tbody></table>
     <div className="flex items-center justify-between">
       <button onClick={addRow} className="text-xs text-amber-300 hover:text-amber-200">+ add row</button>
-      <span className="text-xs text-stone-400">Total: <span className="font-mono text-amber-300">{fmt$(total)}</span></span>
+      <span className="text-xs text-stone-400">
+        Total: <span className="font-mono text-amber-300">{fmt$(total)}</span>
+        {extraField && <> · {extraLabel}: <span className="font-mono text-amber-300">{(extraTotal||0).toLocaleString()}</span></>}
+      </span>
     </div>
   </div>;
 }
@@ -2517,7 +2666,7 @@ function CapexTab({model, setModel}){
   return <div>
     <Section title="Direct-Forecast Ingestion" subtitle="Override line-item build-up with pre-forecasted monthly totals.">
       <div className="flex items-center gap-3 mb-3"><Toggle value={c.useDirectForecast} onChange={v=>setC({useDirectForecast:v})} label="Use direct forecast"/></div>
-      {c.useDirectForecast && <DirectForecastTable rows={c.directForecast} onChange={rows=>setC({directForecast:rows})} keyName="month" unitLabel="Month" total={sum(c.directForecast.map(r=>r.total||0))}/>}
+      {c.useDirectForecast && <DirectForecastTable rows={c.directForecast} onChange={rows=>setC({directForecast:rows})} keyName="month" unitLabel="Month" total={sum(c.directForecast.map(r=>r.total||0))} model={model} sheetTitle="Capex Direct Forecast" paramLabel="Capex Spend This Month ($)"/>}
     </Section>
     <Section title="Design-Build Contract" subtitle="D&B packages with per-line inflation & curve."><CapexItemTable items={c.items.filter(i=>i.group==='D&B')} updateItem={updateItem}/></Section>
     <Section title="ROW, Utilities, Environmental, Advisory, Reserves" subtitle="Non-D&B capex."><CapexItemTable items={c.items.filter(i=>i.group==='Other')} updateItem={updateItem}/></Section>
@@ -2548,7 +2697,8 @@ function RevenueTab({model, setModel}){
   return <div>
     <Section title="Direct-Forecast Ingestion" subtitle="Annual revenue forecast overrides build-up. Allocated to periods by day-count.">
       <div className="flex items-center gap-3 mb-3"><Toggle value={r.useDirectForecast} onChange={v=>setR({useDirectForecast:v})} label="Use direct forecast"/></div>
-      {r.useDirectForecast && <DirectForecastTable rows={r.directForecast} onChange={rows=>setR({directForecast:rows})} keyName="year" unitLabel="Op. Year" total={sum(r.directForecast.map(x=>x.total||0))}/>}
+      {r.useDirectForecast && <DirectForecastTable rows={r.directForecast} onChange={rows=>setR({directForecast:rows})} keyName="year" unitLabel="Op. Year" total={sum(r.directForecast.map(x=>x.total||0))} model={model} sheetTitle="Revenue Direct Forecast" paramLabel="Annual Revenue ($)" extraField="transactions" extraLabel="Transactions This Year" extraTotal={sum(r.directForecast.map(x=>x.transactions||0))}/>}
+      <p className="text-[10px] text-stone-500 mt-2">Optional: enter or upload periodic transaction counts alongside revenue. Transactions drive per-transaction toll-collection opex costs (Toll Collection — License Plate / Video items) — both revenue and transactions are used together in calculations.</p>
     </Section>
     <Section title="Traffic & Toll Build-up">
       <div className="grid grid-cols-3 gap-4 mb-4">
@@ -2581,7 +2731,7 @@ function OpexTab({model, setModel}){
   return <div>
     <Section title="Direct-Forecast Ingestion">
       <div className="flex items-center gap-3 mb-3"><Toggle value={o.useDirectForecast} onChange={v=>setO({useDirectForecast:v})} label="Use direct forecast"/></div>
-      {o.useDirectForecast && <DirectForecastTable rows={o.directForecast} onChange={rows=>setO({directForecast:rows})} keyName="year" unitLabel="Op. Year" total={sum(o.directForecast.map(x=>x.total||0))}/>}
+      {o.useDirectForecast && <DirectForecastTable rows={o.directForecast} onChange={rows=>setO({directForecast:rows})} keyName="year" unitLabel="Op. Year" total={sum(o.directForecast.map(x=>x.total||0))} model={model} sheetTitle="Opex Direct Forecast" paramLabel="Annual Opex ($)"/>}
     </Section>
     <Section title="Operating Cost Line Items" subtitle="Annual base in Y1 dollars. Per-txn items scale with traffic.">
       <div className="grid grid-cols-2 gap-4 mb-4">
@@ -3297,14 +3447,7 @@ function DashboardTab({model, results}){
   // ── Excel export via ExcelJS (full styling + formula support) ──────────────
   const [exporting, setExporting] = useState(false);
 
-  const loadExcelJS = () => new Promise((resolve, reject) => {
-    if(window.ExcelJS){ resolve(window.ExcelJS); return; }
-    const s = document.createElement('script');
-    s.src = 'https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js';
-    s.onload  = () => resolve(window.ExcelJS);
-    s.onerror = () => reject(new Error('ExcelJS CDN load failed'));
-    document.head.appendChild(s);
-  });
+  const loadExcelJS = loadExcelJSGlobal;
 
   const exportXLSX = async () => {
     setExporting(true);
