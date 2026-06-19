@@ -908,13 +908,22 @@ function buildControlAccounts(model, periods, ds, opex, debtSchedules, instrumen
   // Both modes track the time-varying target with top-up deposits AND excess releases.
   // Difference: 'initial' funds the period-0 target from proceeds at SC (not a cash deposit);
   //             'deposits' funds everything from operating cash.
-  const buildMovements = (target, mode) => {
+  // IMPORTANT: in 'initial' mode, the deposit is LOCKED — no releases — until the period where
+  // actual cash debt service begins (dsArr > 0). A reserve sized ahead of a deferral period
+  // (e.g. TIFIA 5y CapI) must not be drawn down before debt service genuinely starts.
+  const buildMovements = (target, mode, dsArr) => {
     const deposit = zeros(n), release = zeros(n), balance = zeros(n);
     // First period where the reserve has a positive target = funding start
     let firstActive = target.findIndex(t => (t||0) > 0);
     if(firstActive < 0) firstActive = 0;
     const initialFund = mode === 'initial' ? (target[firstActive] || 0) : 0;
     let bal = mode === 'initial' ? initialFund : 0;
+    // Lock boundary: first period where this instrument's (or pooled) debt service is actually > 0.
+    // Until this period, the initial deposit cannot be released even if the target dips.
+    let dsStartIdx = -1;
+    if(mode === 'initial' && dsArr){
+      dsStartIdx = dsArr.findIndex(v => (v||0) > 1);
+    }
     for(let i=0;i<n;i++){
       const tgt = target[i] || 0;
       if(mode === 'initial' && i === firstActive){
@@ -922,9 +931,13 @@ function buildControlAccounts(model, periods, ds, opex, debtSchedules, instrumen
         balance[i] = bal;
         continue;
       }
-      // Both modes: top up when target rises, release when it falls
-      if(bal < tgt){ deposit[i] = tgt - bal; bal = tgt; }
-      else if(bal > tgt){ release[i] = bal - tgt; bal = tgt; }
+      const lockedNoRelease = mode === 'initial' && dsStartIdx >= 0 && i < dsStartIdx;
+      if(bal < tgt){
+        deposit[i] = tgt - bal; bal = tgt;
+      } else if(bal > tgt && !lockedNoRelease){
+        release[i] = bal - tgt; bal = tgt;
+      }
+      // else: target fell but we're still in the locked deferral window — hold the balance, release nothing
       balance[i] = bal;
     }
     return { deposit, release, balance, initialFund };
@@ -947,7 +960,7 @@ function buildControlAccounts(model, periods, ds, opex, debtSchedules, instrumen
       for(let i=0;i<n;i++){ instDS[i] = (sched.interest[i]||0) + (sched.principal[i]||0); if(instDS[i]>0) hasDS = true; }
       if(!hasDS) continue;
       const tgt = buildDsraTarget(instDS);
-      const mov = buildMovements(tgt, dsraMode);
+      const mov = buildMovements(tgt, dsraMode, instDS);
       dsraByInst[inst.id] = { label: inst.type, target: tgt, ...mov };
       for(let i=0;i<n;i++){
         dsraAggDeposit[i] += mov.deposit[i]||0;
@@ -960,7 +973,7 @@ function buildControlAccounts(model, periods, ds, opex, debtSchedules, instrumen
   // Aggregate DSRA used in waterfall/equity-CF
   const dsraMov = { deposit: dsraAggDeposit, release: dsraAggRelease, balance: dsraAggBalance, initialFund: dsraTotalInitial };
 
-  const omMov = buildMovements(om, omMode);
+  const omMov = buildMovements(om, omMode, opex);
   // MMR is always event-pre-funded from cash
   const mmrMov = { deposit: mmrDeposit, release: mmrRelease, balance: mmrBalance, initialFund: 0, eventCost: mmEventCost };
   // Ramp-up reserve: funded at SC, releases over rampUpReleaseYears
