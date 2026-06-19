@@ -1060,19 +1060,25 @@ def build_control_accounts(model: Dict[str, Any], periods: List[Dict[str, Any]],
 
     # ── Reserve movements: both modes track time-varying target with top-ups AND releases ──
     # 'initial' funds period-0 target from proceeds; 'deposits' funds from operating cash.
-    def build_movements(target, mode):
+    def build_movements(target, mode, ds_arr=None):
         deposit, release, balance = _zeros(n), _zeros(n), _zeros(n)
         first_active = next((i for i, t in enumerate(target) if (t or 0) > 0), 0)
         initial_fund = (target[first_active] or 0) if mode == 'initial' else 0.0
         bal = initial_fund if mode == 'initial' else 0.0
+        # Lock boundary: first period where actual debt service > 0. Until then, the initial
+        # deposit cannot be released even if the target dips during a deferral period.
+        ds_start_idx = -1
+        if mode == 'initial' and ds_arr is not None:
+            ds_start_idx = next((i for i, v in enumerate(ds_arr) if (v or 0) > 1), -1)
         for i in range(n):
             tgt = target[i] or 0
             if mode == 'initial' and i == first_active:
                 balance[i] = bal  # pre-funded from proceeds, no cash deposit
                 continue
+            locked_no_release = mode == 'initial' and ds_start_idx >= 0 and i < ds_start_idx
             if bal < tgt:
                 deposit[i] = tgt - bal; bal = tgt
-            elif bal > tgt:
+            elif bal > tgt and not locked_no_release:
                 release[i] = bal - tgt; bal = tgt
             balance[i] = bal
         return {'deposit': deposit, 'release': release, 'balance': balance, 'initialFund': initial_fund}
@@ -1100,7 +1106,7 @@ def build_control_accounts(model: Dict[str, Any], periods: List[Dict[str, Any]],
             if not has_ds:
                 continue
             tgt = build_dsra_target(inst_ds)
-            mov = build_movements(tgt, dsra_mode)
+            mov = build_movements(tgt, dsra_mode, inst_ds)
             dsra_by_inst[inst['id']] = {'label': inst['type'], 'target': tgt, **mov}
             for i in range(n):
                 dsra_agg_dep[i] += mov['deposit'][i] or 0
@@ -1110,7 +1116,7 @@ def build_control_accounts(model: Dict[str, Any], periods: List[Dict[str, Any]],
                 dsra_total_initial += mov['initialFund']
     dsra_mov = {'deposit': dsra_agg_dep, 'release': dsra_agg_rel, 'balance': dsra_agg_bal, 'initialFund': dsra_total_initial}
 
-    om_mov = build_movements(om, om_mode)
+    om_mov = build_movements(om, om_mode, opex)
     mmr_mov = {'deposit': mmr_deposit, 'release': mmr_release, 'balance': mmr_balance,
                'initialFund': 0.0, 'eventCost': mm_event_cost}
     ramp_mov = {'deposit': _zeros(n), 'release': _zeros(n), 'balance': list(ramp), 'initialFund': ca['rampUpReserveAmount']}
