@@ -1666,6 +1666,13 @@ def auto_cascade_tifia(model: Dict[str, Any], params: Dict[str, Any]) -> Dict[st
     Returns {'best': {...}, 'trace': [...], 'converged': bool}
     """
     working = copy.deepcopy(model)
+    # DETERMINISM: zero optimizer-controlled instruments so each run starts identical.
+    _opt_ids = {params.get('tifiaInstrumentId'), params.get('pabInstrumentId'),
+                params.get('equityInstrumentId'), params.get('plugInstrumentId')}
+    for _inst in working['financing']['instruments']:
+        if _inst['id'] in _opt_ids:
+            _inst['amount'] = 0
+    working['financing']['apAmount'] = 0
     trace = []
 
     def evaluate(pct):
@@ -1714,29 +1721,28 @@ def auto_cascade_tifia(model: Dict[str, Any], params: Dict[str, Any]) -> Dict[st
         else:
             phase_res = {'diagnosis': 'TIFIA disabled', 'phases': []}
 
-        # ---- STEP 2: SIZE PAB ----
-        # PABs size when: TIFIA disabled OR TIFIA at statutory ceiling AND gap remains
+        # ---- STEP 2: SIZE PAB — fill to target gearing, capped by senior-DSCR floor ----
         pab_amount = 0
         max_tifia_pct = params.get('maxTifiaPct', 0.49)
+        target_gearing = working['general'].get('targetGearing', 0.75)
         tifia_at_ceiling = tifia_enabled and (pct >= max_tifia_pct - 0.005)
         should_size_pab = not tifia_enabled or tifia_at_ceiling
         if pab_inst:
             if not should_size_pab:
-                # TIFIA stopped below ceiling — adding PAB hurts Total DSCR. No PAB.
                 pab_inst['amount'] = 0
                 pab_amount = 0
             else:
-                # TIFIA at ceiling — check if funding gap remains with PAB=0
                 pab_inst['amount'] = 0
                 try:
                     gap_r = build_full_model(w)
-                    funding_gap = gap_r['total_uses'] - gap_r['total_sources']
+                    uses_wr = gap_r.get('total_uses_with_reserves', gap_r['total_uses'])
+                    funding_gap = uses_wr - gap_r['total_sources']
                 except Exception:
                     funding_gap = 0
+                    uses_wr = 0
                 if funding_gap <= 0:
-                    pab_amount = 0  # no gap, no PAB needed
+                    pab_amount = 0
                 else:
-                    # Find max PAB at Sr DSCR floor, then cap at funding_gap
                     tifia_sched = gap_r['debt_schedules'].get(tifia['id'], {})
                     tifia_ds = [(tifia_sched.get('interest', _zeros(len(gap_r['periods'])))[i] +
                                  tifia_sched.get('principal', _zeros(len(gap_r['periods'])))[i])
@@ -1760,8 +1766,9 @@ def auto_cascade_tifia(model: Dict[str, Any], params: Dict[str, Any]) -> Dict[st
                             worst = 999
                         return (worst >= min_sr_dscr_floor - 0.005), worst
 
-                    # Binary search up to funding gap (no need to go higher)
-                    lo, hi = 0.0, funding_gap * 1.1
+                    pab_by_gearing = max(0, target_gearing * uses_wr - tifia_amount)
+                    pab_cap = min(funding_gap, pab_by_gearing)
+                    lo, hi = 0.0, pab_cap
                     max_at_floor = 0
                     for _ in range(40):
                         m = (lo + hi) / 2
@@ -1773,13 +1780,10 @@ def auto_cascade_tifia(model: Dict[str, Any], params: Dict[str, Any]) -> Dict[st
                             hi = m
                         if hi - lo < 50_000:
                             break
-                    pab_amount = min(funding_gap, max_at_floor)
+                    pab_amount = min(pab_cap, max_at_floor)
                     pab_inst['amount'] = round(pab_amount)
 
-        # ---- STEP 3: SIZE EQUITY TO TARGET IRR (interleaved with plug = upfront subsidy) ----
-        # Equity = NPV-equivalent contribution that yields target IRR.
-        # Plug instrument (typically a grant / upfront subsidy) closes any residual gap in EVERY iteration
-        # so IRR doesn't drift between the search and final state.
+        # ---- STEP 3 (Option A): EQUITY = funding-gap plug; SUBSIDY only for IRR / residual gap ----
         equity_amount = None
         equity_for_irr_calc = None
         upfront_subsidy = 0
@@ -1789,8 +1793,7 @@ def auto_cascade_tifia(model: Dict[str, Any], params: Dict[str, Any]) -> Dict[st
         plug_inst = next((i for i in w['financing']['instruments'] if i['id'] == plug_inst_id), None) if plug_inst_id else None
         equity_inst = next((i for i in w['financing']['instruments'] if i['id'] == equity_inst_id), None) if equity_inst_id else None
 
-        if equity_inst and target_irr > 0:
-            # Pre-compute: max equity = funding gap when plug=0
+        if equity_inst:
             if plug_inst:
                 plug_inst['amount'] = 0
             equity_inst['amount'] = 0
@@ -1799,33 +1802,51 @@ def auto_cascade_tifia(model: Dict[str, Any], params: Dict[str, Any]) -> Dict[st
             except Exception:
                 base_r = None
             if base_r is not None:
-                max_equity = max(0, base_r['total_uses'] - base_r['total_sources'])
-                lo_eq, hi_eq = 0.0, max_equity
-                equity_amount = 0
-                # Binary search: keep gap closed via plug in every iteration
-                for _ in range(30):
-                    mid = (lo_eq + hi_eq) / 2
-                    equity_inst['amount'] = round(mid)
-                    # Set plug to close gap exactly
-                    if plug_inst:
-                        plug_inst['amount'] = max(0, round(max_equity - mid))
-                    try:
-                        test_r = build_full_model(w)
-                        actual_irr = test_r.get('equity_irr')
-                        if actual_irr is None: actual_irr = -1
-                    except Exception:
-                        actual_irr = -1
-                    if actual_irr >= target_irr - 0.0001:
-                        equity_amount = mid
-                        lo_eq = mid
-                    else:
-                        hi_eq = mid
-                    if hi_eq - lo_eq < 10_000:
-                        break
-                equity_inst['amount'] = round(equity_amount)
+                max_equity = max(0, base_r.get('total_uses_with_reserves', base_r['total_uses']) - base_r['total_sources'])
+                # Measure IRR with equity = full gap-plug (subsidy = 0): AP-mode-equivalent stack
+                equity_inst['amount'] = round(max_equity)
                 if plug_inst:
-                    plug_inst['amount'] = max(0, round(max_equity - equity_amount))
-                    upfront_subsidy = plug_inst['amount']
+                    plug_inst['amount'] = 0
+                try:
+                    t_r = build_full_model(w)
+                    plug_free_irr = t_r.get('equity_irr')
+                    if plug_free_irr is None: plug_free_irr = -1
+                except Exception:
+                    plug_free_irr = -1
+
+                if target_irr <= 0 or plug_free_irr >= target_irr - 0.0001:
+                    # Strong deal: full gap-plug equity already clears the hurdle. No subsidy.
+                    equity_amount = max_equity
+                    equity_inst['amount'] = round(equity_amount)
+                    if plug_inst:
+                        plug_inst['amount'] = 0
+                    upfront_subsidy = 0
+                else:
+                    # Weak deal: shrink equity (subsidy funds difference) until IRR hits target.
+                    lo_eq, hi_eq = 0.0, max_equity
+                    equity_amount = 0
+                    for _ in range(34):
+                        mid = (lo_eq + hi_eq) / 2
+                        equity_inst['amount'] = round(mid)
+                        if plug_inst:
+                            plug_inst['amount'] = max(0, round(max_equity - mid))
+                        try:
+                            test_r = build_full_model(w)
+                            actual_irr = test_r.get('equity_irr')
+                            if actual_irr is None: actual_irr = -1
+                        except Exception:
+                            actual_irr = -1
+                        if actual_irr >= target_irr - 0.0001:
+                            equity_amount = mid
+                            lo_eq = mid
+                        else:
+                            hi_eq = mid
+                        if hi_eq - lo_eq < 10_000:
+                            break
+                    equity_inst['amount'] = round(equity_amount)
+                    if plug_inst:
+                        plug_inst['amount'] = max(0, round(max_equity - equity_amount))
+                        upfront_subsidy = plug_inst['amount']
                 equity_for_irr_calc = equity_amount
 
         # ---- STEP 4: FINAL BUILD + UPFRONT SUBSIDY (= plug instrument amount) ----
