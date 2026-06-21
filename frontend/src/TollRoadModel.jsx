@@ -162,6 +162,7 @@ const defaultModel = () => ({
         minTotalDSCR: 1.10,
         minSrDSCR: 1.30,
         minTifiaDSCR: 1.10,
+        minLLCRFloor: 1.20,
       },
     },
     lastRun:null,
@@ -1688,12 +1689,20 @@ function autoCascadeAP(model, params){
       }
     }
     if(!isFinite(minDSCR)) minDSCR = null;
-    return { w, irr: rD.equityIRR, minDSCR, result: rD, tifiaAmt, pabAmt: pabInst?pabInst.amount:0, eqAmt: eqInst?eqInst.amount:0, totalUses };
+    // Min total LLCR over periods where it's defined
+    let minLLCR = Infinity;
+    for(let i=0;i<rD.periods.length;i++){
+      const l = rD.llcrTotal?.[i];
+      if(l != null && isFinite(l) && l > 0){ if(l < minLLCR) minLLCR = l; }
+    }
+    if(!isFinite(minLLCR)) minLLCR = null;
+    return { w, irr: rD.equityIRR, minDSCR, minLLCR, result: rD, tifiaAmt, pabAmt: pabInst?pabInst.amount:0, eqAmt: eqInst?eqInst.amount:0, totalUses };
   };
 
   const minDSCRFloor = params.minTotalDSCR || 1.10;
+  const minLLCRFloor = params.minLLCRFloor || 1.20;
 
-  // Solve 1: AP that hits target equity IRR
+  // Solve for the AP that hits a target via binary search (testFn returns {ok, raise})
   const solveFor = (testFn) => {
     let lo = 0, hi = 300_000_000, found = null;
     for(let iter=0; iter<44; iter++){
@@ -1722,13 +1731,23 @@ function autoCascadeAP(model, params){
   });
   const apForDSCR = evDSCR ? evDSCR.w.financing.apAmount : 0;
 
-  // Final AP = max of the two constraints (whichever binds)
-  const apFinal = Math.max(apForIRR, apForDSCR);
-  const binding = apForDSCR > apForIRR ? 'DSCR floor' : 'Equity IRR';
+  // AP for LLCR floor
+  const evLLCR = solveFor(ev => {
+    const l = ev.minLLCR ?? 99;
+    return { ok: Math.abs(l - minLLCRFloor) < 0.002, raise: l < minLLCRFloor };
+  });
+  const apForLLCR = evLLCR ? evLLCR.w.financing.apAmount : 0;
+
+  // Final AP = max of all three constraints (whichever binds). Equity stays the funding-gap plug;
+  // TIFIA fixed at 49%, PAB at gearing. If DSCR or LLCR binds, equity IRR will sit above target — intended.
+  const apFinal = Math.max(apForIRR, apForDSCR, apForLLCR);
+  let binding = 'Equity IRR';
+  if(apForDSCR >= apForIRR && apForDSCR >= apForLLCR) binding = 'DSCR floor';
+  else if(apForLLCR >= apForIRR && apForLLCR >= apForDSCR) binding = 'LLCR floor';
   const best = evaluate(apFinal);
   if(best.error) return { error:'AP cascade failed: '+best.error, converged:false };
   best.w.financing.apAmount = apFinal;
-  trace.push({apForIRR, apForDSCR, apFinal, binding, irr: best.irr, minDSCR: best.minDSCR,
+  trace.push({apForIRR, apForDSCR, apForLLCR, apFinal, binding, irr: best.irr, minDSCR: best.minDSCR, minLLCR: best.minLLCR,
     tifia: best.tifiaAmt, pab: best.pabAmt, equity: best.eqAmt});
 
   return {
@@ -1738,7 +1757,9 @@ function autoCascadeAP(model, params){
       apEscalation: model.general.apEscalation||0,
       apBinding: binding,
       tifiaAmount: best.tifiaAmt, pabAmount: best.pabAmt, equityAmount: best.eqAmt,
-      actualEquityIRR: best.irr, minDSCR: best.minDSCR, targetGearing,
+      actualEquityIRR: best.irr, minDSCR: best.minDSCR, minLLCR: best.minLLCR, targetGearing,
+      targetEquityIRR: targetIRR,
+      apForIRR, apForDSCR, apForLLCR,
       upfrontSubsidy: 0,
       workingModel: best.w,
       pct: best.tifiaAmt && best.totalUses ? best.tifiaAmt / best.totalUses : 0,
@@ -3182,6 +3203,7 @@ function OptimizerTab({model, setModel, results}){
         minTotalDSCR: ap.minTotalDSCR,
         minSrDSCR: ap.minSrDSCR,
         minTifiaDSCR: ap.minTifiaDSCR,
+        minLLCRFloor: ap.minLLCRFloor ?? 1.20,
       };
       const r = model.general.governmentSupportMode === 'ap'
         ? autoCascadeAP(model, params)
@@ -3372,9 +3394,27 @@ function OptimizerTab({model, setModel, results}){
                   <div className="text-[10px] uppercase tracking-widest text-emerald-400 mb-1">Final Output — Availability Payment (per period, base)</div>
                   <div className="text-3xl font-light text-emerald-300">{fmt$(b.apBasePerPeriod||0)}</div>
                   <div className="text-xs text-stone-400 mt-1">
-                    Level base payment escalating at {fmtPct(b.apEscalation||0,1)}/yr. Sized to meet whichever binds: <span className="text-emerald-300">{b.apBinding}</span>.
-                    Structure: TIFIA={fmtPct(b.pct,1)} (full 49%), PAB={fmt$(b.pabAmount)} (to {fmtPct(b.targetGearing||0,0)} gearing), Equity@{fmtPct(b.targetEquityIRR||0,1)} IRR. No upfront subsidy.
+                    Level base payment escalating at {fmtPct(b.apEscalation||0,1)}/yr. Binding constraint: <span className="text-emerald-300">{b.apBinding}</span>.
+                    Structure: TIFIA={fmtPct(b.pct,1)} (full 49%), PAB={fmt$(b.pabAmount)} (to {fmtPct(b.targetGearing||0,0)} gearing), Equity={fmt$(b.equityAmount)} (funding-gap plug). No upfront subsidy.
                   </div>
+                  <div className="grid grid-cols-3 gap-2 mt-3 text-[11px]">
+                    <div className={`rounded p-2 ${b.apBinding==='Equity IRR'?'bg-emerald-500/20 border border-emerald-500/40':'bg-stone-900/40 border border-stone-700/50'}`}>
+                      <div className="text-stone-500">AP for IRR target</div>
+                      <div className="text-stone-200">{fmt$(b.apForIRR||0)}</div>
+                      <div className="text-stone-500 mt-0.5">→ IRR {fmtPct(b.actualEquityIRR||0,2)}</div>
+                    </div>
+                    <div className={`rounded p-2 ${b.apBinding==='DSCR floor'?'bg-emerald-500/20 border border-emerald-500/40':'bg-stone-900/40 border border-stone-700/50'}`}>
+                      <div className="text-stone-500">AP for DSCR floor</div>
+                      <div className="text-stone-200">{fmt$(b.apForDSCR||0)}</div>
+                      <div className="text-stone-500 mt-0.5">→ min DSCR {fmtRatio(b.minDSCR)}</div>
+                    </div>
+                    <div className={`rounded p-2 ${b.apBinding==='LLCR floor'?'bg-emerald-500/20 border border-emerald-500/40':'bg-stone-900/40 border border-stone-700/50'}`}>
+                      <div className="text-stone-500">AP for LLCR floor</div>
+                      <div className="text-stone-200">{fmt$(b.apForLLCR||0)}</div>
+                      <div className="text-stone-500 mt-0.5">→ min LLCR {fmtRatio(b.minLLCR)}</div>
+                    </div>
+                  </div>
+                  <div className="text-[10px] text-stone-500 mt-2">AP = max of the three. The binding constraint is met exactly; the other two are satisfied with headroom (so IRR may sit above target when DSCR or LLCR binds — intended).</div>
                 </div>
               ) : (
                 <div className="bg-gradient-to-r from-amber-500/10 to-amber-500/5 border-2 border-amber-500/40 rounded-lg p-4">
