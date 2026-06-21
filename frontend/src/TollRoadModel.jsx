@@ -1660,22 +1660,31 @@ function autoCascadeAP(model, params){
         if(!phRes.error){ tifia.phases = phRes.phases; tifia.repaymentStyle = 'Phased (multi-regime)'; }
       }
     }
-    // STEP 2: PAB sized so total debt = gearing × total uses
+    // STEP 2: PAB fills toward target gearing, but never more than the funding gap remaining
+    // after TIFIA + grants (so total sources never exceed uses). Equity is the exact residual.
     let rB;
     try { rB = buildFullModel(w); } catch(e){ return {error:e.message}; }
     const totalUses = rB.totalUsesWithReserves || rB.totalUses;
-    const targetDebt = targetGearing * totalUses;
     const tifiaAmt = tifia ? tifia.amount : 0;
+    // Sum of fixed grants (Grant seniority, excludes the sub1 plug which is 0 in AP mode)
+    const grantsTotal = w.financing.instruments
+      .filter(i => i.seniority === 'Grant')
+      .reduce((s,i) => s + (i.amount||0), 0);
+    // Gearing-implied debt headroom for PABs (total debt ≤ gearing × uses)
+    const pabByGearing = Math.max(0, targetGearing * totalUses - tifiaAmt);
+    // Remaining funding gap after TIFIA + grants (what still needs financing)
+    const gapAfterSenior = Math.max(0, totalUses - tifiaAmt - grantsTotal);
+    // PAB = lesser of the two — fills to gearing, but never over-funds the deal
     const pabInst = w.financing.instruments.find(i=>i.id===params.pabInstrumentId);
     if(pabInst){
-      pabInst.amount = Math.max(0, Math.round(targetDebt - tifiaAmt));
+      pabInst.amount = Math.round(Math.min(pabByGearing, gapAfterSenior));
     }
-    // STEP 3: Equity as plug to balance; then measure IRR
+    // STEP 3: Equity = exact residual funding gap (always ≥ 0 since PAB is capped at the gap)
     let rC;
     try { rC = buildFullModel(w); } catch(e){ return {error:e.message}; }
     const eqInst = w.financing.instruments.find(i=>i.id===params.equityInstrumentId);
-    const gap = rC.totalUsesWithReserves - rC.totalSources;  // remaining funded by equity
-    if(eqInst){ eqInst.amount = Math.max(0, (eqInst.amount||0) + gap); }
+    const gap = (rC.totalUsesWithReserves || rC.totalUses) - rC.totalSources;  // residual after all else
+    if(eqInst){ eqInst.amount = Math.max(0, Math.round((eqInst.amount||0) + gap)); }
     let rD;
     try { rD = buildFullModel(w); } catch(e){ return {error:e.message}; }
     // Min total DSCR over debt-service periods
@@ -1696,7 +1705,7 @@ function autoCascadeAP(model, params){
       if(l != null && isFinite(l) && l > 0){ if(l < minLLCR) minLLCR = l; }
     }
     if(!isFinite(minLLCR)) minLLCR = null;
-    return { w, irr: rD.equityIRR, minDSCR, minLLCR, result: rD, tifiaAmt, pabAmt: pabInst?pabInst.amount:0, eqAmt: eqInst?eqInst.amount:0, totalUses };
+    return { w, irr: rD.equityIRR, minDSCR, minLLCR, result: rD, tifiaAmt, pabAmt: pabInst?pabInst.amount:0, eqAmt: eqInst?eqInst.amount:0, totalUses, eligibleCost };
   };
 
   const minDSCRFloor = params.minTotalDSCR || 1.10;
@@ -1762,7 +1771,10 @@ function autoCascadeAP(model, params){
       apForIRR, apForDSCR, apForLLCR,
       upfrontSubsidy: 0,
       workingModel: best.w,
-      pct: best.tifiaAmt && best.totalUses ? best.tifiaAmt / best.totalUses : 0,
+      eligibleCost: best.eligibleCost,
+      finalGap: (best.result.totalUsesWithReserves || best.result.totalUses) - best.result.totalSources,
+      pct: best.tifiaAmt && best.eligibleCost ? best.tifiaAmt / best.eligibleCost : 0,  // % of ELIGIBLE cost (where 49% lives)
+      pctOfUses: best.tifiaAmt && best.totalUses ? best.tifiaAmt / best.totalUses : 0,
     },
   };
 }
@@ -3377,8 +3389,8 @@ function OptimizerTab({model, setModel, results}){
           const atCeiling = b.pct >= (ap.maxTifiaPct - 0.005);
           return <>
             <div className="grid grid-cols-4 gap-3 mb-4">
-              <Metric label="TIFIA %" value={fmtPct(b.pct, 2)} accent="amber" sub={atCeiling ? '49% statutory ceiling' : 'Constraint-bound below 49%'}/>
-              <Metric label="TIFIA Principal" value={fmt$(b.tifiaAmount)} accent="amber" sub={`of ${fmt$(b.eligibleCost)} eligible`}/>
+              <Metric label="TIFIA % of eligible" value={fmtPct(b.pct, 2)} accent="amber" sub={atCeiling ? '49% statutory ceiling' : `below 49% — eligible base may be partial`}/>
+              <Metric label="TIFIA Principal" value={fmt$(b.tifiaAmount)} accent="amber" sub={`of ${fmt$(b.eligibleCost)} eligible · ${fmtPct(b.pctOfUses||0,1)} of uses`}/>
               <Metric label="PAB Sized to" value={fmt$(b.pabAmount)} accent={b.pabAmount > 0 ? 'amber' : 'stone'} sub={b.pabAmount > 0 ? 'fills funding gap' : 'no PAB needed'}/>
               <Metric label="Funding Gap" value={fmt$(b.finalGap)} accent={Math.abs(b.finalGap) < 1e6 ? 'green' : 'amber'} sub="post plug-grant"/>
             </div>
