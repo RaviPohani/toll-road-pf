@@ -4264,7 +4264,7 @@ function DashboardTab({model, results}){
     </Section>
 
     <Section title="Cash Inflow vs Outflow (Operating Period)"
-      subtitle="Inflow = toll revenue (line). Outflow = opex + debt service + TIFIA fees (stacked, all positive).">
+      subtitle="Inflow = toll revenue (+ AP if active). Outflow = opex + debt service + TIFIA fees + net reserve deposits + equity distributions (stacked). Negative reserve bars = releases (cash back in).">
       <ResponsiveContainer width="100%" height={360}>
         <ComposedChart data={(r.periods||[]).map((p,i)=>({
           period: p.label,
@@ -4275,7 +4275,10 @@ function DashboardTab({model, results}){
           'Sub Int': r.subInt[i],
           'Sub Pri': r.subPri[i],
           'ST DS': r.shortDS[i],
+          'Reserve Movements': (r.reserveNetDeposit||[])[i] || 0,
+          'Distributions': Math.max(0, (r.equityCF||[])[i] || 0),
           Revenue: r.revSched.byPeriod[i],
+          'Total Inflow': (r.revSched.byPeriod[i]||0) + ((r.apStream||[])[i] || 0),
         }))}>
           <CartesianGrid strokeDasharray="3 3" stroke="#44403c"/>
           <XAxis dataKey="period" tick={{fontSize:10, fill:'#a8a29e'}}/>
@@ -4289,10 +4292,13 @@ function DashboardTab({model, results}){
           <Bar dataKey="Sub Int" stackId="out" fill="#a78bfa"/>
           <Bar dataKey="Sub Pri" stackId="out" fill="#c4b5fd"/>
           <Bar dataKey="ST DS" stackId="out" fill="#fb7185"/>
-          <Line type="monotone" dataKey="Revenue" stroke="#10b981" strokeWidth={3} dot={false} name="Revenue (Inflow)"/>
+          <Bar dataKey="Reserve Movements" stackId="out" fill="#22d3ee"/>
+          <Bar dataKey="Distributions" stackId="out" fill="#10b981"/>
+          {r.apMode && <Line type="monotone" dataKey="Total Inflow" stroke="#34d399" strokeWidth={3} dot={false} name="Total Inflow (Revenue + AP)"/>}
+          <Line type="monotone" dataKey="Revenue" stroke={r.apMode ? '#6ee7b7' : '#10b981'} strokeWidth={r.apMode?1.5:3} strokeDasharray={r.apMode?'4 3':undefined} dot={false} name="Toll Revenue"/>
         </ComposedChart>
       </ResponsiveContainer>
-      <div className="text-[10px] text-stone-500 mt-2">Where the green Revenue line sits ABOVE the stacked bars = positive equity cashflow (distributable). Where it sits below = lockup or DSRA draw.</div>
+      <div className="text-[10px] text-stone-500 mt-2">The full stack equals total cash use each period: opex + debt service + TIFIA fees + net reserve deposits + equity distributions. When it equals total inflow, the period balances exactly (sources = uses in operations). Cyan reserve bars dip below zero in periods where reserves release cash back to the waterfall.</div>
     </Section>
   </div>;
 }
