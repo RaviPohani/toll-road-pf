@@ -4293,7 +4293,7 @@ function DashboardTab({model, results}){
           <Bar dataKey="Sub Pri" stackId="out" fill="#c4b5fd"/>
           <Bar dataKey="ST DS" stackId="out" fill="#fb7185"/>
           <Bar dataKey="Reserve Movements" stackId="out" fill="#22d3ee"/>
-          <Bar dataKey="Distributions" stackId="out" fill="#10b981"/>
+          <Bar dataKey="Distributions" stackId="out" fill="#e879f9"/>
           {r.apMode && <Line type="monotone" dataKey="Total Inflow" stroke="#34d399" strokeWidth={3} dot={false} name="Total Inflow (Revenue + AP)"/>}
           <Line type="monotone" dataKey="Revenue" stroke={r.apMode ? '#6ee7b7' : '#10b981'} strokeWidth={r.apMode?1.5:3} strokeDasharray={r.apMode?'4 3':undefined} dot={false} name="Toll Revenue"/>
         </ComposedChart>
