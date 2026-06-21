@@ -1384,6 +1384,7 @@ def build_full_model(model: Dict[str, Any]) -> Dict[str, Any]:
         raw_equity_cf[i] = base - reserve_net_deposit[i]
 
     initial_reserve_funding = control_accts.get('totalInitialReserveFunding', 0)
+    total_uses_with_reserves = total_uses + initial_reserve_funding
 
     lockup_acct = build_lockup_account(raw_equity_cf, lockup, periods)
     equity_cf = lockup_acct['equityCFAfterLockup']
@@ -1414,6 +1415,7 @@ def build_full_model(model: Dict[str, Any]) -> Dict[str, Any]:
         'non_tifia_idc': nt_idc, 'non_tifia_idc_monthly': nt_idc_monthly, 'idc_by_inst': idc_by_inst, 'financing_fees': financing_fees,
         'capitalized_tifia_interest': tifia_constr['capitalizedInterestTotal'],
         'total_uses': total_uses, 'total_sources': sources_total,
+        'total_uses_with_reserves': total_uses_with_reserves,
         'total_issuance_cost': total_issuance_cost,
         'issuance_costs_by_id': issuance_costs_by_id,
         'tifia_admin_per_period': tifia_admin_per_period,
