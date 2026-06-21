@@ -2070,14 +2070,15 @@ function buildAuditChecks(model, results){
   const instruments = model.financing.instruments || [];
   const debtInstruments = instruments.filter(i => !['Grant','Equity','Paygo'].includes(i.seniority));
 
-  // ── CHECK 1a: Sources = Uses — Construction ──
-  const constrGap = (r.totalSources||0) - (r.totalUses||0);
+  // ── CHECK 1a: Sources = Uses — Construction (uses includes initial reserve funding) ──
+  const usesWithReserves = r.totalUsesWithReserves || r.totalUses || 0;
+  const constrGap = (r.totalSources||0) - usesWithReserves;
   checks.push({
     id: 'sources_uses_construction',
     category: 'Sources = Uses',
     label: 'Construction: Total Sources = Total Uses',
     pass: Math.abs(constrGap) <= TOL,
-    detail: `Sources ${fmt$(r.totalSources)} vs Uses ${fmt$(r.totalUses)} — gap ${fmt$(constrGap)}`,
+    detail: `Sources ${fmt$(r.totalSources)} vs Uses ${fmt$(usesWithReserves)} (incl. ${fmt$(r.initialReserveFunding||0)} initial reserves) — gap ${fmt$(constrGap)}`,
   });
 
   // ── CHECK 1b: Sources = Uses — Operations (waterfall balances every period) ──
@@ -4542,8 +4543,11 @@ function SourcesUsesTab({model, results}){
           <tr><TD>TIFIA Capitalized Interest</TD><TD className="text-right text-stone-300">{fmt$(r.tifiaConstr?.capitalizedInterestTotal||0)}</TD><TD className="text-right text-stone-400">{fmtPct((r.tifiaConstr?.capitalizedInterestTotal||0)/Math.max(1,r.totalUses),1)}</TD></tr>
           <tr><TD>Financing Fees (% of debt)</TD><TD className="text-right text-stone-300">{fmt$(r.financingFees)}</TD><TD className="text-right text-stone-400">{fmtPct(r.financingFees/Math.max(1,r.totalUses),1)}</TD></tr>
           <tr><TD>Issuance Costs (escalated)</TD><TD className="text-right text-stone-300">{fmt$(r.totalIssuanceCost)}</TD><TD className="text-right text-stone-400">{fmtPct(r.totalIssuanceCost/Math.max(1,r.totalUses),1)}</TD></tr>
-          <tr className="bg-stone-900/60 font-medium"><TD className="text-stone-100">Total Uses</TD><TD className="text-right text-amber-300">{fmt$(r.totalUses)}</TD><TD></TD></tr>
-          <tr className="bg-stone-900/40"><TD className="text-stone-300">Funding Gap (Uses − Sources)</TD><TD className={`text-right ${Math.abs(r.totalUses - r.totalSources) < 1e6 ? 'text-emerald-300' : 'text-rose-300'}`}>{fmt$(r.totalUses - r.totalSources)}</TD><TD></TD></tr>
+          {(r.initialReserveFunding||0) > 0 && (
+            <tr><TD>Initial Reserve Funding (DSRA/O&M/Ramp-up at SC)</TD><TD className="text-right text-stone-300">{fmt$(r.initialReserveFunding)}</TD><TD className="text-right text-stone-400">{fmtPct((r.initialReserveFunding||0)/Math.max(1,r.totalUsesWithReserves||r.totalUses),1)}</TD></tr>
+          )}
+          <tr className="bg-stone-900/60 font-medium"><TD className="text-stone-100">Total Uses</TD><TD className="text-right text-amber-300">{fmt$(r.totalUsesWithReserves||r.totalUses)}</TD><TD></TD></tr>
+          <tr className="bg-stone-900/40"><TD className="text-stone-300">Funding Gap (Uses − Sources)</TD><TD className={`text-right ${Math.abs((r.totalUsesWithReserves||r.totalUses) - r.totalSources) < 1e6 ? 'text-emerald-300' : 'text-rose-300'}`}>{fmt$((r.totalUsesWithReserves||r.totalUses) - r.totalSources)}</TD><TD></TD></tr>
         </tbody>
       </table>
     </Section>
