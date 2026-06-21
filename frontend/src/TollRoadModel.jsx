@@ -1369,7 +1369,7 @@ function optimizeJointTranches(model, targets, sharedConstraints, plugInstrument
     }
     // Plug
     const preR = buildFullModel(working);
-    const gap = preR.totalUses - preR.totalSources;
+    const gap = (preR.totalUsesWithReserves||preR.totalUses) - preR.totalSources;
     let plugAdj = 0;
     if(plugInstrumentId){
       const plugInst = working.financing.instruments.find(i=>i.id===plugInstrumentId);
@@ -1381,14 +1381,14 @@ function optimizeJointTranches(model, targets, sharedConstraints, plugInstrument
       }
     }
     const postR = buildFullModel(working);
-    const postGap = postR.totalUses - postR.totalSources;
+    const postGap = (postR.totalUsesWithReserves||postR.totalUses) - postR.totalSources;
     outerHistory.push({outerIter:outerIter+1, innerTraces, preGap:gap, plugAdjustment:plugAdj, postGap, minSeniorDSCR:postR.minSeniorDSCR, minLLCR:postR.minLLCR});
     if(Math.abs(postGap) < 100_000){ converged = true; break; }
     if(outerIter > 0 && Math.abs(gap - prevGap) < 50_000){ converged = true; break; }
     prevGap = gap;
   }
   const finalResults = buildFullModel(working);
-  const finalGap = finalResults.totalUses - finalResults.totalSources;
+  const finalGap = (finalResults.totalUsesWithReserves||finalResults.totalUses) - finalResults.totalSources;
   const lastInner = outerHistory.length ? outerHistory[outerHistory.length-1].innerTraces : [];
   return {
     workingModel: working, outerHistory, finalResults, finalGap, converged,
@@ -1478,7 +1478,7 @@ function runCascadeWaterfall(model, params, maxIter = 8){
     let preGapResults;
     try { preGapResults = buildFullModel(working); }
     catch(e){ return { error: 'Build failed before plug: '+e.message, trace, workingModel:working }; }
-    const gap = preGapResults.totalUses - preGapResults.totalSources;
+    const gap = (preGapResults.totalUsesWithReserves||preGapResults.totalUses) - preGapResults.totalSources;
     let plugAmount = 0;
     if(params.plugInstrumentId){
       const plugInst = working.financing.instruments.find(i => i.id === params.plugInstrumentId);
@@ -1499,7 +1499,7 @@ function runCascadeWaterfall(model, params, maxIter = 8){
     let postResults;
     try { postResults = buildFullModel(working); }
     catch(e){ return { error: 'Build failed after plug: '+e.message, trace, workingModel:working }; }
-    const postGap = postResults.totalUses - postResults.totalSources;
+    const postGap = (postResults.totalUsesWithReserves||postResults.totalUses) - postResults.totalSources;
 
     trace.push({
       outer: outer + 1,
@@ -1843,7 +1843,7 @@ function autoCascadeTifia(model, params){
         pabInst.amount = 0;
         let gapR;
         try { gapR = buildFullModel(w); } catch(e){ gapR = preR; }
-        const fundingGap = gapR.totalUses - gapR.totalSources;
+        const fundingGap = (gapR.totalUsesWithReserves||gapR.totalUses) - gapR.totalSources;
         if(fundingGap <= 0){
           pabAmount = 0;
         } else {
@@ -1896,7 +1896,7 @@ function autoCascadeTifia(model, params){
       let baseR;
       try { baseR = buildFullModel(w); } catch(e){ baseR = null; }
       if(baseR){
-        const maxEquity = Math.max(0, baseR.totalUses - baseR.totalSources);
+        const maxEquity = Math.max(0, (baseR.totalUsesWithReserves||baseR.totalUses) - baseR.totalSources);
         let loEq = 0, hiEq = maxEquity;
         equityAmount = 0;
         for(let k=0; k<30; k++){
@@ -1931,7 +1931,7 @@ function autoCascadeTifia(model, params){
     catch(e){ return { pct, tifiaAmount, error:'final build failed: '+e.message, feasible:false }; }
     let plugApplied = 0;
     if(plugInst){
-      const gap = finalR.totalUses - finalR.totalSources;
+      const gap = (finalR.totalUsesWithReserves||finalR.totalUses) - finalR.totalSources;
       if(Math.abs(gap) > 100){
         plugInst.amount = Math.max(0, Math.round(plugInst.amount + gap));
         plugApplied = gap;
@@ -1942,7 +1942,7 @@ function autoCascadeTifia(model, params){
       // plug instrument missing (old saved state without sub1) — fall back to first grant
       const fallbackGrant = w.financing.instruments.find(i => i.seniority === 'Grant');
       if(fallbackGrant){
-        const gap = finalR.totalUses - finalR.totalSources;
+        const gap = (finalR.totalUsesWithReserves||finalR.totalUses) - finalR.totalSources;
         fallbackGrant.amount = Math.max(0, Math.round((fallbackGrant.amount||0) + gap));
         upfrontSubsidy = fallbackGrant.amount;
         plugApplied = gap;
@@ -2008,7 +2008,7 @@ function autoCascadeTifia(model, params){
       phaseInfo: phaseRes,
       minSrDSCR, minTotalDSCR, minTifiaEffDSCR,
       testBalAtPoint, testPassed,
-      finalGap: finalR.totalUses - finalR.totalSources, plugApplied,
+      finalGap: (finalR.totalUsesWithReserves||finalR.totalUses) - finalR.totalSources, plugApplied,
       feasible, workingModel: w, finalResults: finalR,
     };
   };
@@ -3506,7 +3506,8 @@ function CFRow({label, data, positive, negative, bold, ratio, raw}){
 function DashboardTab({model, results}){
   if(!results) return <div className="p-8 text-center text-stone-500">Loading model…</div>;
   const r = results;
-  const gap = r.totalUses - r.totalSources;
+  const usesWithReserves = r.totalUsesWithReserves || r.totalUses;
+  const gap = usesWithReserves - r.totalSources;
   const minSr = r.minSeniorDSCR;
   const minTot = r.totalDSCR ? Math.min(...r.totalDSCR.filter(v=>v!=null && isFinite(v))) : null;
 
@@ -3648,7 +3649,7 @@ function DashboardTab({model, results}){
         ['Equity IRR (Target)',      model.optimizer?.cascade?.targetEquityIRR, 'pct', C.greenBg, C.green],
         ['Min Total DSCR',           r.totalDSCR ? Math.min(...r.totalDSCR.filter(v=>v&&isFinite(v))) : null, 'ratio', 'FFF3F4F6', C.medBg],
         ['TIFIA All-in Rate',        r.tifiaAllInRate, 'pct', 'FFF3F4F6', C.medBg],
-        ['Total Uses',               r.totalUses, 'money', 'FFF3F4F6', C.medBg],
+        ['Total Uses',               r.totalUsesWithReserves||r.totalUses, 'money', 'FFF3F4F6', C.medBg],
         ['Concession Period',        `${model.general.concessionYears}y`, 'text', 'FFF3F4F6', C.medBg],
         ['Operations Period',        `${model.general.operationsYears}y`, 'text', 'FFF3F4F6', C.medBg],
         ['Periods per Year',         model.general.periodsPerYear === 2 ? 'Semi-Annual' : 'Annual', 'text', 'FFF3F4F6', C.medBg],
@@ -3831,6 +3832,7 @@ function DashboardTab({model, results}){
         ['TIFIA Capitalised Interest', r.tifiaConstr?.capitalizedInterestTotal||0],
         ['Financing Fees (% of debt)', r.financingFees],
         ['Issuance Costs (escalated to FC)', r.totalIssuanceCost],
+        ...((r.initialReserveFunding||0) > 0 ? [['Initial Reserve Funding (at SC)', r.initialReserveFunding]] : []),
       ];
       const usesStartRow = sRow;
       usesData.forEach(([label, val], i) => {
@@ -3846,7 +3848,7 @@ function DashboardTab({model, results}){
       const usesTotalRow = wsSU.getRow(sRow);
       usesTotalRow.getCell(1).value = 'TOTAL USES';
       usesTotalRow.getCell(1).font = {bold:true, size:11, color:{argb:C.white}};
-      usesTotalRow.getCell(2).value = {formula:`=SUM(B${usesStartRow}:B${sRow-1})`, result:r.totalUses};
+      usesTotalRow.getCell(2).value = {formula:`=SUM(B${usesStartRow}:B${sRow-1})`, result:r.totalUsesWithReserves||r.totalUses};
       usesTotalRow.getCell(2).numFmt = '$#,##0'; usesTotalRow.getCell(2).font = {bold:true,size:11,color:{argb:C.amber}};
       setRowFill(usesTotalRow, C.medBg);
       usesTotalRow.height = 20;
@@ -3854,7 +3856,7 @@ function DashboardTab({model, results}){
       const gapRow = wsSU.getRow(sRow);
       gapRow.getCell(1).value = 'Funding Gap  (Uses − Sources)';
       gapRow.getCell(1).font = {size:10, italic:true};
-      const gapVal = r.totalUses - r.totalSources;
+      const gapVal = (r.totalUsesWithReserves||r.totalUses) - r.totalSources;
       gapRow.getCell(2).value = {formula:`=B${sRow-1}-D${suHdrRow + model.financing.instruments.length + 1}`, result:gapVal};
       gapRow.getCell(2).numFmt = '$#,##0';
       gapRow.getCell(2).font = {bold:true, size:11, color:{argb: Math.abs(gapVal)<1e6 ? C.green : C.red}};
@@ -4120,9 +4122,14 @@ function DashboardTab({model, results}){
       O('Min Total DSCR', r.totalDSCR?Math.min(...r.totalDSCR.filter(v=>v&&isFinite(v))):0, 'ratio');
       O('Min LLCR', r.minLLCR, 'ratio');
       O('TIFIA All-in Rate', r.tifiaAllInRate||0, 'pct');
-      O('Total Uses', r.totalUses, 'money');
+      O('Total Uses', r.totalUsesWithReserves||r.totalUses, 'money');
       O('Total Sources', r.totalSources, 'money');
-      O('Funding Gap', r.totalUses - r.totalSources, 'money');
+      O('Funding Gap', (r.totalUsesWithReserves||r.totalUses) - r.totalSources, 'money');
+      if(r.apMode){
+        const apYr1x = (r.apStream||[]).slice(0, model.general.periodsPerYear||2).reduce((a,b)=>a+b,0);
+        O('Availability Payment — Year 1', apYr1x, 'money');
+        O('AP Escalation', model.general.apEscalation||0, 'pct');
+      }
       O('Issuance Costs (total)', r.totalIssuanceCost, 'money');
       O('TIFIA Admin + Monitoring (life)', r.totalTifiaFees, 'money');
       oRow++;
@@ -4169,19 +4176,40 @@ function DashboardTab({model, results}){
         {exporting ? 'Exporting…' : '⬇ Export All to Excel'}
       </button>
     </div>
-    {model.optimizer?.lastAutoCascadeRun?.bestSubsidy != null && (
-      <Section title="Project Funding Ask — Upfront Subsidy" subtitle="From the last optimizer run. Government / sponsor capital needed at financial close to close the funding gap after maximum debt and equity sized to target IRR.">
+    {model.optimizer?.lastAutoCascadeRun?.converged && (()=>{
+      const lr = model.optimizer.lastAutoCascadeRun;
+      const apModeActive = model.general.governmentSupportMode === 'ap';
+      if(apModeActive){
+        const apYr1 = (r.apStream||[]).slice(0, model.general.periodsPerYear||2).reduce((a,b)=>a+b,0);
+        const dr = model.general.discountRate||0.07;
+        const constYrs = Math.ceil(model.general.constructionMonths/12);
+        let apNPV = 0;
+        (r.apStream||[]).forEach((v,i)=>{ apNPV += v / Math.pow(1+dr, constYrs + (i/(model.general.periodsPerYear||2)) + 0.5); });
+        return <Section title="Project Funding Ask — Availability Payment" subtitle="From the last optimizer run. The government's contractual annual payment stream that funds the deal in lieu of an upfront subsidy.">
+          <div className="bg-gradient-to-r from-emerald-500/15 to-emerald-500/5 border-2 border-emerald-500/50 rounded-lg p-5">
+            <div className="text-[11px] uppercase tracking-widest text-emerald-400 mb-2">Availability Payment — Year 1</div>
+            <div className="text-5xl font-extralight text-emerald-300 mb-2">{fmt$(apYr1)}</div>
+            <div className="grid grid-cols-4 gap-6 mt-4 text-xs">
+              <div><span className="text-stone-500">AP base/period: </span><span className="text-stone-200">{fmt$(r.apBasePerPeriod||0)}</span></div>
+              <div><span className="text-stone-500">Escalation: </span><span className="text-stone-200">{fmtPct(model.general.apEscalation||0,1)}/yr</span></div>
+              <div><span className="text-stone-500">AP stream NPV: </span><span className="text-stone-200">{fmt$(apNPV)}</span></div>
+              <div><span className="text-stone-500">TIFIA: </span><span className="text-stone-200">{fmt$(lr.bestTifia)}</span> ({fmtPct(lr.bestPct||0,1)})</div>
+            </div>
+          </div>
+        </Section>;
+      }
+      return <Section title="Project Funding Ask — Upfront Subsidy" subtitle="From the last optimizer run. Government / sponsor capital needed at financial close to close the funding gap after maximum debt and equity sized to target IRR.">
         <div className="bg-gradient-to-r from-amber-500/15 to-amber-500/5 border-2 border-amber-500/50 rounded-lg p-5">
           <div className="text-[11px] uppercase tracking-widest text-amber-400 mb-2">Upfront Subsidy Required</div>
-          <div className="text-5xl font-extralight text-amber-300 mb-2">{fmt$(model.optimizer.lastAutoCascadeRun.bestSubsidy)}</div>
+          <div className="text-5xl font-extralight text-amber-300 mb-2">{fmt$(lr.bestSubsidy||0)}</div>
           <div className="grid grid-cols-3 gap-6 mt-4 text-xs">
-            <div><span className="text-stone-500">TIFIA: </span><span className="text-stone-200">{fmt$(model.optimizer.lastAutoCascadeRun.bestTifia)}</span> ({fmtPct(model.optimizer.lastAutoCascadeRun.bestPct||0,1)})</div>
-            <div><span className="text-stone-500">PAB: </span><span className="text-stone-200">{fmt$(model.optimizer.lastAutoCascadeRun.bestPab)}</span></div>
+            <div><span className="text-stone-500">TIFIA: </span><span className="text-stone-200">{fmt$(lr.bestTifia)}</span> ({fmtPct(lr.bestPct||0,1)})</div>
+            <div><span className="text-stone-500">PAB: </span><span className="text-stone-200">{fmt$(lr.bestPab)}</span></div>
             <div><span className="text-stone-500">Target Equity IRR: </span><span className="text-stone-200">{fmtPct(model.optimizer?.cascade?.targetEquityIRR||0.12,1)}</span></div>
           </div>
         </div>
-      </Section>
-    )}
+      </Section>;
+    })()}
     <Section title="Key Metrics">
       <div className="grid grid-cols-4 gap-3 mb-4">
         <Metric label="Project IRR" value={fmtPct(r.projectIRR,2)} accent="amber"/>
@@ -4192,7 +4220,7 @@ function DashboardTab({model, results}){
       <div className="grid grid-cols-4 gap-3 mb-4">
         <Metric label="Min LLCR" value={fmtRatio(r.minLLCR)} accent="amber"/>
         <Metric label="TIFIA All-in Rate" value={fmtPct(r.tifiaAllInRate||0,3)} accent="amber"/>
-        <Metric label="Total Uses" value={fmt$(r.totalUses)}/>
+        <Metric label="Total Uses" value={fmt$(usesWithReserves)} sub={r.initialReserveFunding>0?`incl. ${fmt$(r.initialReserveFunding)} reserves`:undefined}/>
         <Metric label="Funding Gap" value={fmt$(gap)} accent={Math.abs(gap)<1e6?'green':'red'}/>
       </div>
       <div className="grid grid-cols-4 gap-3">
@@ -4201,6 +4229,21 @@ function DashboardTab({model, results}){
         <Metric label="Total Equity Sized" value={fmt$(r.equityTotal)}/>
         <Metric label="Total Debt Sized" value={fmt$(r.debtTotal)}/>
       </div>
+      {r.apMode && (()=>{
+        // AP-mode metrics: year-1 AP, escalation, and NPV of the AP stream
+        const apYr1 = (r.apStream||[]).slice(0, model.general.periodsPerYear||2).reduce((a,b)=>a+b,0);
+        const apEsc = model.general.apEscalation||0;
+        const dr = model.general.discountRate||0.07;
+        const constYrs = Math.ceil(model.general.constructionMonths/12);
+        let apNPV = 0;
+        (r.apStream||[]).forEach((v,i)=>{ apNPV += v / Math.pow(1+dr, constYrs + (i/(model.general.periodsPerYear||2)) + 0.5); });
+        return <div className="grid grid-cols-4 gap-3 mt-3">
+          <Metric label="Availability Payment — Year 1" value={fmt$(apYr1)} accent="green" sub="first full operating year"/>
+          <Metric label="AP Escalation" value={fmtPct(apEsc,1)} accent="green" sub="annual"/>
+          <Metric label="AP Stream NPV" value={fmt$(apNPV)} accent="green" sub={`@ ${fmtPct(dr,1)} discount`}/>
+          <Metric label="AP Base (per period)" value={fmt$(r.apBasePerPeriod||0)} accent="green"/>
+        </div>;
+      })()}
     </Section>
     <Section title="Debt Service vs Revenue (Operating Period)">
       <ResponsiveContainer width="100%" height={320}>
@@ -4894,8 +4937,8 @@ function SensitivityTab({model, results}){
     avgSrDSCR:    {label:'Avg Senior DSCR',   extract:r=>r.avgSeniorDSCR,                      fmt:fmtRatio, betterHigher:true},
     minLLCR:      {label:'Min LLCR',          extract:r=>r.minLLCR,                            fmt:fmtRatio, betterHigher:true},
     tifiaEffDSCR: {label:'TIFIA Eff. DSCR',   extract:r=>r.tifiaEffectiveDSCR??r.tifiaTargetDSCR, fmt:fmtRatio, betterHigher:true},
-    fundingGap:   {label:'Funding Gap',       extract:r=>r.totalUses - r.totalSources,         fmt:fmt$,     betterHigher:false},
-    totalUses:    {label:'Total Uses',        extract:r=>r.totalUses,                          fmt:fmt$,     betterHigher:false},
+    fundingGap:   {label:'Funding Gap',       extract:r=>(r.totalUsesWithReserves||r.totalUses) - r.totalSources, fmt:fmt$,     betterHigher:false},
+    totalUses:    {label:'Total Uses',        extract:r=>r.totalUsesWithReserves||r.totalUses,  fmt:fmt$,     betterHigher:false},
     lockupPeriods:{label:'# Lockup Periods',  extract:r=>sum(r.lockup),                        fmt:v=>v!=null?v.toString():'—', betterHigher:false},
   };
 
