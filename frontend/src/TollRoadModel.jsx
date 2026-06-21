@@ -1633,6 +1633,14 @@ function buildTifiaCascadePhases(model, instrumentId, params, cfadsByPeriod){
 // 4) AP (level, escalating) solved so equity hits target IRR
 function autoCascadeAP(model, params){
   const working = JSON.parse(JSON.stringify(model));
+  // DETERMINISM: zero out all optimizer-controlled instruments so each run starts from an
+  // identical clean baseline, regardless of what a previous run left on the model.
+  for(const inst of working.financing.instruments){
+    if([params.tifiaInstrumentId, params.pabInstrumentId, params.equityInstrumentId, params.plugInstrumentId].includes(inst.id)){
+      inst.amount = 0;
+    }
+  }
+  working.financing.apAmount = 0;
   const trace = [];
   const tifiaEnabled = params.tifiaEnabled !== false;
   const maxTifiaPct = params.maxTifiaPct || 0.49;
@@ -1781,6 +1789,14 @@ function autoCascadeAP(model, params){
 
 function autoCascadeTifia(model, params){
   const working = JSON.parse(JSON.stringify(model));
+  // DETERMINISM: zero out all optimizer-controlled instruments so each run starts from an
+  // identical clean baseline, regardless of what a previous run left on the model.
+  for(const inst of working.financing.instruments){
+    if([params.tifiaInstrumentId, params.pabInstrumentId, params.equityInstrumentId, params.plugInstrumentId].includes(inst.id)){
+      inst.amount = 0;
+    }
+  }
+  working.financing.apAmount = 0;
   const trace = [];
 
   const evaluate = (pct) => {
@@ -1827,23 +1843,22 @@ function autoCascadeTifia(model, params){
     tifia.phases = phaseRes.phases;
     tifia.repaymentStyle = 'Phased (multi-regime)';
 
-    // STEP 2: SIZE PAB
-    // PABs size when: TIFIA disabled, OR TIFIA hit statutory ceiling AND gap remains
+    // STEP 2: SIZE PAB — fill to target gearing, capped by senior-DSCR floor.
+    // (Same gearing-fill philosophy as AP mode, so the two modes size the stack identically.)
     let pabAmount = 0;
     const maxTifiaPct = params.maxTifiaPct || 0.49;
+    const targetGearing = working.general.targetGearing || 0.75;
     const tifiaAtCeiling = tifiaEnabled && (pct >= maxTifiaPct - 0.005);
     const shouldSizePab = !tifiaEnabled || tifiaAtCeiling;
     if(pabInst){
       if(!shouldSizePab){
-        // TIFIA stopped below ceiling — adding PAB would hurt Total DSCR
-        pabInst.amount = 0;
-        pabAmount = 0;
+        pabInst.amount = 0; pabAmount = 0;
       } else {
-        // TIFIA at ceiling — check funding gap with PAB=0
         pabInst.amount = 0;
         let gapR;
         try { gapR = buildFullModel(w); } catch(e){ gapR = preR; }
-        const fundingGap = (gapR.totalUsesWithReserves||gapR.totalUses) - gapR.totalSources;
+        const usesWR = (gapR.totalUsesWithReserves||gapR.totalUses);
+        const fundingGap = usesWR - gapR.totalSources;
         if(fundingGap <= 0){
           pabAmount = 0;
         } else {
@@ -1851,7 +1866,6 @@ function autoCascadeTifia(model, params){
           const tifiaDS = gapR.periods.map((_, i) =>
             (tifiaSched.interest?.[i] || 0) + (tifiaSched.principal?.[i] || 0));
           const minSrFloor = params.minSrDSCR || 1.30;
-
           const pabFeasible = (amt) => {
             pabInst.amount = Math.round(amt);
             let rr;
@@ -1866,8 +1880,10 @@ function autoCascadeTifia(model, params){
             if(!isFinite(worst)) worst = 999;
             return [worst >= minSrFloor - 0.005, worst];
           };
-
-          let lo = 0, hi = fundingGap * 1.1;
+          // PAB target = fill to gearing, but never exceed funding gap, and never breach DSCR.
+          const pabByGearing = Math.max(0, targetGearing * usesWR - tifiaAmount);
+          const pabCap = Math.min(fundingGap, pabByGearing);
+          let lo = 0, hi = pabCap;
           let maxAtFloor = 0;
           for(let k=0; k<40; k++){
             const m = (lo + hi) / 2;
@@ -1875,13 +1891,18 @@ function autoCascadeTifia(model, params){
             if(ok){ maxAtFloor = m; lo = m; } else { hi = m; }
             if(hi - lo < 50_000) break;
           }
-          pabAmount = Math.min(fundingGap, maxAtFloor);
+          pabAmount = Math.min(pabCap, maxAtFloor);
           pabInst.amount = Math.round(pabAmount);
         }
       }
     }
 
-    // STEP 3: SIZE EQUITY TO TARGET IRR (plug = Upfront Subsidy, kept closed in every iteration)
+    // STEP 3 (Option A): EQUITY = funding-gap plug; SUBSIDY only if needed for IRR or residual gap.
+    // Philosophy mirrors AP mode: equity absorbs the construction gap. The subsidy then does two jobs:
+    //   (a) closes any residual funding gap equity alone can't cover, AND
+    //   (b) if the gap-plug equity's IRR is BELOW target, the subsidy shrinks the equity base
+    //       (public funds more of construction) until equity IRR rises to exactly the target.
+    // Self-funding deal whose plug-equity already clears the hurdle ⇒ subsidy = $0 (matches AP mode).
     let equityAmount = null, equityForIRRCalc = null, upfrontSubsidy = 0;
     const targetIRR = params.targetEquityIRR || 0;
     const plugInst = params.plugInstrumentId
@@ -1889,43 +1910,52 @@ function autoCascadeTifia(model, params){
     const equityInst = params.equityInstrumentId
       ? w.financing.instruments.find(i => i.id === params.equityInstrumentId) : null;
 
-    if(equityInst && targetIRR > 0){
-      // max_equity = gap when equity=0 AND plug=0
+    if(equityInst){
       if(plugInst) plugInst.amount = 0;
       equityInst.amount = 0;
       let baseR;
       try { baseR = buildFullModel(w); } catch(e){ baseR = null; }
       if(baseR){
+        // Full funding gap after TIFIA + PAB + grants — this is the max equity could need to cover.
         const maxEquity = Math.max(0, (baseR.totalUsesWithReserves||baseR.totalUses) - baseR.totalSources);
-        let loEq = 0, hiEq = maxEquity;
-        equityAmount = 0;
-        for(let k=0; k<30; k++){
-          const mid = (loEq + hiEq) / 2;
-          equityInst.amount = Math.round(mid);
-          if(plugInst) plugInst.amount = Math.max(0, Math.round(maxEquity - mid));
-          let actualIRR = -1;
-          try {
-            const testR = buildFullModel(w);
-            actualIRR = (testR.equityIRR != null) ? testR.equityIRR : -1;
-          } catch(e){}
-          if(actualIRR >= targetIRR - 0.0001){
-            equityAmount = mid;
-            loEq = mid;
-          } else {
-            hiEq = mid;
+
+        // Measure IRR with equity = full gap-plug (subsidy = 0). This is the AP-mode-equivalent stack.
+        equityInst.amount = Math.round(maxEquity);
+        if(plugInst) plugInst.amount = 0;
+        let plugFreeIRR = -1;
+        try { const tR = buildFullModel(w); plugFreeIRR = (tR.equityIRR != null) ? tR.equityIRR : -1; } catch(e){}
+
+        if(targetIRR <= 0 || plugFreeIRR >= targetIRR - 0.0001){
+          // Strong (or unconstrained) deal: equity as full plug already clears the hurdle.
+          // No subsidy. Equity = full gap-plug; IRR floats at/above target (like AP mode).
+          equityAmount = maxEquity;
+          equityInst.amount = Math.round(equityAmount);
+          if(plugInst) plugInst.amount = 0;
+          upfrontSubsidy = 0;
+        } else {
+          // Weak deal: gap-plug equity earns below target. Shrink equity (subsidy funds the difference)
+          // until equity IRR rises to exactly the target. Subsidy = maxEquity − equity.
+          let loEq = 0, hiEq = maxEquity;
+          equityAmount = 0;
+          for(let k=0; k<34; k++){
+            const mid = (loEq + hiEq) / 2;
+            equityInst.amount = Math.round(mid);
+            if(plugInst) plugInst.amount = Math.max(0, Math.round(maxEquity - mid));
+            let actualIRR = -1;
+            try { const testR = buildFullModel(w); actualIRR = (testR.equityIRR != null) ? testR.equityIRR : -1; } catch(e){}
+            // Smaller equity ⇒ higher IRR. Find the LARGEST equity that still clears the target.
+            if(actualIRR >= targetIRR - 0.0001){ equityAmount = mid; loEq = mid; }
+            else { hiEq = mid; }
+            if(hiEq - loEq < 10_000) break;
           }
-          if(hiEq - loEq < 10_000) break;
-        }
-        equityInst.amount = Math.round(equityAmount);
-        if(plugInst){
-          plugInst.amount = Math.max(0, Math.round(maxEquity - equityAmount));
-          upfrontSubsidy = plugInst.amount;
+          equityInst.amount = Math.round(equityAmount);
+          if(plugInst){ plugInst.amount = Math.max(0, Math.round(maxEquity - equityAmount)); upfrontSubsidy = plugInst.amount; }
         }
         equityForIRRCalc = equityAmount;
       }
     }
 
-    // STEP 4: FINAL BUILD + UPFRONT SUBSIDY (plug already set in Step 3; verify)
+    // STEP 4: FINAL BUILD + balance the plug to exact funding gap (rounding residual).
     let finalR;
     try { finalR = buildFullModel(w); }
     catch(e){ return { pct, tifiaAmount, error:'final build failed: '+e.message, feasible:false }; }
@@ -1939,7 +1969,6 @@ function autoCascadeTifia(model, params){
       }
       upfrontSubsidy = plugInst.amount;
     } else if(params.plugInstrumentId) {
-      // plug instrument missing (old saved state without sub1) — fall back to first grant
       const fallbackGrant = w.financing.instruments.find(i => i.seniority === 'Grant');
       if(fallbackGrant){
         const gap = (finalR.totalUsesWithReserves||finalR.totalUses) - finalR.totalSources;
