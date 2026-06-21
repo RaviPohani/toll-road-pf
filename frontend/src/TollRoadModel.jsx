@@ -5372,12 +5372,39 @@ ${JSON.stringify(summary, null, 2)}`;
           </tbody></table>
         </div>
       </div>
+      <div className="mb-2 text-sm font-medium text-stone-200">PSC vs P3 — Net Cost to Public (NPV)</div>
+      <div className="text-[10px] text-stone-500 mb-2">The headline VfM comparison. Lower (or more negative) net cost is better for the public. {vfm.vfm >= 0 ? 'P3 delivers positive value for money.' : 'PSC is cheaper here — P3 does not show value for money.'}</div>
+      <div style={{height:220}}>
+        <ResponsiveContainer>
+          <BarChart data={[
+            { name:'PSC (public delivery)', netCost: vfm.pscNetCost/1e6 },
+            { name:'P3 (private delivery)', netCost: vfm.p3NetCost/1e6 },
+          ]}>
+            <CartesianGrid stroke="#44403c" strokeDasharray="2 4"/>
+            <XAxis dataKey="name" stroke="#a8a29e" tick={{fontSize:11}}/>
+            <YAxis stroke="#a8a29e" tick={{fontSize:11}} label={{value:'Net cost $M (NPV)',angle:-90,position:'insideLeft',fill:'#a8a29e',fontSize:11}}/>
+            <Tooltip contentStyle={{background:'#1c1917',border:'1px solid #44403c',fontSize:12}} formatter={v=>`$${Number(v).toFixed(1)}M`}/>
+            <ReferenceLine y={0} stroke="#a8a29e" strokeWidth={1}/>
+            <Bar dataKey="netCost" radius={[3,3,0,0]}>
+              <Cell fill="#fbbf24"/>
+              <Cell fill={vfm.vfm >= 0 ? '#34d399' : '#f87171'}/>
+            </Bar>
+          </BarChart>
+        </ResponsiveContainer>
+      </div>
+      <div className="text-xs text-stone-400 mt-2 mb-5">
+        PSC net cost <span className="text-amber-300">{fmt$(vfm.pscNetCost)}</span> · P3 net cost <span className={vfm.vfm>=0?'text-emerald-300':'text-rose-300'}>{fmt$(vfm.p3NetCost)}</span> · Value for Money = <span className={vfm.vfm>=0?'text-emerald-300':'text-rose-300'}>{fmt$(vfm.vfm)} ({fmtPct(vfm.vfmPct,1)})</span>
+        {vfm.pscNetCost < 0 && <span className="text-stone-500"> — note: PSC net cost is negative because toll-revenue NPV exceeds total public costs (the asset is a net revenue generator under public ownership).</span>}
+      </div>
+
+      <div className="mb-2 text-sm font-medium text-stone-200">Risk Allocation — Expected Value by Owner</div>
+      <div className="text-[10px] text-stone-500 mb-2">How construction & operations risk (expected value) is split between public and private parties. This is a risk-transfer view, not the net-cost comparison above.</div>
       <div style={{height:200}}>
         <ResponsiveContainer>
           <BarChart data={riskChartData}>
             <CartesianGrid stroke="#44403c" strokeDasharray="2 4"/>
             <XAxis dataKey="owner" stroke="#a8a29e" tick={{fontSize:11}}/>
-            <YAxis stroke="#a8a29e" tick={{fontSize:11}} label={{value:'$M (EV)',angle:-90,position:'insideLeft',fill:'#a8a29e',fontSize:11}}/>
+            <YAxis stroke="#a8a29e" tick={{fontSize:11}} label={{value:'Risk EV $M',angle:-90,position:'insideLeft',fill:'#a8a29e',fontSize:11}}/>
             <Tooltip contentStyle={{background:'#1c1917',border:'1px solid #44403c',fontSize:12}} formatter={v=>`$${(v).toFixed(2)}M`}/>
             <Legend wrapperStyle={{fontSize:11}}/>
             <Bar dataKey="Construction" stackId="r" fill="#fb923c"/>
