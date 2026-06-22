@@ -1172,8 +1172,14 @@ function buildFullModel(rawModel){
       apStream[i] = apBasePerPeriod * Math.pow(1 + apEsc, yr);
     }
   }
+  const debtFirst = model.waterfall.mode === 'Debt-first (Revenue → DS → Opex)';
   const cfads = zeros(n);
-  for(let i=0;i<n;i++) cfads[i] = revSched.byPeriod[i] + apStream[i] - opexSched.byPeriod[i];
+  for(let i=0;i<n;i++){
+    // Opex-first (standard): CFADS = revenue + AP − opex (opex senior to debt service).
+    // Debt-first (gross-revenue pledge): debt has first lien on gross revenue; opex is paid
+    //   AFTER debt service, so it is NOT deducted from the CFADS used to service/size debt.
+    cfads[i] = revSched.byPeriod[i] + apStream[i] - (debtFirst ? 0 : opexSched.byPeriod[i]);
+  }
 
   const order = { 'Short-term':0, 'Senior':1, 'Subordinate':2, 'Grant':3, 'Equity':4, 'Paygo':5 };
   const sortedInst = [...instruments].sort((a,b)=>(order[a.seniority]??99)-(order[b.seniority]??99));
@@ -1242,9 +1248,12 @@ function buildFullModel(rawModel){
   const rawEquityCF = zeros(n);
   for(let i=0;i<n;i++){
     let base;
-    if(model.waterfall.mode === 'Debt-first (Revenue → DS → Opex)'){
-      base = revSched.byPeriod[i] - totalDS[i] - opexSched.byPeriod[i] - tifiaFeesPerPeriod[i];
+    if(debtFirst){
+      // Debt-first: cfads = gross revenue + AP (opex not yet deducted). Equity gets what remains
+      // after debt service AND opex (opex paid after DS): revenue + AP − DS − opex − TIFIA fees.
+      base = cfads[i] - totalDS[i] - opexSched.byPeriod[i] - tifiaFeesPerPeriod[i];
     } else {
+      // Opex-first: cfadsForDscr already nets opex + fees; equity = CFADS − DS.
       base = cfadsForDscr[i] - totalDS[i];
     }
     rawEquityCF[i] = base - reserveNetDeposit[i];  // reserves sit above equity in waterfall
