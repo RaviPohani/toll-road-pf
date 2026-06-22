@@ -1300,7 +1300,10 @@ def build_full_model(model: Dict[str, Any]) -> Dict[str, Any]:
         for i in range(n):
             yr = i // ppy
             ap_stream[i] = ap_base * ((1 + ap_esc) ** yr)
-    cfads = [rev_sched['byPeriod'][i] + ap_stream[i] - opex_sched['byPeriod'][i] for i in range(n)]
+    debt_first = model['waterfall']['mode'] == 'Debt-first (Revenue \u2192 DS \u2192 Opex)'
+    # Debt-first (gross-revenue pledge): opex paid AFTER debt service, so not deducted from CFADS.
+    cfads = [rev_sched['byPeriod'][i] + ap_stream[i] - (0 if debt_first else opex_sched['byPeriod'][i])
+             for i in range(n)]
 
     senority_order = {'Short-term': 0, 'Senior': 1, 'Subordinate': 2, 'Grant': 3, 'Equity': 4, 'Paygo': 5}
     sorted_inst = sorted(instruments, key=lambda i: senority_order.get(i['seniority'], 99))
@@ -1377,8 +1380,9 @@ def build_full_model(model: Dict[str, Any]) -> Dict[str, Any]:
 
     raw_equity_cf = _zeros(n)
     for i in range(n):
-        if model['waterfall']['mode'] == 'Debt-first (Revenue \u2192 DS \u2192 Opex)':
-            base = rev_sched['byPeriod'][i] - total_ds[i] - opex_sched['byPeriod'][i] - tifia_fees_per_period[i]
+        if debt_first:
+            # cfads = gross revenue + AP (opex not yet deducted). Equity = after DS and opex.
+            base = cfads[i] - total_ds[i] - opex_sched['byPeriod'][i] - tifia_fees_per_period[i]
         else:
             base = cfads_for_dscr[i] - total_ds[i]
         raw_equity_cf[i] = base - reserve_net_deposit[i]
